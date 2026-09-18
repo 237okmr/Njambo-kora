@@ -1,0 +1,86 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isUser(uid) {
+      return isAuthenticated() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (request.auth.token.email == '237okmr@gmail.com' || request.auth.token.admin == true);
+    }
+
+    // Global settings and social links for Katika AI Copilot (Admin restricted)
+    match /katika_settings/{settingId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Telemetry and analytical game records for official Palmarès Mondial & Katika Cockpit
+    // Enforcing authenticated submission to prevent fraud and spam
+    match /njambo_game_records/{recordId} {
+      allow read: if true;
+      allow create, update: if isAuthenticated();
+      allow delete: if isAdmin();
+    }
+
+    // Player profiles and cloud synchronized palmares
+    match /users/{userId} {
+      allow read: if true;
+      allow create: if isUser(userId) && (
+        !('chips' in request.resource.data) || request.resource.data.chips >= 0
+      );
+      allow update: if isUser(userId) && (
+        // Prevent negative chips
+        (!('chips' in request.resource.data) || request.resource.data.chips >= 0)
+      );
+      allow delete: if isUser(userId) || isAdmin();
+
+      match /history/{gameId} {
+        allow read: if isUser(userId);
+        allow create, update: if isUser(userId);
+        allow delete: if isUser(userId) || isAdmin();
+      }
+
+      match /friends/{friendId} {
+        allow read: if isAuthenticated() && (request.auth.uid == userId || request.auth.uid == friendId);
+        allow write: if isAuthenticated() && (request.auth.uid == userId || request.auth.uid == friendId);
+      }
+    }
+
+    // Rooms for multiplayer card games (fallback Firestore sync)
+    match /rooms/{roomId} {
+      allow read, write: if true;
+    }
+
+    // Web Push notifications subscriptions (server push service & background sync)
+    match /push_subscriptions/{subscriptionId} {
+      allow read, write: if true;
+    }
+
+    // Real-time table invitations (strictly accessible to sender and recipient)
+    match /invitations/{invitationId} {
+      allow read: if isAuthenticated() && (resource.data.toUserId == request.auth.uid || resource.data.fromUserId == request.auth.uid);
+      allow create: if isAuthenticated() && request.resource.data.fromUserId == request.auth.uid;
+      allow update, delete: if isAuthenticated() && (resource.data.toUserId == request.auth.uid || resource.data.fromUserId == request.auth.uid);
+    }
+
+    // Player presence and online status (strictly own presence)
+    match /presence/{userId} {
+      allow read: if true;
+      allow write: if isUser(userId);
+    }
+
+    // Fair-play sanctions and moderation logs (Katika telemetry & audits)
+    match /fairplay_sanctions/{sanctionId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated();
+      allow delete: if isAdmin();
+    }
+  }
+}
+
