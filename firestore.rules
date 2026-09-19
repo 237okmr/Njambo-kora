@@ -119,7 +119,7 @@ service cloud.firestore {
       let dGamesWon = nS.get('multiplayerGamesWon', 0) - oS.get('multiplayerGamesWon', 0);
       let dManchesWon = nS.get('multiplayerManchesWon', 0) - oS.get('multiplayerManchesWon', 0);
       let dKoraCount = nS.get('multiplayerKoraCount', 0) - oS.get('multiplayerKoraCount', 0);
-      let allocHorsSolo = 20 * (dGamesWon + dManchesWon + dKoraCount) + 5;
+      let allocHorsSolo = 20 * (dGamesWon + dManchesWon + dKoraCount) + 0.01;
       let deltaSolo = getDeltaSolo(existing, incoming);
       let hasIn = 'soloDaily' in incoming && incoming.soloDaily != null;
       let hasEx = 'soloDaily' in existing && existing.soloDaily != null;
@@ -127,9 +127,11 @@ service cloud.firestore {
       let exSD = hasEx ? existing.soloDaily : null;
       let oDay = (hasEx && 'day' in exSD) ? exSD.day : null;
       let nDay = (hasIn && 'day' in inSD) ? inSD.day : null;
+      let oPts = (hasEx && 'points' in exSD && exSD.points != null) ? exSD.points : 0;
       let g = (oDay != null && nDay != null && nDay > oDay) ? (nDay - oDay) : 0;
-      let multiDayCap = g >= 7 ? 7 : g;
-      let allocMultiDay = 30 * multiDayCap;
+      let gCap = g >= 7 ? 7 : g;
+      let remainingOldDay = (30 - oPts > 0) ? (30 - oPts) : 0;
+      let allocMultiDay = (g == 0) ? 0 : (remainingOldDay + 30 * (gCap - 1));
       return one || isScoreMigration || (scoreIncrease <= deltaSolo + allocHorsSolo + allocMultiDay);
     }
 

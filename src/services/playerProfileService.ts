@@ -80,6 +80,7 @@ function computeAwardedSoloMastery(
   if (potentialMastery > 0 && alreadyAwarded < cap) {
     awarded = Math.min(potentialMastery, Math.max(0, cap - alreadyAwarded));
   }
+  awarded = Math.round(awarded * 100) / 100;
 
   const rawPoints = alreadyAwarded + awarded;
   const roundedPoints = Math.round(rawPoints * 100) / 100;
