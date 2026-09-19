@@ -2548,6 +2548,7 @@ export class ServerGameEngine {
       endReason: 'EARLY_CLOSE',
       capitalsBefore,
       grossByPlayerId,
+      allowBurned: true,
     });
 
     room.updatedAt = Date.now();

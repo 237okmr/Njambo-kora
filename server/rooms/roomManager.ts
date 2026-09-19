@@ -2118,6 +2118,10 @@ export class RoomManager {
     client.roomCode = targetRoomCode;
     const room = this.rooms.get(targetRoomCode)!;
 
+    if (room.status === 'MANCHE_OVER') {
+      room.players = (room.players || []).filter((p) => !p.leftRoom);
+    }
+
     const isHost = room.hostId === client.playerId;
     const connectedHumans = (room.players || []).filter((p) => p.isHuman && p.connected);
     const maxCapacity = Math.min(4, Math.max(2, room.maxPlayers || 4));
