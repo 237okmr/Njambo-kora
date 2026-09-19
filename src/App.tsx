@@ -48,6 +48,7 @@ import { wsService } from './services/websocketService';
 import { FriendService } from './services/friendService';
 import { pushNotificationService } from './services/pushNotificationService';
 import { syncPwaIdentityFromLocation } from './katika/utils/pwaManifestSwitcher';
+import { auth } from './lib/firebase';
 
 // Lazy loaded heavy components (Admin cockpit, test suites)
 const KatikaApp = React.lazy(() =>
@@ -960,6 +961,9 @@ function GameApp() {
         telemetryService
           .recordGame({
             id: mancheSessionId,
+            creatorUid: auth.currentUser?.uid || localPlayerId || 'guest',
+            roomId: isOnlineActive ? (multiplayerRoom?.id || roomId) : undefined,
+            mancheNumber: isOnlineActive ? (multiplayerRoom?.mancheNumber || 1) : 1,
             mode,
             playerCount: activeGameState.players?.length || (multiplayerRoom?.maxPlayers || 4),
             status: 'in_progress', // « Non terminée » à l'entame
@@ -970,6 +974,7 @@ function GameApp() {
             partiesCount: activeGameState.partieCount || 1,
             isMancheFinalWin: false,
             potWon: 0,
+            aiDifficulty: mode === 'SOLO' ? (activeGameState.aiDifficulty || gameState.aiDifficulty) : undefined,
             createdAt: Date.now(),
             players: activeGameState.players?.map((p: any) => ({
               id: p.id,
@@ -986,14 +991,25 @@ function GameApp() {
     // 2. Gestion des fins de donnes (PARTIE_OVER) et victoires finales de Manche (MANCHE_OVER)
     if (phase === 'PARTIE_OVER' || phase === 'MANCHE_OVER') {
       const winnerIdx = activeGameState.partieWinnerIndex ?? activeGameState.mancheWinnerIndex;
+      const winnerPlayer = (winnerIdx !== null && winnerIdx !== undefined && activeGameState.players)
+        ? activeGameState.players[winnerIdx]
+        : null;
       const winnerName =
         activeGameState.partieWinnerName ||
         activeGameState.mancheWinnerName ||
-        (winnerIdx !== null && winnerIdx !== undefined && activeGameState.players[winnerIdx]?.name) ||
+        winnerPlayer?.name ||
         'Joueur';
-      const winnerId =
-        (winnerIdx !== null && winnerIdx !== undefined && activeGameState.players[winnerIdx]?.id) ||
-        undefined;
+      
+      // Assurer que winnerId est identique chez tous les clients de la table
+      let winnerId: string | undefined = undefined;
+      if (winnerPlayer) {
+        if (auth.currentUser && !auth.currentUser.isAnonymous && (winnerPlayer.id === localPlayerId || winnerPlayer.id === auth.currentUser.uid)) {
+          winnerId = auth.currentUser.uid;
+        } else {
+          winnerId = winnerPlayer.id;
+        }
+      }
+
       const winType = activeGameState.partieWinType || 'STANDARD';
       const playerCount = activeGameState.players?.length || (multiplayerRoom?.maxPlayers || 4);
       const partieCount = activeGameState.partieCount || 1;
@@ -1008,7 +1024,11 @@ function GameApp() {
         lastRecordedPartieKeyRef.current = recordKey;
 
         const isCompleted = phase === 'MANCHE_OVER';
-        const targetSessionId = activeMancheSessionIdRef.current || `manche_${mode.toLowerCase()}_${roomId}_${Date.now()}`;
+        const effectiveRoomId = isOnlineActive ? (multiplayerRoom?.id || roomId) : undefined;
+        const effectiveMancheNumber = isOnlineActive ? (multiplayerRoom?.mancheNumber || 1) : 1;
+        const targetSessionId = isOnlineActive
+          ? `rec_mp_${effectiveRoomId}_m${effectiveMancheNumber}_${auth.currentUser?.uid || localPlayerId}`
+          : (activeMancheSessionIdRef.current || `manche_${mode.toLowerCase()}_${roomId}_${Date.now()}`);
         const baseBetValue = activeGameState.baseBet || 50;
         const effectivePot = (activeGameState.pot && activeGameState.pot > 0)
           ? activeGameState.pot
@@ -1017,6 +1037,9 @@ function GameApp() {
         telemetryService
           .recordGame({
             id: targetSessionId,
+            creatorUid: auth.currentUser?.uid || localPlayerId || 'guest',
+            roomId: effectiveRoomId,
+            mancheNumber: effectiveMancheNumber,
             mode,
             playerCount,
             status: isCompleted ? 'completed' : 'in_progress', // « Terminée » uniquement si victoire de manche
@@ -1031,6 +1054,7 @@ function GameApp() {
             potGross: effectivePot,
             baseBet: baseBetValue,
             currency: 'CHIPS',
+            aiDifficulty: mode === 'SOLO' ? (activeGameState.aiDifficulty || gameState.aiDifficulty) : undefined,
             players: activeGameState.players?.map((p: any) => ({
               id: p.id,
               name: p.name,
@@ -1100,6 +1124,7 @@ function GameApp() {
           opponents: opponentsList,
           tricksWon: localTricks,
           roomId: isOnlineActive ? roomId : undefined,
+          difficulty: mode === 'SOLO' ? (activeGameState.aiDifficulty || gameState.aiDifficulty) : undefined,
         }).catch((err) => {
           console.warn('[App] recordPartieResult warning:', err);
         });
@@ -1120,7 +1145,8 @@ function GameApp() {
             durationSeconds,
             opponents: opponentsList,
             status: 'completed',
-          }, { skipStatsIncrement: true }).catch((err) => {
+            difficulty: mode === 'SOLO' ? (activeGameState.aiDifficulty || gameState.aiDifficulty) : undefined,
+          }).catch((err) => {
             console.warn('[App] recordGameResult warning:', err);
           });
 
@@ -1520,18 +1546,6 @@ function GameApp() {
 
     const targetSessionId = activeMancheSessionIdRef.current || `manche_${mode.toLowerCase()}_${Date.now()}`;
 
-    if (isOnlineActive) {
-      registerFairPlayIncident({
-        type: 'FORFEIT',
-        roomId: multiplayerRoom?.id,
-        gameId: targetSessionId,
-      })
-        .then((res) => {
-          if (res.message) triggerToast(res.message);
-        })
-        .catch(console.warn);
-    }
-
     telemetryService.recordGame({
       id: targetSessionId,
       mode,
@@ -1549,6 +1563,7 @@ function GameApp() {
       partiesCount: gameState.partieCount || 1,
       isMancheFinalWin: false,
       potWon: 0,
+      aiDifficulty: mode === 'SOLO' ? (activeGameState.aiDifficulty || gameState.aiDifficulty) : undefined,
       createdAt: Date.now(),
       players: gameState.players?.map((p) => ({
         id: p.id,
@@ -1556,6 +1571,21 @@ function GameApp() {
         isHuman: p.isHuman ?? (p.id === 'human' || p.id === localPlayerId || !p.id?.toLowerCase().includes('bot')),
         score: p.score ?? p.capital ?? 0,
       })) || [],
+    }).catch(console.warn);
+
+    // Record 1 abandoned game in profile stats
+    recordGameResult({
+      recordType: 'MANCHE',
+      mode,
+      playerCount: opponentCount + 1,
+      winType: 'FORFEIT',
+      isWinner: false,
+      winnerName: 'Abandon',
+      potWon: 0,
+      baseBet: gameState.baseBet || 50,
+      roundsCount: gameState.partieCount || 1,
+      status: 'abandoned',
+      difficulty: mode === 'SOLO' ? (activeGameState.aiDifficulty || gameState.aiDifficulty) : undefined,
     }).catch(console.warn);
 
     activeMancheSessionIdRef.current = null;
@@ -2404,6 +2434,18 @@ function GameApp() {
               .catch(console.warn);
             activeMancheSessionIdRef.current = null;
           }
+          recordGameResult({
+            recordType: 'MANCHE',
+            mode: 'MULTIPLAYER',
+            playerCount: activeGameState.players?.length || 4,
+            winType: 'FORFEIT',
+            isWinner: false,
+            winnerName: 'Adversaire (Par Forfait)',
+            potWon: 0,
+            baseBet: activeGameState.baseBet || 50,
+            roundsCount: activeGameState.partieCount || 1,
+            status: 'abandoned',
+          }).catch(console.warn);
           if (isOnlineActive) {
             registerFairPlayIncident({
               type: 'FORFEIT',

@@ -12,7 +12,16 @@ export interface PlayerStats {
   soloManchesWonEasy?: number;
   soloManchesWonNormal?: number;
   soloManchesWonHard?: number;
-  masteryScore?: number; // Score de Maîtrise (Barème 1-20 pts)
+  soloGamesWonEasy?: number;
+  soloGamesWonNormal?: number;
+  soloGamesWonHard?: number;
+  soloKorasEasy?: number;
+  soloKorasNormal?: number;
+  soloKorasHard?: number;
+  soloDoubleKorasEasy?: number;
+  soloDoubleKorasNormal?: number;
+  soloDoubleKorasHard?: number;
+  masteryScore?: number; // Score de Maîtrise
   koraCount: number;
   doubleKoraCount: number;
   under21Count: number;
@@ -54,6 +63,15 @@ export const DEFAULT_PLAYER_STATS: PlayerStats = {
   soloManchesWonEasy: 0,
   soloManchesWonNormal: 0,
   soloManchesWonHard: 0,
+  soloGamesWonEasy: 0,
+  soloGamesWonNormal: 0,
+  soloGamesWonHard: 0,
+  soloKorasEasy: 0,
+  soloKorasNormal: 0,
+  soloKorasHard: 0,
+  soloDoubleKorasEasy: 0,
+  soloDoubleKorasNormal: 0,
+  soloDoubleKorasHard: 0,
   masteryScore: 0,
   koraCount: 0,
   doubleKoraCount: 0,
@@ -168,6 +186,8 @@ export interface PlayerProfile {
   isGuest: boolean;
   chips: number; // Persistent wallet / token balance (default: 1000 for guests and new accounts)
   stats: PlayerStats;
+  scoreVersion?: number;
+  statsLegacyBackup?: PlayerStats;
   fairPlay?: PlayerFairPlay;
   honorificTitleId: string;
   createdAt: number;
@@ -203,6 +223,7 @@ export interface PlayerGameHistoryItem {
   createdAt: number;
   difficulty?: 'EASY' | 'NORMAL' | 'EXPERT' | 'GRAND_MASTER' | string;
   pointsEarned?: number;
+  masteryPointsAwarded?: number;
   tricksWon?: number;
   isDoubleKora?: boolean;
   isUnder21?: boolean;

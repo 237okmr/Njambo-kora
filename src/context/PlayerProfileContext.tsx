@@ -64,6 +64,7 @@ interface PlayerProfileContextValue {
     opponents?: PlayerOpponentSummary[];
     tricksWon?: number;
     roomId?: string;
+    difficulty?: 'EASY' | 'NORMAL' | 'EXPERT' | 'GRAND_MASTER' | string;
   }) => Promise<void>;
   recordGameResult: (
     item: Omit<PlayerGameHistoryItem, 'id' | 'createdAt'> & { id?: string; createdAt?: number },
@@ -163,6 +164,20 @@ export const PlayerProfileProvider: React.FC<{ children: ReactNode }> = ({ child
     return () => unsub();
   }, [profile.isGuest]);
 
+  // Auto-run scoreVersion = 2 migration if needed
+  useEffect(() => {
+    if (profile && profile.scoreVersion !== 2) {
+      playerProfileService.migratePlayerScoreVersion2(profile.uid)
+        .then((migrated) => {
+          setProfile(migrated);
+          setHistory(playerProfileService.getLocalHistory());
+        })
+        .catch((err) => {
+          console.warn('[PlayerProfileContext] Migration scoreVersion 2 failed:', err);
+        });
+    }
+  }, [profile?.scoreVersion, profile?.uid]);
+
   // Silent background stats consolidation to prevent desynchronization (Lot 3 Recommendation 2)
   useEffect(() => {
     if (!profile.isGuest && profile.uid) {
@@ -249,6 +264,7 @@ export const PlayerProfileProvider: React.FC<{ children: ReactNode }> = ({ child
       opponents?: PlayerOpponentSummary[];
       tricksWon?: number;
       roomId?: string;
+      difficulty?: 'EASY' | 'NORMAL' | 'EXPERT' | 'GRAND_MASTER' | string;
     }) => {
       const updatedProfile = await playerProfileService.recordPartieResult(params);
       setProfile(updatedProfile);

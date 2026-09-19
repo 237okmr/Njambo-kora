@@ -70,6 +70,8 @@ class WebSocketService {
   private serverTimeOffset: number = 0;
   private lastPingSentAt: number = 0;
   private lastConnectAttemptAt: number = 0;
+  private authSentOnThisSocket: boolean = false;
+  private hasAttemptedAuthRetry: boolean = false;
 
   public getLocalPlayerId(): string {
     if (this.activeRoomCode && this.sessionRoomPlayerId) {
@@ -183,11 +185,28 @@ class WebSocketService {
 
   public onAuthChanged(): void {
     const inRoom = Boolean(this.activeRoomCode || this.currentRoom);
+    const currentUser = auth.currentUser;
+    const isSameGoogleUser = Boolean(
+      currentUser &&
+      !currentUser.isAnonymous &&
+      currentUser.uid === getPlayerId()
+    );
+
     if (!inRoom) {
       console.log('[WS] Auth state changed outside of room: reconnecting socket with new auth identity.');
       if (this.socket) {
         try {
           this.socket.close(1000, 'Auth changed');
+        } catch (e) {
+          // ignore
+        }
+      }
+      this.connect();
+    } else if (isSameGoogleUser && !this.authSentOnThisSocket) {
+      console.log('[WS] Auth state restored for current in-room Google user: reconnecting socket to send AUTH.');
+      if (this.socket) {
+        try {
+          this.socket.close(1000, 'Auth restored in room');
         } catch (e) {
           // ignore
         }
@@ -216,6 +235,19 @@ class WebSocketService {
 
     this.isConnecting = true;
     this.lastConnectAttemptAt = Date.now();
+    this.authSentOnThisSocket = false;
+
+    // Wait for authStateReady with a 3s max timeout to ensure restored Firebase session
+    try {
+      if (typeof (auth as any).authStateReady === 'function') {
+        await Promise.race([
+          auth.authStateReady(),
+          new Promise((resolve) => setTimeout(resolve, 3000)),
+        ]);
+      }
+    } catch (e) {
+      console.warn('[WS] authStateReady wait error:', e);
+    }
 
     // Retrieve Firebase Auth ID Token for authenticated Google user
     let idToken: string | null = null;
@@ -258,6 +290,7 @@ class WebSocketService {
               timestamp: Date.now(),
             };
             this.socket.send(JSON.stringify(authMsg));
+            this.authSentOnThisSocket = true;
           }
 
           // Intelligent Offline Queue Purge (Lot 2 Resilience)
@@ -551,6 +584,7 @@ class WebSocketService {
     switch (msg.type) {
       case 'ROOM_JOINED':
       case 'SYNC_STATE':
+        this.hasAttemptedAuthRetry = false;
         if (msg.playerId) {
           const canonicalId = getPlayerId();
           if (msg.playerId !== canonicalId) {
@@ -625,6 +659,19 @@ class WebSocketService {
             // ignore
           }
           this.notifyRoomUpdate(null);
+        } else if (errorCode === 'AUTH_REQUIRED') {
+          if (!this.hasAttemptedAuthRetry) {
+            this.hasAttemptedAuthRetry = true;
+            console.warn('[WS] Server returned AUTH_REQUIRED: attempting one-time reconnection with AUTH.');
+            if (this.socket) {
+              try {
+                this.socket.close(1000, 'AUTH_REQUIRED retry');
+              } catch (e) {
+                // ignore
+              }
+            }
+            this.connect();
+          }
         }
         if (msg.error) {
           this.notifyError(msg.error, errorCode, msg.activeGameRoomCode);

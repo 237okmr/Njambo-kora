@@ -720,22 +720,13 @@ export const GlobalLeaderboardModal: React.FC<GlobalLeaderboardModalProps> = ({
             {!showMasteryHelp && (
               <div className="px-3 pb-2 pt-0 flex items-center gap-1.5 overflow-x-auto no-scrollbar text-[9px] font-mono text-slate-300">
                 <span className="px-1.5 py-0.5 rounded bg-slate-900/90 border border-slate-800 shrink-0">
-                  <strong className="text-amber-400">+10</strong> Multi
+                  <strong className="text-amber-400">Manche 10</strong> / <strong className="text-amber-400">Donne 1</strong>
                 </span>
                 <span className="px-1.5 py-0.5 rounded bg-slate-900/90 border border-slate-800 shrink-0">
-                  <strong className="text-amber-400">+6</strong> Difficile
+                  <strong className="text-amber-400">Kora 5</strong> / <strong className="text-cyan-400">Double 15</strong>
                 </span>
-                <span className="px-1.5 py-0.5 rounded bg-slate-900/90 border border-slate-800 shrink-0">
-                  <strong className="text-amber-400">+3</strong> Normal
-                </span>
-                <span className="px-1.5 py-0.5 rounded bg-slate-900/90 border border-slate-800 shrink-0">
-                  <strong className="text-amber-400">+1</strong> Donne
-                </span>
-                <span className="px-1.5 py-0.5 rounded bg-slate-900/90 border border-slate-800 shrink-0">
-                  <strong className="text-amber-400">+5</strong> Kora
-                </span>
-                <span className="px-1.5 py-0.5 rounded bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 shrink-0">
-                  <strong className="text-cyan-400">+20</strong> Double 💎
+                <span className="px-1.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/20 text-amber-300 shrink-0">
+                  Multi ×1 | Solo Exp/GM ×0,4 | Norm ×0,2 | Fac ×0,05
                 </span>
               </div>
             )}
@@ -744,27 +735,24 @@ export const GlobalLeaderboardModal: React.FC<GlobalLeaderboardModalProps> = ({
             {showMasteryHelp && (
               <div className="p-3 pt-0 border-t border-amber-500/15 space-y-2 text-[11px] text-slate-400">
                 <p className="leading-relaxed text-slate-300 text-[11px]">
-                  Le classement général hiérarchise les compétiteurs selon la difficulté et la précision de leurs victoires :
+                  <strong>Barème officiel du Score de Maîtrise v2 :</strong> Points de base calculés pour chaque réalisation, puis ajustés par le coefficient du mode de jeu (plafond solo : 30 pts/jour).
                 </p>
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5 font-mono text-[10px]">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 font-mono text-[10px]">
                   <div className="p-1.5 rounded bg-slate-900/90 border border-slate-800 text-slate-300">
-                    <span className="text-amber-400 font-bold">+10 pts</span> Manche Multijoueur
+                    <span className="text-amber-400 font-bold">10 pts</span> Manche gagnée
                   </div>
                   <div className="p-1.5 rounded bg-slate-900/90 border border-slate-800 text-slate-300">
-                    <span className="text-amber-400 font-bold">+6 pts</span> Manche Solo Difficile
+                    <span className="text-amber-400 font-bold">1 pt</span> Donne gagnée
                   </div>
                   <div className="p-1.5 rounded bg-slate-900/90 border border-slate-800 text-slate-300">
-                    <span className="text-amber-400 font-bold">+3 pts</span> Manche Solo Normale
-                  </div>
-                  <div className="p-1.5 rounded bg-slate-900/90 border border-slate-800 text-slate-300">
-                    <span className="text-amber-400 font-bold">+1 pt</span> Manche Facile / Donne
-                  </div>
-                  <div className="p-1.5 rounded bg-slate-900/90 border border-slate-800 text-slate-300">
-                    <span className="text-amber-400 font-bold">+5 pts</span> Exploit Kora
+                    <span className="text-amber-400 font-bold">5 pts</span> Kora Simple
                   </div>
                   <div className="p-1.5 rounded bg-cyan-500/15 border border-cyan-500/30 text-cyan-300">
-                    <span className="font-bold text-cyan-400">+20 pts</span> Double Kora 💎
+                    <span className="font-bold text-cyan-400">15 pts</span> Double Kora 💎
                   </div>
+                </div>
+                <div className="p-2 rounded bg-amber-500/10 border border-amber-500/20 text-[10px] text-amber-300">
+                  <strong>Coefficients de mode :</strong> Multijoueur ×1,0 | Solo Expert/Grand Maître ×0,4 | Solo Normal ×0,2 | Solo Facile ×0,05.
                 </div>
               </div>
             )}

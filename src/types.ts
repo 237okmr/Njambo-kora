@@ -329,6 +329,7 @@ export interface GameState {
   humanSelectedCardId: string | null;
   partieCount: number; // Compteur de Partie dans la Manche
   roundCount: number;
+  mancheNumber?: number; // Numéro officiel de manche dans la session (identique pour toute la table)
   showKoraHunterAlert?: boolean; // True quand une alerte alerte "Chasseur de Kora" doit être affichée à l'écran
   koraHunterAlertShown?: boolean; // Evite de réafficher l'alerte plusieurs fois au cours d'une même partie
   gameSpeed?: GameSpeed;
@@ -562,6 +563,7 @@ export interface MultiplayerRoom {
   integrationProposal?: IntegrationProposal | null;
   capacityExtensionProposal?: CapacityExtensionProposal | null;
   earlyCloseProposal?: EarlyCloseProposal | null;
+  mancheNumber?: number; // Numéro de manche officiel (identique pour tous les joueurs de la table)
   manchePartiesPlayed?: number;
   lastBetIncreaseProposalPartie?: number;
   previousPartieSummary?: PreviousPartieSummary | null;

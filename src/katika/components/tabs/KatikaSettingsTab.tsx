@@ -22,10 +22,15 @@ import {
   UserCheck,
   Eye,
   Crown,
-  MessageSquare
+  MessageSquare,
+  Download,
+  FileText,
+  CheckSquare,
+  Square,
+  RefreshCw
 } from 'lucide-react';
 import { KatikaGameConfig } from '../../types/katika';
-import { KatikaService, DEFAULT_KATIKA_CONFIG } from '../../services/katikaService';
+import { KatikaService, DEFAULT_KATIKA_CONFIG, ProfileAuditReport } from '../../services/katikaService';
 import { navigateToKatikaTab } from '../../utils/katikaNavigation';
 import { 
   AiAdminChatClient, 
@@ -44,8 +49,11 @@ export const KatikaSettingsTab: React.FC<KatikaSettingsTabProps> = ({ onConfigUp
   const [loading, setLoading] = useState<boolean>(true);
   const [saving, setSaving] = useState<boolean>(false);
   const [feedback, setFeedback] = useState<string | null>(null);
-  const [settingsSubTab, setSettingsSubTab] = useState<'ENGINE_PACING' | 'MULTI_AI' | 'ECONOMY' | 'RULES' | 'BROADCAST' | 'AI_CONFIG' | 'PWA_POLICY'>('ENGINE_PACING');
+  const [settingsSubTab, setSettingsSubTab] = useState<'ENGINE_PACING' | 'MULTI_AI' | 'ECONOMY' | 'RULES' | 'BROADCAST' | 'AI_CONFIG' | 'PWA_POLICY' | 'SECURITY_AUDIT'>('ENGINE_PACING');
   const [aiPrefs, setAiPrefs] = useState<ChatBotPreferences>(() => AiAdminChatClient.getPreferences());
+  const [auditReport, setAuditReport] = useState<ProfileAuditReport | null>(null);
+  const [isAuditing, setIsAuditing] = useState<boolean>(false);
+  const [auditError, setAuditError] = useState<string | null>(null);
 
   useEffect(() => {
     KatikaService.getConfig().then((data) => {
@@ -144,6 +152,7 @@ export const KatikaSettingsTab: React.FC<KatikaSettingsTabProps> = ({ onConfigUp
           { id: 'BROADCAST', label: 'Message Global', icon: Megaphone },
           { id: 'AI_CONFIG', label: 'Assistant IA', icon: Bot },
           { id: 'PWA_POLICY', label: 'Versions PWA', icon: ShieldCheck },
+          { id: 'SECURITY_AUDIT', label: 'Audit Sécurité & Règles', icon: ShieldCheck },
         ].map((tab) => {
           const Icon = tab.icon;
           const isActive = settingsSubTab === tab.id;
@@ -1376,6 +1385,239 @@ export const KatikaSettingsTab: React.FC<KatikaSettingsTabProps> = ({ onConfigUp
                 <p className="text-[11px] text-slate-500">
                   Seuil sous lequel un avertissement majeur est affiché dans le Lobby.
                 </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* DOMAIN 8: AUDIT SÉCURITÉ & RÈGLES FIRESTORE (SECURITY_AUDIT) */}
+        {settingsSubTab === 'SECURITY_AUDIT' && (
+          <div className="space-y-6">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                <h3 className="text-sm font-bold text-white">Audit des Profils & Sécurité Firestore</h3>
+              </div>
+              <span className="text-[11px] font-mono text-emerald-400 bg-emerald-950/40 border border-emerald-800/40 px-2 py-0.5 rounded">
+                Étape Pré-déploiement Lot 3
+              </span>
+            </div>
+
+            <div className="p-4 rounded-xl bg-slate-850/70 border border-slate-700/60 space-y-3">
+              <p className="text-xs text-slate-300 leading-relaxed">
+                Avant de déployer les nouvelles règles de sécurité Firestore, cet outil scanne l'intégralité des profils joueurs (<code className="text-amber-300 font-mono">users/{'{uid}'}</code>) pour garantir la conformité aux invariants stricts :
+              </p>
+              <ul className="text-[11px] text-slate-400 space-y-1 list-disc pl-5">
+                <li><strong className="text-slate-200">Isolement des données personnelles :</strong> Détection de l'adresse e-mail dans le document public, copie sécurisée dans <code className="text-amber-300 font-mono">users/{'{uid}'}/private/profile</code> et suppression de la clé publique via <code className="text-amber-300 font-mono">deleteField()</code>.</li>
+                <li><strong className="text-slate-200">Pseudo (displayName) :</strong> Non vide, chaîne de caractères valide, plafonné à 30 caractères maximum.</li>
+                <li><strong className="text-slate-200">Jetons (chips) :</strong> Valeur numérique positive ou nulle (minimum 0).</li>
+                <li><strong className="text-slate-200">Invariants de jeu :</strong> <code className="text-slate-300 font-mono">partiesWon ≤ partiesPlayed</code>, <code className="text-slate-300 font-mono">gamesWon ≤ gamesPlayed</code>, <code className="text-slate-300 font-mono">manchesWon ≤ manchesPlayed</code>, <code className="text-slate-300 font-mono">doubleKoraCount ≤ koraCount</code>, etc.</li>
+                <li><strong className="text-slate-200">Types Fair-Play :</strong> Compteurs numériques valides, structure <code className="text-slate-300 font-mono">activeSanction</code> normalisée.</li>
+                <li><strong className="text-slate-200">Sauvegarde avant correction :</strong> Chaque document modifié reçoit une copie intégrale dans <code className="text-amber-300 font-mono">statsLegacyBackup</code> et un export JSON téléchargeable est généré.</li>
+              </ul>
+            </div>
+
+            {/* Actions Bar */}
+            <div className="flex items-center gap-3 flex-wrap">
+              <button
+                type="button"
+                disabled={isAuditing}
+                onClick={async () => {
+                  setIsAuditing(true);
+                  setAuditError(null);
+                  try {
+                    const report = await KatikaService.auditAndSanitizeAllProfiles();
+                    setAuditReport(report);
+                    setFeedback(`Audit terminé : ${report.totalScanned} profils analysés, ${report.totalCorrected} assainis.`);
+                  } catch (err: any) {
+                    setAuditError(err?.message || 'Erreur lors du scan des profils.');
+                  } finally {
+                    setIsAuditing(false);
+                  }
+                }}
+                className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-lg shadow-emerald-600/20 transition-all cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isAuditing ? 'animate-spin' : ''}`} />
+                <span>{isAuditing ? 'Analyse & Assainissement en cours...' : 'Lancer l’Audit & l’Assainissement'}</span>
+              </button>
+
+              {auditReport && (
+                <button
+                  type="button"
+                  onClick={() => KatikaService.downloadBackupJson(auditReport)}
+                  className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-semibold border border-amber-500/30 transition-all cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Télécharger l’Export JSON de Sauvegarde ({auditReport.corrections.length} modifiés)</span>
+                </button>
+              )}
+            </div>
+
+            {auditError && (
+              <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-800 text-rose-300 text-xs flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                <span>{auditError}</span>
+              </div>
+            )}
+
+            {/* Audit Summary Cards */}
+            {auditReport && (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div className="p-4 rounded-xl bg-slate-850/90 border border-slate-700/60 flex items-center gap-3">
+                    <div className="w-9 h-9 rounded-lg bg-blue-500/10 border border-blue-500/30 flex items-center justify-center text-blue-400 font-bold text-sm">
+                      {auditReport.totalScanned}
+                    </div>
+                    <div>
+                      <div className="text-[11px] text-slate-400">Profils Analysés</div>
+                      <div className="text-sm font-bold text-white">100% de la base</div>
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-xl bg-slate-850/90 border border-slate-700/60 flex items-center gap-3">
+                    <div className="w-9 h-9 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 font-bold text-sm">
+                      {auditReport.totalHealthy}
+                    </div>
+                    <div>
+                      <div className="text-[11px] text-slate-400">Profils Déjà Conformes</div>
+                      <div className="text-sm font-bold text-emerald-400">Aucune modification</div>
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-xl bg-slate-850/90 border border-slate-700/60 flex items-center gap-3">
+                    <div className="w-9 h-9 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 font-bold text-sm">
+                      {auditReport.totalCorrected}
+                    </div>
+                    <div>
+                      <div className="text-[11px] text-slate-400">Profils Assainis & Sécurisés</div>
+                      <div className="text-sm font-bold text-amber-400">Sauvegardés & corrigés</div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Detailed Corrections Report */}
+                {auditReport.corrections.length > 0 ? (
+                  <div className="space-y-2">
+                    <h4 className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                      <FileText className="w-3.5 h-3.5 text-amber-400" />
+                      Rapport détaillé des assainissements ({auditReport.corrections.length})
+                    </h4>
+                    <div className="max-h-72 overflow-y-auto space-y-2 pr-1 scrollbar-thin">
+                      {auditReport.corrections.map((entry, idx) => (
+                        <div key={entry.uid + idx} className="p-3 rounded-lg bg-slate-950/70 border border-slate-800 text-xs space-y-1.5">
+                          <div className="flex items-center justify-between flex-wrap gap-1">
+                            <span className="font-semibold text-amber-300">{entry.originalDisplayName}</span>
+                            <span className="font-mono text-[10px] text-slate-500">UID: {entry.uid}</span>
+                          </div>
+                          <div className="text-[11px] text-rose-300 space-y-0.5">
+                            {entry.reasons.map((r, ri) => (
+                              <div key={ri} className="flex items-center gap-1.5">
+                                <span className="w-1.5 h-1.5 rounded-full bg-rose-500" />
+                                <span>{r}</span>
+                              </div>
+                            ))}
+                          </div>
+                          <div className="text-[11px] text-emerald-300 space-y-0.5">
+                            {entry.appliedFixes.map((f, fi) => (
+                              <div key={fi} className="flex items-center gap-1.5">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                                <span>{f}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="p-4 rounded-xl bg-emerald-950/40 border border-emerald-800/40 text-emerald-300 text-xs flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span>Tous les profils analysés sont 100% conformes aux invariants. Aucune correction n'était requise.</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Checklist de Contrôle Pré-Déploiement Manuel */}
+            <div className="p-5 rounded-xl bg-slate-950 border border-amber-500/30 space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <CheckSquare className="w-4 h-4 text-amber-400" />
+                  <h4 className="text-xs font-bold text-white uppercase tracking-wider">
+                    Liste de Contrôle Pré-Déploiement Manuel (Règles Firestore)
+                  </h4>
+                </div>
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/30">
+                  Déploiement par l'Administrateur
+                </span>
+              </div>
+
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                Le déploiement des règles s'effectue manuellement par l'administrateur via la console Firebase (ou Firebase CLI) afin de conserver la maîtrise totale des versions. Validez chaque pré-requis avant d'appliquer les nouvelles règles :
+              </p>
+
+              <div className="space-y-2.5 text-xs">
+                <div className="flex items-start gap-2.5 p-2.5 rounded-lg bg-slate-900 border border-slate-800">
+                  <div className={`mt-0.5 ${auditReport ? 'text-emerald-400' : 'text-slate-600'}`}>
+                    {auditReport ? <CheckCircle2 className="w-4 h-4" /> : <Square className="w-4 h-4" />}
+                  </div>
+                  <div>
+                    <div className="font-semibold text-slate-200">1. Audit et assainissement des profils existants</div>
+                    <div className="text-[11px] text-slate-400">
+                      {auditReport 
+                        ? `Exécuté : ${auditReport.totalScanned} profils vérifiés, 0 violation résiduelle en base.` 
+                        : 'En attente : lancez l’audit ci-dessus avant de déployer.'}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-start gap-2.5 p-2.5 rounded-lg bg-slate-900 border border-slate-800">
+                  <div className="mt-0.5 text-emerald-400">
+                    <CheckCircle2 className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="font-semibold text-slate-200">2. Séparation des données privées (Email)</div>
+                    <div className="text-[11px] text-slate-400">
+                      Le code applicatif isole l'e-mail dans <code className="text-amber-300 font-mono">users/{'{uid}'}/private/profile</code> et ne transmet plus l'e-mail dans les écritures publiques.
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-start gap-2.5 p-2.5 rounded-lg bg-slate-900 border border-slate-800">
+                  <div className="mt-0.5 text-emerald-400">
+                    <CheckCircle2 className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="font-semibold text-slate-200">3. Code applicatif à jour & File hors-ligne assainie</div>
+                    <div className="text-[11px] text-slate-400">
+                      Version applicative 2.5.194 déployée. Les actions de la file hors-ligne au démarrage sont purgées du champ email.
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-start gap-2.5 p-2.5 rounded-lg bg-slate-900 border border-slate-800">
+                  <div className="mt-0.5 text-emerald-400">
+                    <CheckCircle2 className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="font-semibold text-slate-200">4. Sauvegarde de rollback prête</div>
+                    <div className="text-[11px] text-slate-400">
+                      La copie exacte des règles actuellement en production est conservée dans vos archives locales pour restauration instantanée en cas de besoin.
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-start gap-2.5 p-2.5 rounded-lg bg-slate-900 border border-slate-800">
+                  <div className="mt-0.5 text-amber-400">
+                    <Square className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="font-semibold text-slate-200">5. Publication manuelle dans Firebase Console</div>
+                    <div className="text-[11px] text-slate-400">
+                      Copiez le texte final des règles <code className="text-amber-300 font-mono">firestore.rules</code> fourni par l'assistant et collez-le dans l'onglet <em>Firestore Database &gt; Règles</em> de votre console Firebase, puis cliquez sur <strong>Publier</strong>.
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           </div>

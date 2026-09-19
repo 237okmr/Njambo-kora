@@ -724,6 +724,16 @@ export class RoomManager {
 
         console.log(`[Auth] Authenticated Google player: ${verifiedUid} (email: ${result.email || 'n/a'})`);
 
+        // If client was previously associated with an active room and is a non-spectator non-forfeit member, resume seat
+        if (client.roomCode && this.rooms.has(client.roomCode)) {
+          const room = this.rooms.get(client.roomCode)!;
+          const player = (room.players || []).find((p) => p.id === verifiedUid);
+          if (player && !player.isSpectator && !player.isForfeit) {
+            console.log(`[Auth] Resuming seat automatically for authenticated player '${verifiedUid}' in room '${client.roomCode}'`);
+            this.resumeSeat(client, client.roomCode);
+          }
+        }
+
         // Drain any messages that arrived while authenticating
         if (client.messageQueue && client.messageQueue.length > 0) {
           const queue = [...client.messageQueue];
@@ -764,7 +774,7 @@ export class RoomManager {
         console.warn(`[Security] Rejected message: msg.playerId '${msg.playerId}' != client.playerId '${client.playerId}' (type: ${msg.type})`);
         this.sendMessage(client.socket, {
           type: 'ERROR',
-          errorCode: 'GENERIC',
+          errorCode: 'AUTH_REQUIRED',
           error: 'Action non autorisée : identifiant joueur invalide pour cette connexion.',
         });
         return;
@@ -775,7 +785,7 @@ export class RoomManager {
         console.warn(`[Security] Unauthenticated client attempting action with Google UID '${client.playerId}' without AUTH verification.`);
         this.sendMessage(client.socket, {
           type: 'ERROR',
-          errorCode: 'GENERIC',
+          errorCode: 'AUTH_REQUIRED',
           error: 'Action non autorisée : authentification requise.',
         });
         return;
@@ -1139,6 +1149,7 @@ export class RoomManager {
       disconnectGraceSeconds: (settings as any).disconnectGraceSeconds || this.engineConfig.reconnectGracePeriodSeconds || 30,
       players: [hostPlayer],
       gameState: null,
+      mancheNumber: 1,
       protocolVersion: this.CURRENT_PROTOCOL_VERSION,
       serverVersion: this.SERVER_VERSION,
       createdAt: Date.now(),
@@ -1506,71 +1517,8 @@ export class RoomManager {
           this.setRoomPlayerToken(roomCode, client.playerId, client.reconnectToken);
         }
       } else {
-        this.removePlayerFromOtherRooms(client.playerId, roomCode);
-        if (oldClient && oldClient.socket !== client.socket && oldClient.socket.readyState === WebSocket.OPEN) {
-          try {
-            oldClient.socket.close(1000, 'Session remplacée par une nouvelle connexion');
-          } catch (e) {
-            // ignore
-          }
-        }
-        if (providedToken) {
-          this.setRoomPlayerToken(roomCode, client.playerId, providedToken);
-          client.reconnectToken = providedToken;
-          this.tokenToPlayerId.set(providedToken, client.playerId);
-          this.playerIdToToken.set(client.playerId, providedToken);
-        }
-        this.clients.set(client.playerId, client);
-
-        // [Droit du sang] - Host recovery
-        if (room.originalHostId === client.playerId && room.hostId !== client.playerId) {
-          const previousHost = (room.players || []).find((p) => p.id === room.hostId);
-          if (previousHost) previousHost.isHost = false;
-          existingPlayer.isHost = true;
-          room.hostId = client.playerId;
-          room.hostName = playerName;
-          this.broadcastRoomState(roomCode);
-          this.evaluateAutoStart(roomCode);
-          const emote: EmoteMessage = {
-            id: 'em_' + Math.random().toString(36).substring(2, 9),
-            playerId: 'system',
-            playerName: 'Table',
-            text: `👑 L'hôte original (${playerName}) est de retour et récupère ses droits !`,
-            emoji: '👑',
-            timestamp: Date.now(),
-            isBot: true,
-          };
-          room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
-        }
-
-        existingPlayer.connected = true;
-        existingPlayer.lastSeen = Date.now();
-        const wasSpectator = existingPlayer.isSpectator;
-        const activeCount = (room.players || []).filter((p) => !p.isSpectator && p.id !== client.playerId).length;
-        
-        if (room.status === 'LOBBY' || room.status === 'MANCHE_OVER') {
-          existingPlayer.isSpectator = activeCount >= room.maxPlayers;
-          if (!existingPlayer.isSpectator) {
-            existingPlayer.isEliminated = false;
-            existingPlayer.isForfeit = false;
-            existingPlayer.isReady = true;
-            if (room.status === 'LOBBY') {
-              existingPlayer.capital = room.initialCapital;
-              existingPlayer.score = room.initialCapital;
-            }
-          }
-        }
-        const state = this.getOrCreateActiveState(roomCode, room);
-        ServerGameEngine.handlePlayerReconnect(
-          room,
-          client.playerId,
-          (updatedRoom) => {
-            this.broadcastRoomState(updatedRoom.id);
-          this.evaluateAutoStart(updatedRoom.id);
-          },
-          state
-        );
-        if (msg.playerName) existingPlayer.name = playerName;
+        this.resumeSeat(client, roomCode, playerName, providedToken, isProtocolCompatible, updateRecommended);
+        return;
       }
     } else {
       // Prune permanently disconnected players whose grace expired before joining
@@ -1703,6 +1651,125 @@ export class RoomManager {
 
     this.broadcastRoomState(roomCode);
     this.evaluateAutoStart(roomCode);
+  }
+
+  /**
+   * Resumes seat of an existing player in a room upon reconnection (from handleJoinRoom or handleAuthMessage).
+   * Strictly idempotent to avoid duplicated messages or emotes.
+   */
+  private static resumeSeat(
+    client: ConnectedClient,
+    roomCode: string,
+    playerName?: string,
+    providedToken?: string,
+    isProtocolCompatible: boolean = true,
+    updateRecommended: boolean = false
+  ): boolean {
+    const room = this.rooms.get(roomCode);
+    if (!room) return false;
+
+    const existingPlayer = (room.players || []).find((p) => p.id === client.playerId);
+    if (!existingPlayer) return false;
+
+    const token = providedToken || client.reconnectToken;
+    const oldClient = this.clients.get(existingPlayer.id);
+
+    this.removePlayerFromOtherRooms(client.playerId, roomCode);
+
+    if (oldClient && oldClient.socket !== client.socket && oldClient.socket.readyState === WebSocket.OPEN) {
+      try {
+        oldClient.socket.close(1000, 'Session remplacée par une nouvelle connexion');
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    if (token) {
+      this.setRoomPlayerToken(roomCode, client.playerId, token);
+      client.reconnectToken = token;
+      this.tokenToPlayerId.set(token, client.playerId);
+      this.playerIdToToken.set(client.playerId, token);
+    }
+    client.roomCode = roomCode;
+    this.clients.set(client.playerId, client);
+
+    const displayName = playerName || existingPlayer.name;
+
+    // [Droit du sang] - Host recovery
+    if (room.originalHostId === client.playerId && room.hostId !== client.playerId) {
+      const previousHost = (room.players || []).find((p) => p.id === room.hostId);
+      if (previousHost) previousHost.isHost = false;
+      existingPlayer.isHost = true;
+      room.hostId = client.playerId;
+      room.hostName = displayName;
+      this.broadcastRoomState(roomCode);
+      this.evaluateAutoStart(roomCode);
+      const emote: EmoteMessage = {
+        id: 'em_' + Math.random().toString(36).substring(2, 9),
+        playerId: 'system',
+        playerName: 'Table',
+        text: `👑 L'hôte original (${displayName}) est de retour et récupère ses droits !`,
+        emoji: '👑',
+        timestamp: Date.now(),
+        isBot: true,
+      };
+      room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
+    }
+
+    existingPlayer.connected = true;
+    existingPlayer.lastSeen = Date.now();
+    const activeCount = (room.players || []).filter((p) => !p.isSpectator && p.id !== client.playerId).length;
+
+    if (room.status === 'LOBBY' || room.status === 'MANCHE_OVER') {
+      existingPlayer.isSpectator = activeCount >= room.maxPlayers;
+      if (!existingPlayer.isSpectator) {
+        existingPlayer.isEliminated = false;
+        existingPlayer.isForfeit = false;
+        existingPlayer.isReady = true;
+        if (room.status === 'LOBBY') {
+          existingPlayer.capital = room.initialCapital;
+          existingPlayer.score = room.initialCapital;
+        }
+      }
+    }
+
+    const state = this.getOrCreateActiveState(roomCode, room);
+    ServerGameEngine.handlePlayerReconnect(
+      room,
+      client.playerId,
+      (updatedRoom) => {
+        this.broadcastRoomState(updatedRoom.id);
+        this.evaluateAutoStart(updatedRoom.id);
+      },
+      state
+    );
+
+    if (playerName) existingPlayer.name = playerName;
+
+    // Strictly deduplicate room.players to prevent any duplicate player entries
+    const seenPlayerIds = new Set<string>();
+    room.players = (room.players || []).filter((p) => {
+      if (seenPlayerIds.has(p.id)) return false;
+      seenPlayerIds.add(p.id);
+      return true;
+    });
+
+    room.updatedAt = Date.now();
+
+    this.sendMessage(client.socket, {
+      type: 'ROOM_JOINED',
+      room: maskOpponentCards(room, client.playerId),
+      playerId: client.playerId,
+      reconnectToken: client.reconnectToken,
+      protocolVersion: this.CURRENT_PROTOCOL_VERSION,
+      serverVersion: this.SERVER_VERSION,
+      isProtocolCompatible,
+      updateRecommended,
+    });
+
+    this.broadcastRoomState(roomCode);
+    this.evaluateAutoStart(roomCode);
+    return true;
   }
 
   public static evaluateLobbyHostInactivity(roomCode: string): void {
@@ -2031,7 +2098,9 @@ export class RoomManager {
     }
 
     if (room.status === 'MANCHE_OVER') {
-      // Revanche / Nouvelle manche : promouvoir d'abord les spectateurs connectés s'il y a des places libres
+      // Revanche / Nouvelle manche : incrémenter le numéro de manche officiel pour toute la table
+      room.mancheNumber = (room.mancheNumber || 1) + 1;
+      // Promouvoir d'abord les spectateurs connectés s'il y a des places libres
       const activePlayerCount = (room.players || []).filter(p => !p.isSpectator).length;
       if (activePlayerCount < maxCapacity) {
         (room.players || []).forEach(p => {

@@ -1,9 +1,27 @@
 import { KatikaKPIs, KatikaLiveRoom, KatikaPlayer, KatikaGameConfig, KatikaAuditLog } from '../types/katika';
 import { telemetryService, GameTelemetryRecord, GlobalMancheCounts } from '../../services/telemetryService';
-import { collection, getDocs, doc, setDoc } from 'firebase/firestore';
+import { collection, getDocs, doc, setDoc, updateDoc, deleteField } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
 import { playerProfileService, computeMasteryScore } from '../../services/playerProfileService';
 import { setBotTimingConfig, setBotDialogueConfig } from '../../utils/ai';
+
+export interface ProfileCorrectionEntry {
+  uid: string;
+  originalDisplayName: string;
+  reasons: string[];
+  appliedFixes: string[];
+  beforeData: any;
+  afterData: any;
+}
+
+export interface ProfileAuditReport {
+  totalScanned: number;
+  totalHealthy: number;
+  totalCorrected: number;
+  corrections: ProfileCorrectionEntry[];
+  backupJson: string;
+  timestamp: number;
+}
 
 export const OFFICIAL_BOT_NAMES = [
   "Thom's Kora",
@@ -1581,5 +1599,302 @@ export const KatikaService = {
       summary: `Message administratif envoyé sur la table ${roomId}${playerId ? ` au joueur (${playerId})` : ''} : "${message}"`,
       details: { roomId, playerId, message },
     });
+  },
+
+  /**
+   * Audit et assainissement pré-déploiement des règles Firestore.
+   * Scanne tous les profils de users/{uid} :
+   * 1. Détecte et corrige les violations d'invariants (compteurs, non-régression, bornes, types, fairPlay, displayName).
+   * 2. Migre et isole l'email dans users/{uid}/private/profile, puis le supprime du document public (deleteField).
+   * 3. Sauvegarde chaque profil modifié dans statsLegacyBackup et fournit un export JSON téléchargeable.
+   */
+  auditAndSanitizeAllProfiles: async (): Promise<ProfileAuditReport> => {
+    if (!db) {
+      throw new Error('Firestore database instance unavailable');
+    }
+
+    const usersRef = collection(db, 'users');
+    const snapshot = await getDocs(usersRef);
+
+    let totalScanned = 0;
+    let totalHealthy = 0;
+    let totalCorrected = 0;
+    const corrections: ProfileCorrectionEntry[] = [];
+    const backupList: any[] = [];
+
+    for (const docSnap of snapshot.docs) {
+      totalScanned++;
+      const uid = docSnap.id;
+      const data = docSnap.data() || {};
+      const reasons: string[] = [];
+      const appliedFixes: string[] = [];
+      const userRef = doc(db, 'users', uid);
+
+      let needsUpdate = false;
+      const patch: Record<string, any> = {};
+
+      // 1. Audit et migration de l'e-mail privé
+      const hasEmailExposed = 'email' in data && data.email !== null && data.email !== undefined && String(data.email).trim() !== '';
+      if (hasEmailExposed) {
+        const rawEmail = String(data.email).trim();
+        reasons.push(`Email personnel exposé dans le document public : ${rawEmail}`);
+        // Copier dans le sous-document privé
+        try {
+          const privateProfileRef = doc(db, 'users', uid, 'private', 'profile');
+          await setDoc(privateProfileRef, {
+            email: rawEmail,
+            uid,
+            migratedAt: Date.now(),
+            updatedAt: Date.now(),
+          }, { merge: true });
+          appliedFixes.push(`Email copié dans users/${uid}/private/profile`);
+        } catch (err) {
+          console.warn(`[KatikaService] Erreur lors de la copie privée de l'email pour ${uid}:`, err);
+        }
+        // Supprimer du document public
+        patch.email = deleteField();
+        appliedFixes.push(`Champ 'email' supprimé du document public via deleteField()`);
+        needsUpdate = true;
+      }
+
+      // 2. Audit du displayName
+      const rawName = data.displayName;
+      let cleanName = rawName;
+      if (typeof rawName !== 'string' || rawName.trim() === '') {
+        reasons.push(`displayName vide ou non-chaîne (valeur: ${JSON.stringify(rawName)})`);
+        cleanName = 'Joueur';
+        patch.displayName = cleanName;
+        appliedFixes.push(`displayName réinitialisé à 'Joueur'`);
+        needsUpdate = true;
+      } else if (rawName.trim().length > 30) {
+        reasons.push(`displayName dépasse 30 caractères (${rawName.trim().length} car.)`);
+        cleanName = rawName.trim().slice(0, 30);
+        patch.displayName = cleanName;
+        appliedFixes.push(`displayName tronqué à 30 caractères ('${cleanName}')`);
+        needsUpdate = true;
+      }
+
+      // 3. Audit des Jetons (chips >= 0)
+      const currentChips = data.chips;
+      if (typeof currentChips !== 'number' || isNaN(currentChips)) {
+        reasons.push(`Solde de jetons non numérique : ${currentChips}`);
+        patch.chips = 1000;
+        appliedFixes.push(`Jetons réinitialisés à la valeur par défaut (1000)`);
+        needsUpdate = true;
+      } else if (currentChips < 0) {
+        reasons.push(`Solde de jetons négatif (${currentChips})`);
+        patch.chips = 0;
+        appliedFixes.push(`Solde de jetons ramené au plancher minimum (0)`);
+        needsUpdate = true;
+      }
+
+      // 4. Audit des Statistiques (PlayerStats) et Invariants de jeu
+      const rawStats = (data.stats && typeof data.stats === 'object') ? { ...data.stats } : {};
+      let statsModified = false;
+
+      // Fonctions utilitaires de validation des entiers
+      const getNum = (v: any, fallback = 0) => (typeof v === 'number' && !isNaN(v) && v >= 0) ? Math.floor(v) : fallback;
+
+      const partiesPlayed = getNum(rawStats.partiesPlayed, 0);
+      const partiesWon = getNum(rawStats.partiesWon, 0);
+      if (partiesWon > partiesPlayed) {
+        reasons.push(`partiesWon (${partiesWon}) > partiesPlayed (${partiesPlayed})`);
+        rawStats.partiesPlayed = partiesWon;
+        appliedFixes.push(`partiesPlayed ajusté de ${partiesPlayed} à ${partiesWon}`);
+        statsModified = true;
+      }
+
+      const gamesPlayed = getNum(rawStats.gamesPlayed, 0);
+      const gamesWon = getNum(rawStats.gamesWon, 0);
+      if (gamesWon > gamesPlayed) {
+        reasons.push(`gamesWon (${gamesWon}) > gamesPlayed (${gamesPlayed})`);
+        rawStats.gamesPlayed = gamesWon;
+        appliedFixes.push(`gamesPlayed ajusté de ${gamesPlayed} à ${gamesWon}`);
+        statsModified = true;
+      }
+
+      const manchesPlayed = getNum(rawStats.manchesPlayed, 0);
+      const manchesWon = getNum(rawStats.manchesWon, 0);
+      if (manchesWon > manchesPlayed) {
+        reasons.push(`manchesWon (${manchesWon}) > manchesPlayed (${manchesPlayed})`);
+        rawStats.manchesPlayed = manchesWon;
+        appliedFixes.push(`manchesPlayed ajusté de ${manchesPlayed} à ${manchesWon}`);
+        statsModified = true;
+      }
+
+      const koraCount = getNum(rawStats.koraCount, 0);
+      const doubleKoraCount = getNum(rawStats.doubleKoraCount, 0);
+      if (doubleKoraCount > koraCount) {
+        reasons.push(`doubleKoraCount (${doubleKoraCount}) > koraCount (${koraCount})`);
+        rawStats.koraCount = doubleKoraCount;
+        appliedFixes.push(`koraCount ajusté de ${koraCount} à ${doubleKoraCount}`);
+        statsModified = true;
+      }
+
+      const soloGamesPlayed = getNum(rawStats.soloGamesPlayed, 0);
+      const soloGamesWon = getNum(rawStats.soloGamesWon, 0);
+      if (soloGamesWon > soloGamesPlayed) {
+        reasons.push(`soloGamesWon (${soloGamesWon}) > soloGamesPlayed (${soloGamesPlayed})`);
+        rawStats.soloGamesPlayed = soloGamesWon;
+        appliedFixes.push(`soloGamesPlayed ajusté de ${soloGamesPlayed} à ${soloGamesWon}`);
+        statsModified = true;
+      }
+
+      const multiplayerGamesPlayed = getNum(rawStats.multiplayerGamesPlayed, 0);
+      const multiplayerGamesWon = getNum(rawStats.multiplayerGamesWon, 0);
+      if (multiplayerGamesWon > multiplayerGamesPlayed) {
+        reasons.push(`multiplayerGamesWon (${multiplayerGamesWon}) > multiplayerGamesPlayed (${multiplayerGamesPlayed})`);
+        rawStats.multiplayerGamesPlayed = multiplayerGamesWon;
+        appliedFixes.push(`multiplayerGamesPlayed ajusté de ${multiplayerGamesPlayed} à ${multiplayerGamesWon}`);
+        statsModified = true;
+      }
+
+      const soloManchesPlayed = getNum(rawStats.soloManchesPlayed, 0);
+      const soloManchesWon = getNum(rawStats.soloManchesWon, 0);
+      if (soloManchesWon > soloManchesPlayed) {
+        reasons.push(`soloManchesWon (${soloManchesWon}) > soloManchesPlayed (${soloManchesPlayed})`);
+        rawStats.soloManchesPlayed = soloManchesWon;
+        appliedFixes.push(`soloManchesPlayed ajusté de ${soloManchesPlayed} à ${soloManchesWon}`);
+        statsModified = true;
+      }
+
+      const multiplayerManchesPlayed = getNum(rawStats.multiplayerManchesPlayed, 0);
+      const multiplayerManchesWon = getNum(rawStats.multiplayerManchesWon, 0);
+      if (multiplayerManchesWon > multiplayerManchesPlayed) {
+        reasons.push(`multiplayerManchesWon (${multiplayerManchesWon}) > multiplayerManchesPlayed (${multiplayerManchesPlayed})`);
+        rawStats.multiplayerManchesPlayed = multiplayerManchesWon;
+        appliedFixes.push(`multiplayerManchesPlayed ajusté de ${multiplayerManchesPlayed} à ${multiplayerManchesWon}`);
+        statsModified = true;
+      }
+
+      // Re-calcul du score de maîtrise Lot 2
+      const calculatedMastery = computeMasteryScore(rawStats as any);
+      if (rawStats.masteryScore !== calculatedMastery || rawStats.scoreVersion !== 2) {
+        rawStats.masteryScore = calculatedMastery;
+        rawStats.scoreVersion = 2;
+        appliedFixes.push(`Score de maîtrise Lot 2 recalculé et synchronisé (${calculatedMastery} pts, v2)`);
+        statsModified = true;
+      }
+
+      if (statsModified || !data.stats) {
+        patch.stats = rawStats;
+        needsUpdate = true;
+      }
+
+      // 5. Audit des types Fair-Play
+      const rawFp = (data.fairPlay && typeof data.fairPlay === 'object') ? { ...data.fairPlay } : {};
+      let fpModified = false;
+
+      const checkFpNum = (field: string) => {
+        if (typeof rawFp[field] !== 'number' || isNaN(rawFp[field]) || rawFp[field] < 0) {
+          reasons.push(`Champ fairPlay.${field} de type invalide (${rawFp[field]})`);
+          rawFp[field] = 0;
+          appliedFixes.push(`fairPlay.${field} normalisé à 0`);
+          fpModified = true;
+        }
+      };
+
+      checkFpNum('consecutiveForfeits');
+      checkFpNum('totalForfeits');
+      checkFpNum('totalFoldRounds');
+      checkFpNum('prolongedDisconnects');
+      checkFpNum('totalGamesStarted');
+
+      if (rawFp.activeSanction !== undefined && rawFp.activeSanction !== null) {
+        const s = rawFp.activeSanction;
+        if (typeof s !== 'object' || typeof s.type !== 'string' || typeof s.active !== 'boolean') {
+          reasons.push(`Structure activeSanction invalide`);
+          rawFp.activeSanction = null;
+          appliedFixes.push(`Structure activeSanction corrompue réinitialisée à null`);
+          fpModified = true;
+        }
+      }
+
+      if (!Array.isArray(rawFp.sanctionsHistory)) {
+        rawFp.sanctionsHistory = [];
+        fpModified = true;
+      }
+
+      if (fpModified || !data.fairPlay) {
+        patch.fairPlay = rawFp;
+        needsUpdate = true;
+      }
+
+      // Si le profil nécessite des corrections
+      if (needsUpdate) {
+        totalCorrected++;
+
+        // Sauvegarde legacy avant correction dans le document
+        patch.statsLegacyBackup = {
+          backedUpAt: Date.now(),
+          previousDisplayName: rawName,
+          previousChips: currentChips,
+          previousStats: data.stats || null,
+          previousFairPlay: data.fairPlay || null,
+          reasons: [...reasons],
+        };
+        patch.updatedAt = Date.now();
+
+        // Ajout à l'export JSON global téléchargeable
+        backupList.push({
+          uid,
+          capturedAt: new Date().toISOString(),
+          originalDocument: { ...data },
+          reasons,
+          appliedFixes,
+        });
+
+        // Écriture sur Firestore
+        await updateDoc(userRef, patch);
+
+        corrections.push({
+          uid,
+          originalDisplayName: String(rawName || 'Sans nom'),
+          reasons,
+          appliedFixes,
+          beforeData: data,
+          afterData: { ...data, ...patch },
+        });
+      } else {
+        totalHealthy++;
+      }
+    }
+
+    const report: ProfileAuditReport = {
+      totalScanned,
+      totalHealthy,
+      totalCorrected,
+      corrections,
+      backupJson: JSON.stringify(backupList, null, 2),
+      timestamp: Date.now(),
+    };
+
+    mockAuditLogs.unshift({
+      id: `log-${Date.now()}`,
+      timestamp: Date.now(),
+      type: 'KATIKA_ACTION',
+      severity: totalCorrected > 0 ? 'WARNING' : 'INFO',
+      actor: 'Katika Master',
+      summary: `Audit de conformité des profils : ${totalScanned} analysés, ${totalCorrected} assainis, ${totalHealthy} conformes`,
+      details: { totalScanned, totalCorrected, totalHealthy, correctionsCount: corrections.length },
+    });
+
+    return report;
+  },
+
+  /**
+   * Déclenche le téléchargement immédiat du fichier JSON de sauvegarde de l'audit
+   */
+  downloadBackupJson: (report: ProfileAuditReport): void => {
+    if (!report.backupJson) return;
+    const blob = new Blob([report.backupJson], { type: 'application/json;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `njambo-backup-profils-pre-migration-${new Date().toISOString().slice(0, 10)}.json`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   },
 };

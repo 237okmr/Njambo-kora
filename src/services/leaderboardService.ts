@@ -11,6 +11,7 @@ import { computeHonorificTitle, computeMasteryScore, DEFAULT_PLAYER_STATS, playe
 import { FriendService } from './friendService';
 import { AvatarOptionId, HONORIFIC_TITLES } from '../types/playerProfile';
 import { getPlayerId } from './identity';
+import { formatMasteryScore } from './masteryConfig';
 
 const LEADERBOARD_CACHE_KEY = 'njambo_leaderboard_cache_v5';
 const CACHE_TTL_MS = 20 * 1000; // 20 seconds local cache
@@ -222,7 +223,7 @@ export class LeaderboardService {
 
       if (category === 'WINS') {
         scoreValue = masteryScore;
-        scoreFormatted = `${masteryScore}`;
+        scoreFormatted = formatMasteryScore(masteryScore);
         scoreUnit = 'pts';
       } else if (category === 'KORAS') {
         scoreValue = totalKorasScore;

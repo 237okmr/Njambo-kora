@@ -83,6 +83,7 @@ export type ServerErrorCode =
   | 'VOTE_CLOSED'
   | 'INVITE_EXPIRED'
   | 'JOIN_REFUSED'
+  | 'AUTH_REQUIRED'
   | 'RATE_LIMITED'
   | 'BANNED'
   | 'MAINTENANCE'

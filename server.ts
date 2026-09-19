@@ -9,6 +9,7 @@ import { handleAdminChatMessage, streamAdminChatMessage } from './server/aiAdmin
 import { pushService } from './server/pushService';
 import { collection, getDocs, query, limit, orderBy } from 'firebase/firestore';
 import { db } from './src/lib/firebase';
+import { computeMasteryScoreFromStats } from './src/services/masteryConfig';
 
 const PORT = 3000;
 const instanceId = 'inst_' + Math.random().toString(36).substring(2, 10) + '_' + Date.now().toString(36);
@@ -194,33 +195,7 @@ async function startServer() {
   const LEADERBOARD_CACHE_TTL = 60 * 1000;
 
   function calculateMasteryScore(stats: any): number {
-    const mpManches = stats?.multiplayerManchesWon || 0;
-    const soloHardManches = stats?.soloManchesWonHard || 0;
-    const soloNormalManches = stats?.soloManchesWonNormal || 0;
-    const soloEasyManches = stats?.soloManchesWonEasy || 0;
-
-    const totalDetailedSolo = soloHardManches + soloNormalManches + soloEasyManches;
-    const totalSoloManches = stats?.soloManchesWon || 0;
-    const untrackedSoloManches = Math.max(0, totalSoloManches - totalDetailedSolo);
-    const untrackedSoloPoints = untrackedSoloManches * 3; // default normal
-
-    const partiesWon = stats?.partiesWon || stats?.gamesWon || 0;
-
-    const doubleKoras = stats?.doubleKoraCount || 0;
-    const totalKoras = stats?.koraCount || 0;
-    const simpleKoras = Math.max(0, totalKoras - doubleKoras);
-
-    const total =
-      (mpManches * 10) +
-      (soloHardManches * 6) +
-      (soloNormalManches * 3) +
-      (soloEasyManches * 1) +
-      untrackedSoloPoints +
-      (partiesWon * 1) +
-      (simpleKoras * 5) +
-      (doubleKoras * 20);
-
-    return Math.max(0, Math.round(total));
+    return computeMasteryScoreFromStats(stats);
   }
 
   function normalizePlayerName(name: string): string {
@@ -272,7 +247,46 @@ async function startServer() {
               });
             });
 
-            // 2. Aggregate human player stats from game records (with full detail for new mastery scale)
+            // 2. Indexation et corroboration des enregistrements multijoueur
+            // Un enregistrement MULTIPLAYER n'est pris en compte pour la Semaine et le Mois
+            // que s'il est corroboré par deux UIDs créateurs distincts avec le même roomId, mancheNumber et winnerId.
+            // Les enregistrements anciens (sans roomId, mancheNumber ou creatorUid) sont ignorés pour Semaine et Mois.
+            const mpGroups = new Map<string, Array<{ id: string; creatorUid?: string; winnerId?: string; winnerName?: string }>>();
+            const corroboratedRecordIds = new Set<string>();
+
+            recordsSnap.docs.forEach((d) => {
+              const g = d.data();
+              if (g.mode === 'MULTIPLAYER' && g.roomId && g.mancheNumber !== undefined && g.creatorUid) {
+                const groupKey = `${g.roomId}__m${g.mancheNumber}`;
+                if (!mpGroups.has(groupKey)) {
+                  mpGroups.set(groupKey, []);
+                }
+                mpGroups.get(groupKey)!.push({
+                  id: d.id,
+                  creatorUid: g.creatorUid,
+                  winnerId: g.winnerId,
+                  winnerName: g.winnerName,
+                });
+              }
+            });
+
+            for (const [_key, list] of mpGroups.entries()) {
+              for (let i = 0; i < list.length; i++) {
+                for (let j = i + 1; j < list.length; j++) {
+                  const a = list[i];
+                  const b = list[j];
+                  const distinctCreators = a.creatorUid && b.creatorUid && a.creatorUid !== b.creatorUid;
+                  const concordantWinner = (a.winnerId && b.winnerId && a.winnerId === b.winnerId) ||
+                    (a.winnerName && b.winnerName && a.winnerName === b.winnerName);
+                  if (distinctCreators && concordantWinner) {
+                    corroboratedRecordIds.add(a.id);
+                    corroboratedRecordIds.add(b.id);
+                  }
+                }
+              }
+            }
+
+            // 3. Agrégation des statistiques par joueur
             const gameStatsByPlayer = new Map<string, any>();
             const now = Date.now();
             const oneWeekAgo = now - 7 * 24 * 60 * 60 * 1000;
@@ -281,6 +295,10 @@ async function startServer() {
             recordsSnap.docs.forEach((d) => {
               const g = d.data();
               const gameTime = g.createdAt || g.timestamp || 0;
+              const isMultiplayer = g.mode === 'MULTIPLAYER';
+              const isCorroborated = !isMultiplayer || corroboratedRecordIds.has(d.id);
+              // Les enregistrements multijoueur non corroborés ou anciens sont exclus des filtres Semaine et Mois
+              const allowInTimeframe = !isMultiplayer || isCorroborated;
 
               const players = g.players || [];
               players.forEach((p: any) => {
@@ -312,33 +330,35 @@ async function startServer() {
                 };
 
                 cur.gamesPlayed++;
-                if (gameTime >= oneWeekAgo) cur.week.gamesPlayed++;
-                if (gameTime >= oneMonthAgo) cur.month.gamesPlayed++;
+                if (allowInTimeframe && gameTime >= oneWeekAgo) cur.week.gamesPlayed++;
+                if (allowInTimeframe && gameTime >= oneMonthAgo) cur.month.gamesPlayed++;
 
                 const isWinner = g.winnerId === pid || g.winnerName === pname;
                 if (isWinner) {
                   cur.gamesWon++;
-                  if (gameTime >= oneWeekAgo) cur.week.gamesWon++;
-                  if (gameTime >= oneMonthAgo) cur.month.gamesWon++;
+                  if (allowInTimeframe && gameTime >= oneWeekAgo) cur.week.gamesWon++;
+                  if (allowInTimeframe && gameTime >= oneMonthAgo) cur.month.gamesWon++;
 
                   if (g.winType === 'KORA') {
                     cur.koraCount++;
-                    if (gameTime >= oneWeekAgo) cur.week.koraCount++;
-                    if (gameTime >= oneMonthAgo) cur.month.koraCount++;
+                    if (allowInTimeframe && gameTime >= oneWeekAgo) cur.week.koraCount++;
+                    if (allowInTimeframe && gameTime >= oneMonthAgo) cur.month.koraCount++;
                   }
                   if (g.winType === 'DOUBLE_KORA') {
                     cur.doubleKoraCount++;
-                    if (gameTime >= oneWeekAgo) cur.week.doubleKoraCount++;
-                    if (gameTime >= oneMonthAgo) cur.month.doubleKoraCount++;
+                    if (allowInTimeframe && gameTime >= oneWeekAgo) cur.week.doubleKoraCount++;
+                    if (allowInTimeframe && gameTime >= oneMonthAgo) cur.month.doubleKoraCount++;
                   }
                   if (g.potWon) cur.potWon += g.potWon;
 
                   if (g.isMancheFinalWin) {
                     cur.manchesWon++;
                     if (g.mode === 'MULTIPLAYER') {
-                      cur.multiplayerManchesWon++;
-                      if (gameTime >= oneWeekAgo) cur.week.multiplayerManchesWon++;
-                      if (gameTime >= oneMonthAgo) cur.month.multiplayerManchesWon++;
+                      if (isCorroborated) {
+                        cur.multiplayerManchesWon++;
+                        if (gameTime >= oneWeekAgo) cur.week.multiplayerManchesWon++;
+                        if (gameTime >= oneMonthAgo) cur.month.multiplayerManchesWon++;
+                      }
                     } else {
                       cur.soloManchesWon++;
                       const diff = (g.aiDifficulty || 'NORMAL').toUpperCase();
@@ -358,6 +378,7 @@ async function startServer() {
                     }
                   }
                 }
+
                 gameStatsByPlayer.set(key, cur);
               });
             });

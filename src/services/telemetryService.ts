@@ -10,8 +10,6 @@ import {
   where,
 } from 'firebase/firestore';
 import { db, auth } from '../lib/firebase';
-import { playerProfileService } from './playerProfileService';
-import { getPlayerId } from './identity';
 
 export type GameRecordStatus = 'completed' | 'in_progress' | 'abandoned';
 
@@ -50,6 +48,9 @@ export function qualifyRecordStatus(
 
 export interface GameTelemetryRecord {
   id?: string;
+  creatorUid?: string; // UID Firebase de l'auteur de l'enregistrement (pour corroboration)
+  roomId?: string; // Identifiant de la table/salon multijoueur
+  mancheNumber?: number; // Numéro de manche officiel (fourni par le serveur de jeu, identique pour toute la table)
   mode: 'SOLO' | 'MULTIPLAYER';
   playerCount: number; // 2, 3, 4
   winType: 'STANDARD' | 'KORA' | 'DOUBLE_KORA' | 'THREE_SEVENS' | 'UNDER_21';
@@ -71,6 +72,7 @@ export interface GameTelemetryRecord {
   potGross?: number; // Total misé à la table
   baseBet?: number; // Mise unitaire par joueur
   currency?: 'CHIPS' | 'XAF'; // Devise : Jetons virtuels ou Francs CFA réels
+  aiDifficulty?: 'EASY' | 'NORMAL' | 'EXPERT' | 'GRAND_MASTER' | string;
   createdAt: number;
   updatedAt?: number;
   players?: Array<{
@@ -96,6 +98,7 @@ const LOCAL_STORAGE_KEY = 'njambo_telemetry_game_records';
 export const telemetryService = {
   /**
    * Records a game or round (in_progress or completed) in Firestore + local cache (Idempotent)
+   * Note: This strictly persists records to njambo_game_records without modifying profile stats.
    */
   recordGame: async (record: Omit<GameTelemetryRecord, 'createdAt'> & { createdAt?: number }): Promise<void> => {
     const docId = record.id || `rec_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -104,9 +107,13 @@ export const telemetryService = {
     const status: GameRecordStatus =
       record.status || (record.isAbandoned ? 'in_progress' : 'completed');
 
+    const currentUid = auth.currentUser?.uid;
     const entry: GameTelemetryRecord = {
       ...record,
       id: docId,
+      creatorUid: currentUid || record.creatorUid || 'guest',
+      roomId: record.roomId || (record.mode === 'MULTIPLAYER' ? 'multiplayer' : undefined),
+      mancheNumber: record.mancheNumber !== undefined ? record.mancheNumber : (record.mode === 'MULTIPLAYER' ? 1 : undefined),
       status,
       partiesCount: record.partiesCount ?? record.roundsCount,
       isMancheFinalWin: record.isMancheFinalWin ?? (status === 'completed'),
@@ -137,57 +144,6 @@ export const telemetryService = {
       }
     } else {
       console.info('[TelemetryService] Guest game preserved locally. Google sign-in required to post to the global leaderboard.');
-    }
-
-    // 3. Update player profile stats if this game is completed or finished
-    if (entry.status === 'completed' || entry.isMancheFinalWin || entry.isAbandoned) {
-      try {
-        const localId = getPlayerId();
-        const localName = localStorage.getItem('njambo_player_name');
-
-        // Locate human player
-        const humanPlayer = entry.players?.find(
-          (p) =>
-            p.isHuman ||
-            (localId && p.id === localId) ||
-            p.id === 'human' ||
-            (localName && p.name === localName)
-        );
-
-        if (humanPlayer || entry.mode === 'SOLO') {
-          const isWinner = Boolean(
-            humanPlayer?.isWinner ||
-              (entry.winnerId && humanPlayer && entry.winnerId === humanPlayer.id) ||
-              (entry.winnerName && humanPlayer && entry.winnerName === humanPlayer.name) ||
-              (entry.mode === 'SOLO' &&
-                entry.winnerName &&
-                !entry.winnerName.toLowerCase().includes('bot') &&
-                entry.winnerName !== 'Adversaire')
-          );
-
-          playerProfileService
-            .recordGame({
-              id: docId,
-              mode: entry.mode,
-              winType: entry.winType || 'STANDARD',
-              winnerName: entry.winnerName || 'Joueur',
-              isWinner,
-              status: entry.status === 'in_progress' ? 'in_progress' : 'completed',
-              potWon: isWinner ? entry.potWon || entry.potGross || 0 : 0,
-              baseBet: entry.baseBet || 10,
-              playerCount: entry.playerCount || 4,
-              roundsCount: entry.roundsCount || entry.partiesCount || 1,
-              tricksWon: humanPlayer?.score || (isWinner ? 3 : 0),
-              isDoubleKora: entry.winType === 'DOUBLE_KORA',
-              isUnder21: entry.winType === 'UNDER_21',
-              isThreeSevens: entry.winType === 'THREE_SEVENS',
-              createdAt: entry.createdAt || Date.now(),
-            })
-            .catch((e) => console.warn('[PlayerProfile] Telemetry profile update warning:', e));
-        }
-      } catch (err) {
-        console.warn('[TelemetryService] Error forwarding to playerProfileService:', err);
-      }
     }
   },
 

@@ -33,6 +33,16 @@ import { getPersistentItem, setPersistentItem } from '../utils/storageUtils';
 import { getGuestId, setAuthenticatedUid, clearAuthenticatedUid } from './identity';
 import { RivalryService } from './rivalryService';
 
+import {
+  MASTERY_CONFIG,
+  getMasteryMultiplier,
+  computeRawBasePoints,
+  computeEventMasteryScore,
+  computeMasteryScoreFromStats,
+  getDoualaDateKey,
+  formatMasteryScore,
+} from './masteryConfig';
+
 export { DEFAULT_PLAYER_STATS, DEFAULT_PLAYER_FAIR_PLAY };
 
 const PROFILE_KEY = 'njambo_player_profile_v1';
@@ -182,61 +192,16 @@ export function applyStatsFallback(stats: PlayerStats | any): PlayerStats {
 }
 
 /**
- * Barème officiel du Score de Maîtrise (1 à 20 pts par accomplissement) :
- * - Manche Multijoueur : +10 pts
- * - Manche Solo Difficile (EXPERT / GRAND_MASTER) : +6 pts
- * - Manche Solo Moyen (NORMAL) : +3 pts
- * - Manche Solo Facile (EASY) : +1 pt
- * - Partie individuelle (donne) gagnée : +1 pt
- * - Exploit Kora Simple : +5 pts
- * - Exploit Suprême Double Kora : +20 pts
+ * Barème officiel du Score de Maîtrise :
+ * Source unique de vérité importée depuis masteryConfig.ts
  */
-export const MASTERY_POINTS_CONFIG = {
-  MANCHE_MULTIPLAYER: 10,
-  MANCHE_SOLO_HARD: 6,
-  MANCHE_SOLO_NORMAL: 3,
-  MANCHE_SOLO_EASY: 1,
-  PARTIE_WIN: 1,
-  KORA_SIMPLE: 5,
-  DOUBLE_KORA: 20,
-} as const;
+export const MASTERY_POINTS_CONFIG = MASTERY_CONFIG;
 
 /**
- * Calcule dynamiquement le Score de Maîtrise (1-20 pts) à partir des statistiques du joueur.
+ * Calcule dynamiquement le Score de Maîtrise (avec ses décimales exactes) à partir des statistiques du joueur.
  */
 export function computeMasteryScore(rawStats?: Partial<PlayerStats> | null): number {
-  if (!rawStats) return 0;
-  const s = rawStats;
-
-  const mpManches = s.multiplayerManchesWon || 0;
-  const soloHardManches = s.soloManchesWonHard || 0;
-  const soloNormalManches = s.soloManchesWonNormal || 0;
-  const soloEasyManches = s.soloManchesWonEasy || 0;
-
-  const totalDetailedSolo = soloHardManches + soloNormalManches + soloEasyManches;
-  const totalSoloManches = s.soloManchesWon || 0;
-  const untrackedSoloManches = Math.max(0, totalSoloManches - totalDetailedSolo);
-  // Default unclassified solo manches as normal (+3 pts)
-  const untrackedSoloPoints = untrackedSoloManches * MASTERY_POINTS_CONFIG.MANCHE_SOLO_NORMAL;
-
-  const partiesWon = s.partiesWon || s.gamesWon || 0;
-
-  const doubleKoras = s.doubleKoraCount || 0;
-  const totalKoras = s.koraCount || 0;
-  // Enregistrement : un double kora incrémente doubleKoraCount et koraCount. Les koras simples sont koraCount - doubleKoraCount.
-  const simpleKoras = Math.max(0, totalKoras - doubleKoras);
-
-  const total =
-    (mpManches * MASTERY_POINTS_CONFIG.MANCHE_MULTIPLAYER) +
-    (soloHardManches * MASTERY_POINTS_CONFIG.MANCHE_SOLO_HARD) +
-    (soloNormalManches * MASTERY_POINTS_CONFIG.MANCHE_SOLO_NORMAL) +
-    (soloEasyManches * MASTERY_POINTS_CONFIG.MANCHE_SOLO_EASY) +
-    untrackedSoloPoints +
-    (partiesWon * MASTERY_POINTS_CONFIG.PARTIE_WIN) +
-    (simpleKoras * MASTERY_POINTS_CONFIG.KORA_SIMPLE) +
-    (doubleKoras * MASTERY_POINTS_CONFIG.DOUBLE_KORA);
-
-  return Math.max(0, Math.round(total));
+  return computeMasteryScoreFromStats(rawStats);
 }
 
 /**
@@ -248,6 +213,7 @@ export function computeEarnedPoints(params: {
   mode: 'SOLO' | 'MULTIPLAYER';
   winType: string;
   difficulty?: string;
+  isForfeitWin?: boolean;
 }): {
   total: number;
   breakdown: Array<{ label: string; points: number }>;
@@ -257,27 +223,28 @@ export function computeEarnedPoints(params: {
     return { total: 0, breakdown };
   }
 
+  const mult = getMasteryMultiplier(params.mode, params.difficulty);
+
   if (params.isMancheOver) {
-    if (params.mode === 'MULTIPLAYER') {
-      breakdown.push({ label: 'Victoire Manche Multijoueur', points: MASTERY_POINTS_CONFIG.MANCHE_MULTIPLAYER });
-    } else {
-      const diff = params.difficulty || 'NORMAL';
-      if (diff === 'EXPERT' || diff === 'GRAND_MASTER' || diff === 'HARD') {
-        breakdown.push({ label: 'Victoire Manche Solo Difficile', points: MASTERY_POINTS_CONFIG.MANCHE_SOLO_HARD });
-      } else if (diff === 'EASY') {
-        breakdown.push({ label: 'Victoire Manche Solo Facile', points: MASTERY_POINTS_CONFIG.MANCHE_SOLO_EASY });
-      } else {
-        breakdown.push({ label: 'Victoire Manche Solo Normale', points: MASTERY_POINTS_CONFIG.MANCHE_SOLO_NORMAL });
-      }
-    }
+    const basePts = params.isForfeitWin
+      ? MASTERY_CONFIG.base.mancheWonForfeit
+      : MASTERY_CONFIG.base.mancheWon;
+    const pts = basePts * mult;
+    const label = params.mode === 'MULTIPLAYER'
+      ? 'Victoire Manche Multijoueur'
+      : `Victoire Manche Solo (${params.difficulty || 'NORMAL'})`;
+    breakdown.push({ label, points: pts });
   } else {
     // Single Partie
-    breakdown.push({ label: 'Donne remportée', points: MASTERY_POINTS_CONFIG.PARTIE_WIN });
+    const partiePts = MASTERY_CONFIG.base.partieWon * mult;
+    breakdown.push({ label: 'Donne remportée', points: partiePts });
 
     if (params.winType === 'DOUBLE_KORA') {
-      breakdown.push({ label: 'Exploit Suprême Double Kora', points: MASTERY_POINTS_CONFIG.DOUBLE_KORA });
+      const dblPts = MASTERY_CONFIG.base.doubleKora * mult;
+      breakdown.push({ label: 'Exploit Suprême Double Kora', points: dblPts });
     } else if (params.winType === 'KORA') {
-      breakdown.push({ label: 'Exploit Kora', points: MASTERY_POINTS_CONFIG.KORA_SIMPLE });
+      const koraPts = MASTERY_CONFIG.base.kora * mult;
+      breakdown.push({ label: 'Exploit Kora', points: koraPts });
     }
   }
 
@@ -588,6 +555,7 @@ export const playerProfileService = {
     opponents?: PlayerOpponentSummary[];
     tricksWon?: number;
     roomId?: string;
+    difficulty?: 'EASY' | 'NORMAL' | 'EXPERT' | 'GRAND_MASTER' | string;
   }): Promise<PlayerProfile> {
     const profile = this.getLocalProfile();
     const history = this.getLocalHistory();
@@ -610,6 +578,7 @@ export const playerProfileService = {
       durationSeconds: params.durationSeconds || 30,
       opponents: params.opponents || [],
       tricksWon: params.tricksWon || 0,
+      difficulty: params.difficulty,
       status: 'completed',
       createdAt: Date.now(),
       isDoubleKora: params.winType === 'DOUBLE_KORA',
@@ -670,6 +639,14 @@ export const playerProfileService = {
       stats.partiesWon += 1;
       if (params.mode === 'SOLO') {
         stats.soloGamesWon = (stats.soloGamesWon || 0) + 1;
+        const diff = (params.difficulty || '').toUpperCase();
+        if (diff === 'EXPERT' || diff === 'GRAND_MASTER' || diff === 'HARD') {
+          stats.soloGamesWonHard = (stats.soloGamesWonHard || 0) + 1;
+        } else if (diff === 'EASY') {
+          stats.soloGamesWonEasy = (stats.soloGamesWonEasy || 0) + 1;
+        } else {
+          stats.soloGamesWonNormal = (stats.soloGamesWonNormal || 0) + 1;
+        }
       } else {
         stats.multiplayerGamesWon = (stats.multiplayerGamesWon || 0) + 1;
       }
@@ -678,6 +655,14 @@ export const playerProfileService = {
         stats.koraCount += 1;
         if (params.mode === 'SOLO') {
           stats.soloKoraCount = (stats.soloKoraCount || 0) + 1;
+          const diff = (params.difficulty || '').toUpperCase();
+          if (diff === 'EXPERT' || diff === 'GRAND_MASTER' || diff === 'HARD') {
+            stats.soloKorasHard = (stats.soloKorasHard || 0) + 1;
+          } else if (diff === 'EASY') {
+            stats.soloKorasEasy = (stats.soloKorasEasy || 0) + 1;
+          } else {
+            stats.soloKorasNormal = (stats.soloKorasNormal || 0) + 1;
+          }
         } else {
           stats.multiplayerKoraCount = (stats.multiplayerKoraCount || 0) + 1;
         }
@@ -687,6 +672,14 @@ export const playerProfileService = {
         if (params.mode === 'SOLO') {
           stats.soloKoraCount = (stats.soloKoraCount || 0) + 1;
           stats.soloDoubleKoraCount = (stats.soloDoubleKoraCount || 0) + 1;
+          const diff = (params.difficulty || '').toUpperCase();
+          if (diff === 'EXPERT' || diff === 'GRAND_MASTER' || diff === 'HARD') {
+            stats.soloDoubleKorasHard = (stats.soloDoubleKorasHard || 0) + 1;
+          } else if (diff === 'EASY') {
+            stats.soloDoubleKorasEasy = (stats.soloDoubleKorasEasy || 0) + 1;
+          } else {
+            stats.soloDoubleKorasNormal = (stats.soloDoubleKorasNormal || 0) + 1;
+          }
         } else {
           stats.multiplayerKoraCount = (stats.multiplayerKoraCount || 0) + 1;
           stats.multiplayerDoubleKoraCount = (stats.multiplayerDoubleKoraCount || 0) + 1;
@@ -738,8 +731,38 @@ export const playerProfileService = {
       stats.averageTricksPerGame = parseFloat((stats.totalTricksWon / stats.partiesPlayed).toFixed(1));
     }
 
-    // Consolidated Score de Maîtrise (Barème 1-20 pts)
-    stats.masteryScore = computeMasteryScore(stats);
+    // Compute potential mastery points for this partie
+    let potentialMastery = 0;
+    if (params.isWinner) {
+      potentialMastery = computeEventMasteryScore({
+        mode: params.mode,
+        difficulty: params.difficulty,
+        partiesWon: 1,
+        koras: params.winType === 'KORA' ? 1 : 0,
+        doubleKoras: params.winType === 'DOUBLE_KORA' ? 1 : 0,
+      });
+    }
+
+    // Apply daily solo cap (30 pts Douala date)
+    let partieMasteryAwarded = 0;
+    if (params.mode === 'SOLO' && potentialMastery > 0) {
+      const todayKey = getDoualaDateKey(Date.now());
+      const todaySoloAwarded = history
+        .filter((h) => h.mode === 'SOLO' && getDoualaDateKey(h.createdAt) === todayKey)
+        .reduce((sum, h) => sum + (h.masteryPointsAwarded || 0), 0);
+
+      const cap = MASTERY_CONFIG.rules.dailySoloPointsCap; // 30
+      if (todaySoloAwarded < cap) {
+        partieMasteryAwarded = Math.min(potentialMastery, cap - todaySoloAwarded);
+      } else {
+        partieMasteryAwarded = 0;
+      }
+    } else {
+      partieMasteryAwarded = potentialMastery;
+    }
+
+    historyItem.masteryPointsAwarded = partieMasteryAwarded;
+    stats.masteryScore = (stats.masteryScore || 0) + partieMasteryAwarded;
 
     const { currentTitle } = computeHonorificTitle(stats);
 
@@ -837,7 +860,7 @@ export const playerProfileService = {
       }
     });
 
-    const shouldIncrementStats = !options?.skipStatsIncrement && item.recordType !== 'MANCHE';
+    const shouldIncrementStats = !options?.skipStatsIncrement && item.recordType === 'PARTIE';
 
     if (shouldIncrementStats) {
       stats.gamesPlayed += 1;
@@ -865,20 +888,33 @@ export const playerProfileService = {
 
     // Record Manche stats
     if (item.recordType === 'MANCHE' || !item.recordType) {
-      stats.manchesPlayed = (stats.manchesPlayed || 0) + 1;
-      if (item.isWinner) {
-        stats.manchesWon = (stats.manchesWon || 0) + 1;
-        if (item.mode === 'MULTIPLAYER') {
-          stats.multiplayerManchesWon = (stats.multiplayerManchesWon || 0) + 1;
+      if (item.status === 'abandoned' || item.winType === 'FORFEIT') {
+        // Abandon: count as 1 played game without win (once)
+        stats.gamesPlayed = (stats.gamesPlayed || 0) + 1;
+        if (item.mode === 'SOLO') {
+          stats.soloGamesPlayed = (stats.soloGamesPlayed || 0) + 1;
         } else {
-          stats.soloManchesWon = (stats.soloManchesWon || 0) + 1;
-          const diff = (item.difficulty || '').toUpperCase();
-          if (diff === 'EXPERT' || diff === 'GRAND_MASTER' || diff === 'HARD') {
-            stats.soloManchesWonHard = (stats.soloManchesWonHard || 0) + 1;
-          } else if (diff === 'EASY') {
-            stats.soloManchesWonEasy = (stats.soloManchesWonEasy || 0) + 1;
+          stats.multiplayerGamesPlayed = (stats.multiplayerGamesPlayed || 0) + 1;
+        }
+        stats.gamesLost = Math.max(0, stats.gamesPlayed - stats.gamesWon);
+        stats.winRate = stats.gamesPlayed > 0 ? Math.round((stats.gamesWon / stats.gamesPlayed) * 100) : 0;
+      } else {
+        // Normal finished manche
+        stats.manchesPlayed = (stats.manchesPlayed || 0) + 1;
+        if (item.isWinner) {
+          stats.manchesWon = (stats.manchesWon || 0) + 1;
+          if (item.mode === 'MULTIPLAYER') {
+            stats.multiplayerManchesWon = (stats.multiplayerManchesWon || 0) + 1;
           } else {
-            stats.soloManchesWonNormal = (stats.soloManchesWonNormal || 0) + 1;
+            stats.soloManchesWon = (stats.soloManchesWon || 0) + 1;
+            const diff = (item.difficulty || '').toUpperCase();
+            if (diff === 'EXPERT' || diff === 'GRAND_MASTER' || diff === 'HARD') {
+              stats.soloManchesWonHard = (stats.soloManchesWonHard || 0) + 1;
+            } else if (diff === 'EASY') {
+              stats.soloManchesWonEasy = (stats.soloManchesWonEasy || 0) + 1;
+            } else {
+              stats.soloManchesWonNormal = (stats.soloManchesWonNormal || 0) + 1;
+            }
           }
         }
       }
@@ -888,8 +924,52 @@ export const playerProfileService = {
       stats.biggestPotWon = item.potWon;
     }
 
-    // Consolidated Score de Maîtrise (Barème 1-20 pts)
-    stats.masteryScore = computeMasteryScore(stats);
+    // Compute potential mastery points for this event
+    let potentialMastery = 0;
+    if (item.isWinner) {
+      potentialMastery = computeEventMasteryScore({
+        mode: item.mode,
+        difficulty: item.difficulty,
+        isMancheWinner: item.recordType === 'MANCHE' || !item.recordType,
+        isForfeitWin: item.winType === 'FORFEIT',
+        partiesWon: item.recordType === 'PARTIE' ? 1 : 0,
+        koras: item.winType === 'KORA' ? 1 : 0,
+        doubleKoras: item.winType === 'DOUBLE_KORA' ? 1 : 0,
+      });
+    } else if (item.status === 'abandoned' || item.winType === 'FORFEIT') {
+      // Forfeit penalty check in multiplayer
+      if (item.mode === 'MULTIPLAYER') {
+        const last20Multi = history
+          .filter((h) => h.mode === 'MULTIPLAYER')
+          .slice(0, MASTERY_CONFIG.rules.forfeitCheckWindow);
+        const hasRecentForfeit = last20Multi.some(
+          (h) => h.status === 'abandoned' || h.winType === 'FORFEIT'
+        );
+        if (hasRecentForfeit) {
+          potentialMastery = -MASTERY_CONFIG.rules.forfeitPenaltyMultiplayer; // -5
+        }
+      }
+    }
+
+    let gameMasteryAwarded = 0;
+    if (item.mode === 'SOLO' && potentialMastery > 0) {
+      const todayKey = getDoualaDateKey(Date.now());
+      const todaySoloAwarded = history
+        .filter((h) => h.mode === 'SOLO' && getDoualaDateKey(h.createdAt) === todayKey)
+        .reduce((sum, h) => sum + (h.masteryPointsAwarded || 0), 0);
+
+      const cap = MASTERY_CONFIG.rules.dailySoloPointsCap; // 30
+      if (todaySoloAwarded < cap) {
+        gameMasteryAwarded = Math.min(potentialMastery, cap - todaySoloAwarded);
+      } else {
+        gameMasteryAwarded = 0;
+      }
+    } else {
+      gameMasteryAwarded = potentialMastery;
+    }
+
+    historyItem.masteryPointsAwarded = gameMasteryAwarded;
+    stats.masteryScore = Math.max(0, (stats.masteryScore || 0) + gameMasteryAwarded);
 
     const { currentTitle } = computeHonorificTitle(stats);
 
@@ -1495,6 +1575,224 @@ export const playerProfileService = {
     }
 
     return updated;
+  },
+
+  /**
+   * Recalcul rétroactif approximatif du Score de Maîtrise v2.
+   * Reconstruit la grille de statistiques et le score à partir de l'historique users/{uid}/history.
+   * Idempotent (scoreVersion = 2). Ne s'exécute JAMAIS deux fois sur un profil déjà migré.
+   */
+  async migratePlayerScoreVersion2(userId?: string): Promise<PlayerProfile> {
+    const profile = this.getLocalProfile();
+    const uid = userId || profile.uid || auth.currentUser?.uid;
+
+    if (profile.scoreVersion === 2) {
+      console.log(`[PlayerProfileService] Profile ${uid} already on scoreVersion = 2. Migration skipped.`);
+      return profile;
+    }
+
+    console.log(`[PlayerProfileService] Starting scoreVersion = 2 migration for player ${uid}...`);
+
+    let historyItems: PlayerGameHistoryItem[] = [];
+
+    // Fetch full history from Firestore if available
+    if (uid && !profile.isGuest && db) {
+      try {
+        const histSnap = await getDocs(
+          query(collection(db, 'users', uid, 'history'), orderBy('createdAt', 'asc'))
+        );
+        historyItems = histSnap.docs.map((d) => d.data() as PlayerGameHistoryItem);
+      } catch (err) {
+        console.warn('[PlayerProfileService] Error fetching history for migration:', err);
+      }
+    }
+
+    if (historyItems.length === 0) {
+      historyItems = this.getLocalHistory().reverse(); // sort ascending chronologically
+    }
+
+    // Deduplicate history items by id
+    const historyMap = new Map<string, PlayerGameHistoryItem>();
+    historyItems.forEach((h) => historyMap.set(h.id, h));
+    const sortedHistory = Array.from(historyMap.values()).sort((a, b) => a.createdAt - b.createdAt);
+
+    // Save legacy backup
+    const statsLegacyBackup = { ...(profile.stats || DEFAULT_PLAYER_STATS) };
+
+    // Reconstruct stats from scratch
+    const newStats: PlayerStats = {
+      ...DEFAULT_PLAYER_STATS,
+    };
+
+    const dailySoloPointsMap = new Map<string, number>();
+    let totalMasteryScore = 0;
+
+    sortedHistory.forEach((item) => {
+      let eventPotential = 0;
+
+      if (item.recordType === 'PARTIE') {
+        newStats.partiesPlayed += 1;
+        if (item.mode === 'SOLO') {
+          newStats.soloGamesPlayed += 1;
+        } else {
+          newStats.multiplayerGamesPlayed += 1;
+        }
+
+        if (item.isWinner) {
+          newStats.partiesWon += 1;
+          if (item.mode === 'SOLO') {
+            newStats.soloGamesWon += 1;
+            const diff = (item.difficulty || '').toUpperCase();
+            if (diff === 'EXPERT' || diff === 'GRAND_MASTER' || diff === 'HARD') {
+              newStats.soloGamesWonHard = (newStats.soloGamesWonHard || 0) + 1;
+            } else if (diff === 'EASY') {
+              newStats.soloGamesWonEasy = (newStats.soloGamesWonEasy || 0) + 1;
+            } else {
+              newStats.soloGamesWonNormal = (newStats.soloGamesWonNormal || 0) + 1;
+            }
+          } else {
+            newStats.multiplayerGamesWon += 1;
+          }
+
+          if (item.winType === 'KORA') {
+            newStats.koraCount += 1;
+            if (item.mode === 'SOLO') {
+              newStats.soloKoraCount += 1;
+              const diff = (item.difficulty || '').toUpperCase();
+              if (diff === 'EXPERT' || diff === 'GRAND_MASTER' || diff === 'HARD') {
+                newStats.soloKorasHard = (newStats.soloKorasHard || 0) + 1;
+              } else if (diff === 'EASY') {
+                newStats.soloKorasEasy = (newStats.soloKorasEasy || 0) + 1;
+              } else {
+                newStats.soloKorasNormal = (newStats.soloKorasNormal || 0) + 1;
+              }
+            } else {
+              newStats.multiplayerKoraCount += 1;
+            }
+          } else if (item.winType === 'DOUBLE_KORA') {
+            newStats.koraCount += 1;
+            newStats.doubleKoraCount += 1;
+            if (item.mode === 'SOLO') {
+              newStats.soloKoraCount += 1;
+              newStats.soloDoubleKoraCount += 1;
+              const diff = (item.difficulty || '').toUpperCase();
+              if (diff === 'EXPERT' || diff === 'GRAND_MASTER' || diff === 'HARD') {
+                newStats.soloDoubleKorasHard = (newStats.soloDoubleKorasHard || 0) + 1;
+              } else if (diff === 'EASY') {
+                newStats.soloDoubleKorasEasy = (newStats.soloDoubleKorasEasy || 0) + 1;
+              } else {
+                newStats.soloDoubleKorasNormal = (newStats.soloDoubleKorasNormal || 0) + 1;
+              }
+            } else {
+              newStats.multiplayerKoraCount += 1;
+              newStats.multiplayerDoubleKoraCount += 1;
+            }
+          }
+        }
+
+        // Calculate potential event mastery score
+        if (item.isWinner) {
+          eventPotential = computeEventMasteryScore({
+            mode: item.mode,
+            difficulty: item.difficulty,
+            partiesWon: 1,
+            koras: item.winType === 'KORA' ? 1 : 0,
+            doubleKoras: item.winType === 'DOUBLE_KORA' ? 1 : 0,
+          });
+        }
+      } else if (item.recordType === 'MANCHE' || !item.recordType) {
+        newStats.manchesPlayed += 1;
+        if (item.isWinner) {
+          newStats.manchesWon += 1;
+          if (item.mode === 'MULTIPLAYER') {
+            newStats.multiplayerManchesWon += 1;
+          } else {
+            newStats.soloManchesWon += 1;
+            const diff = (item.difficulty || '').toUpperCase();
+            if (diff === 'EXPERT' || diff === 'GRAND_MASTER' || diff === 'HARD') {
+              newStats.soloManchesWonHard = (newStats.soloManchesWonHard || 0) + 1;
+            } else if (diff === 'EASY') {
+              newStats.soloManchesWonEasy = (newStats.soloManchesWonEasy || 0) + 1;
+            } else {
+              newStats.soloManchesWonNormal = (newStats.soloManchesWonNormal || 0) + 1;
+            }
+          }
+        }
+
+        if (item.isWinner) {
+          eventPotential = computeEventMasteryScore({
+            mode: item.mode,
+            difficulty: item.difficulty,
+            isMancheWinner: true,
+            isForfeitWin: item.winType === 'FORFEIT',
+          });
+        }
+      }
+
+      // Calculate awarded points taking into account daily solo cap
+      let awarded = 0;
+      if (item.mode === 'SOLO' && eventPotential > 0) {
+        const dateKey = getDoualaDateKey(item.createdAt);
+        const currentDailySum = dailySoloPointsMap.get(dateKey) || 0;
+        const cap = MASTERY_CONFIG.rules.dailySoloPointsCap; // 30
+        if (currentDailySum < cap) {
+          awarded = Math.min(eventPotential, cap - currentDailySum);
+          dailySoloPointsMap.set(dateKey, currentDailySum + awarded);
+        } else {
+          awarded = 0;
+        }
+      } else {
+        awarded = eventPotential;
+      }
+
+      item.masteryPointsAwarded = awarded;
+      totalMasteryScore += awarded;
+    });
+
+    // Compute final win rates
+    newStats.gamesPlayed = newStats.partiesPlayed;
+    newStats.gamesWon = newStats.partiesWon;
+    newStats.gamesLost = Math.max(0, newStats.gamesPlayed - newStats.gamesWon);
+    newStats.winRate = newStats.gamesPlayed > 0 ? Math.round((newStats.gamesWon / newStats.gamesPlayed) * 100) : 0;
+    newStats.soloWinRate = newStats.soloGamesPlayed > 0 ? Math.round((newStats.soloGamesWon / newStats.soloGamesPlayed) * 100) : 0;
+    newStats.multiplayerWinRate = newStats.multiplayerGamesPlayed > 0 ? Math.round((newStats.multiplayerGamesWon / newStats.multiplayerGamesPlayed) * 100) : 0;
+
+    // Set final mastery score
+    newStats.masteryScore = totalMasteryScore > 0 ? totalMasteryScore : computeMasteryScoreFromStats(newStats);
+
+    const { currentTitle } = computeHonorificTitle(newStats);
+
+    const updatedProfile: PlayerProfile = {
+      ...profile,
+      stats: newStats,
+      scoreVersion: 2,
+      statsLegacyBackup,
+      honorificTitleId: currentTitle.id,
+      updatedAt: Date.now(),
+    };
+
+    // Save updated profile & history locally
+    this.saveLocalProfile(updatedProfile);
+    this.saveLocalHistory(sortedHistory.reverse().slice(0, 100));
+
+    // Save to Firestore if authenticated
+    if (uid && !profile.isGuest && db) {
+      try {
+        const userRef = doc(db, 'users', uid);
+        await setDoc(userRef, updatedProfile, { merge: true });
+
+        // Update history items with new masteryPointsAwarded
+        for (const h of sortedHistory.slice(0, 30)) {
+          const itemRef = doc(db, 'users', uid, 'history', h.id);
+          await setDoc(itemRef, { masteryPointsAwarded: h.masteryPointsAwarded }, { merge: true });
+        }
+        console.log(`[PlayerProfileService] Successfully migrated player ${uid} to scoreVersion = 2 in Firestore.`);
+      } catch (err) {
+        console.warn('[PlayerProfileService] Firestore migration sync error:', err);
+      }
+    }
+
+    return updatedProfile;
   },
 };
 

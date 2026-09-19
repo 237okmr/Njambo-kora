@@ -162,7 +162,7 @@ export const EndRoundModal: React.FC<EndRoundModalProps> = ({
     isWinner: true,
     mode: isOnlineMultiplayer ? 'MULTIPLAYER' : 'SOLO',
     winType: partieWinType,
-    difficulty: (gameState as any)?.difficulty || 'NORMAL',
+    difficulty: (gameState as any)?.aiDifficulty || (gameState as any)?.difficulty || 'NORMAL',
   }) : null;
 
   const [showTricksHistory, setShowTricksHistory] = useState(false);
@@ -392,16 +392,16 @@ export const EndRoundModal: React.FC<EndRoundModalProps> = ({
               </div>
               <div className="text-left min-w-0">
                 <div className="font-black text-amber-200 text-xs flex items-center gap-1">
-                  <span>+{earnedPoints.total} {earnedPoints.total > 1 ? 'points de Maîtrise' : 'point de Maîtrise'}</span>
+                  <span>+{Number(earnedPoints.total.toFixed(2))} {earnedPoints.total >= 1 ? 'points de Maîtrise' : 'point de Maîtrise'}</span>
                   <span className="text-[10px] text-amber-400/80 font-normal">au Classement</span>
                 </div>
                 <div className="text-[10px] text-amber-300/80 truncate">
-                  {earnedPoints.breakdown.map((b) => `${b.label} (+${b.points})`).join(' · ')}
+                  {earnedPoints.breakdown.map((b) => `${b.label} (+${Number(b.points.toFixed(2))})`).join(' · ')}
                 </div>
               </div>
             </div>
             <span className="font-mono font-black text-sm sm:text-base text-amber-400 shrink-0 ml-2">
-              +{earnedPoints.total} pts
+              +{Number(earnedPoints.total.toFixed(2))} pts
             </span>
           </motion.div>
         )}
