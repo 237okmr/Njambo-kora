@@ -52,9 +52,9 @@ service cloud.firestore {
       }
     }
 
-    // Rooms for multiplayer card games (fallback Firestore sync)
+    // Rooms for multiplayer card games (disallowed direct client access - managed strictly by in-memory authoritative server)
     match /rooms/{roomId} {
-      allow read, write: if true;
+      allow read, write: if false;
     }
 
     // Web Push notifications subscriptions (server push service & background sync)

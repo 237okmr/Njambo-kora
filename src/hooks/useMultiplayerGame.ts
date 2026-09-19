@@ -2,14 +2,10 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Card, MultiplayerRoom, EmoteMessage } from '../types';
 import { wsService } from '../services/websocketService';
 import { sounds } from '../utils/sound';
+import { getPlayerId } from '../services/identity';
 
 export function getLocalPlayerId(): string {
-  let id = localStorage.getItem('njambo_player_id');
-  if (!id) {
-    id = 'usr_' + Math.random().toString(36).substring(2, 9);
-    localStorage.setItem('njambo_player_id', id);
-  }
-  return id;
+  return getPlayerId();
 }
 
 export function getLocalPlayerName(): string {
@@ -205,10 +201,10 @@ export function useMultiplayerGame() {
       turnTimerSeconds?: number;
       afkAction?: 'auto_play' | 'replace_bot';
       isPublic?: boolean;
-    }) => {
+    }, confirmLeaveCurrent?: boolean) => {
       setLocalPlayerName(settings.playerName);
       
-      return new Promise<{ success: boolean; error?: string }>((resolve) => {
+      return new Promise<{ success: boolean; error?: string; errorCode?: string; activeGameRoomCode?: string }>((resolve) => {
         const unsubRoom = wsService.onRoomUpdate((updated) => {
           if (updated && updated.status === 'LOBBY' && updated.players.some(p => p.isHost && p.name === settings.playerName)) {
             unsubRoom();
@@ -221,11 +217,11 @@ export function useMultiplayerGame() {
           }
         });
         
-        const unsubError = wsService.onError((err) => {
+        const unsubError = wsService.onError((err, code, activeRoom) => {
           unsubRoom();
           unsubError();
           clearTimeout(timeout);
-          resolve({ success: false, error: err });
+          resolve({ success: false, error: err, errorCode: code, activeGameRoomCode: activeRoom });
         });
         
         const timeout = setTimeout(() => {
@@ -243,7 +239,7 @@ export function useMultiplayerGame() {
           enableUnder21: settings.enableUnder21,
           turnTimerSeconds: settings.turnTimerSeconds || 15,
           isPublic: settings.isPublic !== undefined ? settings.isPublic : true,
-        }).catch((err: any) => {
+        }, confirmLeaveCurrent).catch((err: any) => {
           unsubRoom();
           unsubError();
           clearTimeout(timeout);
@@ -254,10 +250,10 @@ export function useMultiplayerGame() {
     []
   );
 
-  const handleJoinRoom = useCallback(async (roomId: string, playerName: string) => {
+  const handleJoinRoom = useCallback(async (roomId: string, playerName: string, confirmLeaveCurrent?: boolean) => {
     setLocalPlayerName(playerName);
     
-    return new Promise<{ success: boolean; error?: string }>((resolve) => {
+    return new Promise<{ success: boolean; error?: string; errorCode?: string; activeGameRoomCode?: string }>((resolve) => {
       const unsubRoom = wsService.onRoomUpdate((updated) => {
         if (updated && updated.id === roomId.toUpperCase()) {
           unsubRoom();
@@ -270,11 +266,11 @@ export function useMultiplayerGame() {
         }
       });
 
-      const unsubError = wsService.onError((err) => {
+      const unsubError = wsService.onError((err, code, activeRoom) => {
         unsubRoom();
         unsubError();
         clearTimeout(timeout);
-        resolve({ success: false, error: err });
+        resolve({ success: false, error: err, errorCode: code, activeGameRoomCode: activeRoom });
       });
 
       const timeout = setTimeout(() => {
@@ -283,7 +279,7 @@ export function useMultiplayerGame() {
         resolve({ success: false, error: 'Délai d\'attente dépassé' });
       }, 10000);
 
-      wsService.joinRoom(roomId, playerName).catch((err: any) => {
+      wsService.joinRoom(roomId, playerName, confirmLeaveCurrent).catch((err: any) => {
         unsubRoom();
         unsubError();
         clearTimeout(timeout);
@@ -292,8 +288,8 @@ export function useMultiplayerGame() {
     });
   }, []);
 
-  const handleQuickMatch = useCallback(async (settings?: { baseBet?: number; initialCapital?: number }) => {
-    return new Promise<{ success: boolean; error?: string }>((resolve) => {
+  const handleQuickMatch = useCallback(async (settings?: { baseBet?: number; initialCapital?: number }, confirmLeaveCurrent?: boolean) => {
+    return new Promise<{ success: boolean; error?: string; errorCode?: string; activeGameRoomCode?: string }>((resolve) => {
       const unsubRoom = wsService.onRoomUpdate((updated) => {
         if (updated && updated.status === 'LOBBY') {
           unsubRoom();
@@ -311,12 +307,12 @@ export function useMultiplayerGame() {
         // Quick match result received; onRoomUpdate will fire and resolve
       });
 
-      const unsubError = wsService.onError((err) => {
+      const unsubError = wsService.onError((err, code, activeRoom) => {
         unsubRoom();
         unsubError();
         unsubQuickMatch();
         clearTimeout(timeout);
-        resolve({ success: false, error: err });
+        resolve({ success: false, error: err, errorCode: code, activeGameRoomCode: activeRoom });
       });
 
       const timeout = setTimeout(() => {
@@ -326,7 +322,7 @@ export function useMultiplayerGame() {
         resolve({ success: false, error: 'Délai d\'attente dépassé' });
       }, 10000);
 
-      wsService.quickMatch(settings).catch((err: any) => {
+      wsService.quickMatch(settings, confirmLeaveCurrent).catch((err: any) => {
         unsubRoom();
         unsubError();
         unsubQuickMatch();

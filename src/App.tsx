@@ -2529,8 +2529,8 @@ function GameApp() {
             localPlayerId={localPlayerId}
             errorMessage={serverErrorMessage}
             onCreateRoom={handleCreateRoom}
-            onJoinRoom={async (code, name) => {
-              const res = await handleJoinRoom(code, name);
+            onJoinRoom={async (code, name, confirmLeaveCurrent) => {
+              const res = await handleJoinRoom(code, name, confirmLeaveCurrent);
               if (res.success) {
                 const current = wsService.getCurrentRoom();
                 if (current && current.status !== 'LOBBY') {

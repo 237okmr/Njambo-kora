@@ -30,6 +30,7 @@ import {
   HonorificTitle,
 } from '../types/playerProfile';
 import { getPersistentItem, setPersistentItem } from '../utils/storageUtils';
+import { getGuestId, setAuthenticatedUid, clearAuthenticatedUid } from './identity';
 import { RivalryService } from './rivalryService';
 
 export { DEFAULT_PLAYER_STATS, DEFAULT_PLAYER_FAIR_PLAY };
@@ -50,11 +51,7 @@ export interface PendingOfflineSyncItem {
 }
 
 function generateGuestId(): string {
-  const existing = getPersistentItem('njambo_player_id');
-  if (existing && existing.startsWith('usr_')) return existing;
-  const newId = 'usr_' + Math.random().toString(36).substring(2, 9);
-  setPersistentItem('njambo_player_id', newId);
-  return newId;
+  return getGuestId();
 }
 
 function getInitialDisplayName(): string {
@@ -454,7 +451,11 @@ export const playerProfileService = {
   saveLocalProfile(profile: PlayerProfile): void {
     try {
       localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
-      setPersistentItem('njambo_player_id', profile.uid);
+      if (!profile.isGuest && profile.uid) {
+        setAuthenticatedUid(profile.uid);
+      } else {
+        clearAuthenticatedUid();
+      }
       setPersistentItem('njambo_player_name', profile.displayName);
       localStorage.setItem('njambo_player_chips', (profile.chips ?? 1000).toString());
       if (profile.stats) {

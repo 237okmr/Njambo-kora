@@ -41,6 +41,7 @@ import {
   Search,
   Send,
   Inbox,
+  ShieldAlert,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
@@ -54,7 +55,7 @@ import {
   PresenceStatus,
 } from '../../types';
 import { triggerHaptic, sounds } from '../../utils/sound';
-import { getLocalPlayerName, setLocalPlayerName } from '../../services/multiplayerService';
+import { getLocalPlayerName, setLocalPlayerName } from '../../services/identity';
 import { FriendService } from '../../services/friendService';
 import { webSocketService } from '../../services/websocketService';
 import { PlayerAvatar } from '../profile/PlayerAvatar';
@@ -92,9 +93,9 @@ export interface MultiplayerScreenProps {
     turnTimerSeconds?: number;
     afkAction?: 'auto_play' | 'replace_bot';
     isPublic?: boolean;
-  }) => Promise<{ success: boolean; error?: string } | void>;
-  onJoinRoom: (roomCode: string, playerName: string) => Promise<{ success: boolean; error?: string }>;
-  onQuickMatch: (settings?: { baseBet?: number; initialCapital?: number }) => Promise<{ success: boolean; error?: string }>;
+  }, confirmLeaveCurrent?: boolean) => Promise<{ success: boolean; error?: string; errorCode?: string; activeGameRoomCode?: string } | void>;
+  onJoinRoom: (roomCode: string, playerName: string, confirmLeaveCurrent?: boolean) => Promise<{ success: boolean; error?: string; errorCode?: string; activeGameRoomCode?: string }>;
+  onQuickMatch: (settings?: { baseBet?: number; initialCapital?: number }, confirmLeaveCurrent?: boolean) => Promise<{ success: boolean; error?: string; errorCode?: string; activeGameRoomCode?: string }>;
   // Lobby actions
   onStartGame: () => Promise<void>;
   onToggleReady?: (isReady: boolean) => void;
@@ -133,6 +134,13 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
 }) => {
   // 3-Pillar Navigation Tabs (Zero horizontal scroll)
   const [activeTab, setActiveTab] = useState<MultiplayerTab>('play');
+
+  // Active game conflict state (Confirmation dialog when trying to join/create during an active match)
+  const [activeGameConflict, setActiveGameConflict] = useState<{
+    activeRoomCode: string;
+    message?: string;
+    onConfirmLeaveAndProceed: () => Promise<void>;
+  } | null>(null);
 
   // Profile & Auth Status
   const { isLoggedIn, loginWithGoogle, profile, activeSanction } = usePlayerProfile();
@@ -523,6 +531,28 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
             initialCapital: 100,
           });
           if (!res.success) {
+            if (res.errorCode === 'ACTIVE_GAME_IN_PROGRESS' && res.activeGameRoomCode) {
+              setActiveGameConflict({
+                activeRoomCode: res.activeGameRoomCode,
+                message: res.error,
+                onConfirmLeaveAndProceed: async () => {
+                  setActiveGameConflict(null);
+                  setIsLoading(true);
+                  try {
+                    const retryRes = await onQuickMatch({
+                      baseBet: quickMatchBet,
+                      initialCapital: 100,
+                    }, true);
+                    if (!retryRes.success) {
+                      setHubErrorMsg(retryRes.error || 'Erreur lors du Matchmaking.');
+                    }
+                  } finally {
+                    setIsLoading(false);
+                  }
+                },
+              });
+              return;
+            }
             setHubErrorMsg(res.error || 'Erreur lors du Matchmaking.');
           }
         } catch (err: any) {
@@ -543,7 +573,7 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
     triggerHaptic('light');
   };
 
-  const handleCreate = async () => {
+  const handleCreate = async (confirmLeaveCurrent?: boolean) => {
     // Fair-play check: table creation restriction
     if (activeSanction && activeSanction.active) {
       if (
@@ -586,11 +616,22 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
         enableDoubleKora,
         enableUnder21,
         isPublic: isPublicRoom,
-      });
+      }, confirmLeaveCurrent);
       if (res && !res.success) {
+        if (res.errorCode === 'ACTIVE_GAME_IN_PROGRESS' && res.activeGameRoomCode) {
+          setActiveGameConflict({
+            activeRoomCode: res.activeGameRoomCode,
+            message: res.error,
+            onConfirmLeaveAndProceed: async () => {
+              await handleCreate(true);
+            },
+          });
+          return;
+        }
         throw new Error(res.error || 'Erreur lors de la création du salon.');
       }
       setShowCreateModal(false);
+      setActiveGameConflict(null);
     } catch (err: any) {
       const errorMsg = err.message || 'Erreur lors de la création du salon.';
       if (errorMsg.includes('Connexion Google requise')) {
@@ -603,7 +644,7 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
     }
   };
 
-  const handleJoin = async (codeToJoin?: string) => {
+  const handleJoin = async (codeToJoin?: string, confirmLeaveCurrent?: boolean) => {
     // Fair-play check: banned players cannot join tables
     if (activeSanction && activeSanction.active) {
       if (activeSanction.type === 'TEMP_BAN' || activeSanction.type === 'PERM_BAN') {
@@ -629,10 +670,21 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
     setHubErrorMsg(null);
     setIsLoading(true);
     try {
-      const res = await onJoinRoom(code, playerName.trim());
+      const res = await onJoinRoom(code, playerName.trim(), confirmLeaveCurrent);
       if (res.success) {
         setShowJoinCodeModal(false);
+        setActiveGameConflict(null);
       } else {
+        if (res.errorCode === 'ACTIVE_GAME_IN_PROGRESS' && res.activeGameRoomCode) {
+          setActiveGameConflict({
+            activeRoomCode: res.activeGameRoomCode,
+            message: res.error,
+            onConfirmLeaveAndProceed: async () => {
+              await handleJoin(code, true);
+            },
+          });
+          return;
+        }
         if (res.error && res.error.includes('Connexion Google requise')) {
           setAuthRequirementReason(res.error);
           setShowAuthRequirementModal(true);
@@ -759,7 +811,8 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
 
   const handleChallengeFriend = async (
     friend: { id: string; name: string; avatarSeed?: string; addedAt?: number },
-    forcedStatus?: PresenceStatus
+    forcedStatus?: PresenceStatus,
+    confirmLeaveCurrent?: boolean
   ) => {
     const presence = friendsPresenceMap[friend.id];
     const status = forcedStatus || (presence ? presence.status : 'OFFLINE');
@@ -778,7 +831,7 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
     setIsLoading(true);
     try {
       // Create a private 1v1 or 4-player table and auto-invite friend
-      await onCreateRoom({
+      const res = await onCreateRoom({
         playerName: playerName.trim(),
         fillWithBots: false,
         baseBet: 10,
@@ -787,7 +840,21 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
         enableDoubleKora: true,
         enableUnder21: true,
         isPublic: false,
-      });
+      }, confirmLeaveCurrent);
+
+      if (res && !res.success) {
+        if (res.errorCode === 'ACTIVE_GAME_IN_PROGRESS' && res.activeGameRoomCode) {
+          setActiveGameConflict({
+            activeRoomCode: res.activeGameRoomCode,
+            message: res.error,
+            onConfirmLeaveAndProceed: async () => {
+              await handleChallengeFriend(friend, forcedStatus, true);
+            },
+          });
+          return;
+        }
+        throw new Error(res.error || 'Erreur lors de la création du défi.');
+      }
 
       if (status === 'IN_SOLO') {
         setHubSuccessMsg(`Défi envoyé à ${friend.name} ! Sa partie solo sera automatiquement sauvegardée s'il accepte.`);
@@ -808,8 +875,8 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
     }
   };
 
-  const handleAcceptInvite = (invite: GameInvitation) => {
-    webSocketService.respondDirectInvite(invite.id, true);
+  const handleAcceptInvite = (invite: GameInvitation, confirmLeaveCurrent?: boolean) => {
+    webSocketService.respondDirectInvite(invite.id, true, confirmLeaveCurrent);
     setReceivedInvitations((prev) => prev.filter((i) => i.id !== invite.id));
     triggerHaptic('success');
   };
@@ -3496,7 +3563,7 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
                   type="button"
                   id="btn-confirm-create-room"
                   disabled={isLoading}
-                  onClick={handleCreate}
+                  onClick={() => handleCreate()}
                   className="w-full h-13 sm:h-14 rounded-2xl bg-gradient-to-r from-emerald-400 via-emerald-500 to-teal-400 hover:from-emerald-300 hover:via-emerald-400 hover:to-teal-300 text-slate-950 font-black text-xs sm:text-sm tracking-wide transition-all duration-150 active:scale-[0.98] cursor-pointer shadow-[0_6px_25px_-2px_rgba(16,185,129,0.55)] hover:shadow-[0_8px_30px_rgba(16,185,129,0.7)] border-t border-emerald-200/60 border-b-2 border-emerald-700/50 flex items-center justify-between px-4 sm:px-5 disabled:opacity-50 mt-1 group"
                 >
                   <div className="flex items-center gap-2.5 min-w-0">
@@ -3874,6 +3941,86 @@ export const MultiplayerScreen: React.FC<MultiplayerScreenProps> = ({
                   className="w-full py-2.5 px-4 rounded-xl text-slate-400 hover:text-white text-xs font-semibold transition-colors cursor-pointer"
                 >
                   Continuer en Invité
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ========================================================================= */}
+      {/* MODAL : PARTIE EN COURS DÉTECTÉE (PROTECTION CONTRE L'ABANDON INVOLONTAIRE) */}
+      {/* ========================================================================= */}
+      <AnimatePresence>
+        {activeGameConflict && (
+          <div className="fixed inset-0 z-[100] bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-4">
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0, y: 10 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.95, opacity: 0, y: 10 }}
+              className="bg-slate-900 border border-amber-500/30 rounded-3xl max-w-sm w-full p-5 sm:p-6 shadow-2xl flex flex-col gap-4 text-center"
+            >
+              {/* Icon & Header */}
+              <div className="mx-auto w-14 h-14 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 shadow-inner">
+                <ShieldAlert className="w-7 h-7 animate-pulse" />
+              </div>
+
+              <div>
+                <h3 className="text-base sm:text-lg font-black text-white">
+                  Partie en cours détectée
+                </h3>
+                <p className="text-xs sm:text-sm text-slate-300 mt-1.5 leading-relaxed">
+                  Vous avez déjà une partie active sur la table{' '}
+                  <span className="font-black text-amber-400 tracking-wider">
+                    #{activeGameConflict.activeRoomCode}
+                  </span>
+                  .
+                </p>
+                <p className="text-[11px] sm:text-xs text-slate-400 mt-1">
+                  Rejoindre ou créer une autre table sans la terminer sera comptabilisé comme un abandon de votre part.
+                </p>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex flex-col gap-2.5 pt-1">
+                {/* Primary: Return to active match */}
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const activeCode = activeGameConflict.activeRoomCode;
+                    setActiveGameConflict(null);
+                    setShowJoinCodeModal(false);
+                    setShowCreateModal(false);
+                    await handleJoin(activeCode);
+                  }}
+                  className="w-full h-12 rounded-xl bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-black text-sm flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20 transition active:scale-98 cursor-pointer"
+                >
+                  <Sparkles className="w-4 h-4 text-slate-950" />
+                  <span>Retourner à ma partie</span>
+                </button>
+
+                {/* Secondary: Forfeit current match and proceed */}
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const proceed = activeGameConflict.onConfirmLeaveAndProceed;
+                    setActiveGameConflict(null);
+                    if (proceed) {
+                      await proceed();
+                    }
+                  }}
+                  className="w-full h-11 rounded-xl bg-slate-800/80 hover:bg-rose-500/20 text-slate-300 hover:text-rose-300 border border-slate-700 hover:border-rose-500/40 font-bold text-xs flex items-center justify-center gap-2 transition active:scale-98 cursor-pointer"
+                >
+                  <span>Quitter ma partie et continuer</span>
+                </button>
+
+                {/* Cancel / Stay in Hub */}
+                <button
+                  type="button"
+                  onClick={() => setActiveGameConflict(null)}
+                  className="text-xs text-slate-500 hover:text-slate-400 py-1 cursor-pointer transition"
+                >
+                  Annuler
                 </button>
               </div>
             </motion.div>

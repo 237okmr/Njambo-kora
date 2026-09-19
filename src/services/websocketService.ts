@@ -1,13 +1,15 @@
 import { MultiplayerRoom, EmoteMessage, PublicRoomSummary, GameInvitation, UserPresence } from '../types';
 import { ClientMessage, ServerMessage } from '../../server/types';
 import { auth } from '../lib/firebase';
+import { onAuthStateChanged } from 'firebase/auth';
 import { APP_VERSION } from '../version';
 import { playerProfileService } from './playerProfileService';
 import { getPersistentItem, setPersistentItem } from '../utils/storageUtils';
+import { getPlayerId, setInRoomStatus, onIdentityChange } from './identity';
 
 export type ConnectionStateListener = (connected: boolean) => void;
 export type RoomUpdateListener = (room: MultiplayerRoom | null) => void;
-export type ErrorListener = (error: string) => void;
+export type ErrorListener = (error: string, errorCode?: string, activeGameRoomCode?: string) => void;
 export type EmoteListener = (emote: EmoteMessage) => void;
 export type LobbyAlertListener = (message: string) => void;
 export type AdminMessageListener = (data: { senderName: string; text: string; isPrivate: boolean }) => void;
@@ -56,8 +58,10 @@ class WebSocketService {
   private versionStatusListeners: Set<VersionStatusListener> = new Set();
   private offlineQueueListeners: Set<OfflineQueueListener> = new Set();
   private currentRoom: MultiplayerRoom | null = null;
+  private lastAcceptedState: { roomId: string; epoch: number; rev: number } | null = null;
   private isConnecting: boolean = false;
   private activeRoomCode: string | null = null;
+  private sessionRoomPlayerId: string | null = null;
   private userExplicitlyLeft: boolean = false;
   private currentPresenceStatus: 'ONLINE_IDLE' | 'IN_SOLO' | 'IN_LOBBY' | 'IN_GAME' | 'OFFLINE' = 'ONLINE_IDLE';
   private connectPromise: Promise<void> | null = null;
@@ -66,6 +70,13 @@ class WebSocketService {
   private serverTimeOffset: number = 0;
   private lastPingSentAt: number = 0;
   private lastConnectAttemptAt: number = 0;
+
+  public getLocalPlayerId(): string {
+    if (this.activeRoomCode && this.sessionRoomPlayerId) {
+      return this.sessionRoomPlayerId;
+    }
+    return getPlayerId();
+  }
 
   public updateServerTime(serverTimestamp: number, roundTripMs: number = 0): void {
     if (!serverTimestamp || typeof serverTimestamp !== 'number') return;
@@ -99,6 +110,7 @@ class WebSocketService {
         const savedRoom = localStorage.getItem('njambo_active_room_code');
         if (savedRoom) {
           this.activeRoomCode = savedRoom;
+          setInRoomStatus(true);
         }
       } catch (e) {
         // ignore
@@ -121,7 +133,7 @@ class WebSocketService {
           }
           this.connect().then(() => {
             if (!this.userExplicitlyLeft && currentActiveRoom && this.socket && this.socket.readyState === WebSocket.OPEN) {
-              const playerId = localStorage.getItem('njambo_player_id') || '';
+              const playerId = this.getLocalPlayerId();
               const playerName = localStorage.getItem('njambo_player_name') || '';
               this.send({
                 type: 'JOIN_ROOM',
@@ -133,7 +145,7 @@ class WebSocketService {
           });
         } else if (this.socket.readyState === WebSocket.OPEN && currentActiveRoom && !this.userExplicitlyLeft) {
           // Socket is open: send instant join/sync and ping
-          const playerId = localStorage.getItem('njambo_player_id') || '';
+          const playerId = this.getLocalPlayerId();
           const playerName = localStorage.getItem('njambo_player_name') || '';
           this.send({
             type: 'JOIN_ROOM',
@@ -156,6 +168,33 @@ class WebSocketService {
         console.log('[WS] Network back online - reconnecting');
         handleAppResume();
       });
+
+      // Listen for Firebase Auth state changes
+      onAuthStateChanged(auth, () => {
+        this.onAuthChanged();
+      });
+
+      // Listen for identity queue releases (when exiting a room)
+      onIdentityChange(() => {
+        this.onAuthChanged();
+      });
+    }
+  }
+
+  public onAuthChanged(): void {
+    const inRoom = Boolean(this.activeRoomCode || this.currentRoom);
+    if (!inRoom) {
+      console.log('[WS] Auth state changed outside of room: reconnecting socket with new auth identity.');
+      if (this.socket) {
+        try {
+          this.socket.close(1000, 'Auth changed');
+        } catch (e) {
+          // ignore
+        }
+      }
+      this.connect();
+    } else {
+      console.log('[WS] Auth state changed while in active room: preserving table session until room exit.');
     }
   }
 
@@ -167,7 +206,7 @@ class WebSocketService {
     setPersistentItem('njambo_reconnect_token', token);
   }
 
-  public connect(): Promise<void> {
+  public async connect(): Promise<void> {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
       return Promise.resolve();
     }
@@ -178,11 +217,22 @@ class WebSocketService {
     this.isConnecting = true;
     this.lastConnectAttemptAt = Date.now();
 
+    // Retrieve Firebase Auth ID Token for authenticated Google user
+    let idToken: string | null = null;
+    const currentUser = auth.currentUser;
+    if (currentUser && !currentUser.isAnonymous) {
+      try {
+        idToken = await currentUser.getIdToken();
+      } catch (e) {
+        console.warn('[WS] Failed to get auth ID token for handshake:', e);
+      }
+    }
+
     this.connectPromise = new Promise((resolve) => {
       try {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const token = this.getReconnectToken();
-        const playerId = getPersistentItem('njambo_player_id') || '';
+        const playerId = this.getLocalPlayerId();
         const sessionId = getDeviceSessionId();
         const params = new URLSearchParams();
         if (token) params.set('token', token);
@@ -195,8 +245,20 @@ class WebSocketService {
         this.socket.onopen = () => {
           this.isConnecting = false;
           this.connectPromise = null;
+          this.lastAcceptedState = null;
           this.startHeartbeat();
           this.notifyConnectionState(true);
+
+          // Step 1: Send AUTH as the very first message if user is authenticated
+          if (idToken && this.socket && this.socket.readyState === WebSocket.OPEN) {
+            const authMsg: ClientMessage = {
+              type: 'AUTH',
+              playerId: currentUser?.uid || playerId,
+              idToken,
+              timestamp: Date.now(),
+            };
+            this.socket.send(JSON.stringify(authMsg));
+          }
 
           // Intelligent Offline Queue Purge (Lot 2 Resilience)
           // 1. Purge stale in-game actions like PLAY_CARD (avoid burst execution of obsolete cards)
@@ -293,7 +355,7 @@ class WebSocketService {
             this.pendingMessages = [];
 
             // If we had an active room, rejoin immediately with reconnect token
-            const pid = getPersistentItem('njambo_player_id') || localStorage.getItem('njambo_player_id') || '';
+            const pid = this.getLocalPlayerId();
             const pname = getPersistentItem('njambo_player_name') || localStorage.getItem('njambo_player_name') || '';
             const reconnectToken = this.getReconnectToken();
             this.send({
@@ -342,6 +404,8 @@ class WebSocketService {
           if (event.code === 4001) {
             console.log('[WS] Session takeover detected (4001). Halting auto-reconnect.');
             this.activeRoomCode = null;
+            this.sessionRoomPlayerId = null;
+            setInRoomStatus(false);
             this.notifyError('SESSION_TAKEOVER');
             return resolve();
           }
@@ -387,7 +451,7 @@ class WebSocketService {
       this.connect().then(() => {
         const currentActiveRoom = this.activeRoomCode || localStorage.getItem('njambo_active_room_code');
         if (!this.userExplicitlyLeft && currentActiveRoom && this.socket && this.socket.readyState === WebSocket.OPEN) {
-          const playerId = localStorage.getItem('njambo_player_id') || '';
+          const playerId = this.getLocalPlayerId();
           const playerName = localStorage.getItem('njambo_player_name') || '';
           this.send({
             type: 'JOIN_ROOM',
@@ -403,7 +467,7 @@ class WebSocketService {
   public setPresenceStatus(status: 'ONLINE_IDLE' | 'IN_SOLO' | 'IN_LOBBY' | 'IN_GAME' | 'OFFLINE'): void {
     this.currentPresenceStatus = status;
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-      const playerId = localStorage.getItem('njambo_player_id') || '';
+      const playerId = this.getLocalPlayerId();
       const playerName = localStorage.getItem('njambo_player_name') || '';
       const avatarSeed = localStorage.getItem('njambo_avatar_seed') || '';
       const statusPresence = this.activeRoomCode
@@ -426,7 +490,7 @@ class WebSocketService {
     // 25s client heartbeat (harmonized with server RFC-6455 20s transport ping/pong to save battery)
     this.pingInterval = setInterval(() => {
       if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-        const playerId = localStorage.getItem('njambo_player_id') || '';
+        const playerId = this.getLocalPlayerId();
         const playerName = localStorage.getItem('njambo_player_name') || '';
         const avatarSeed = localStorage.getItem('njambo_avatar_seed') || '';
         const statusPresence = this.activeRoomCode
@@ -488,24 +552,52 @@ class WebSocketService {
       case 'ROOM_JOINED':
       case 'SYNC_STATE':
         if (msg.playerId) {
-          try {
-            setPersistentItem('njambo_player_id', msg.playerId);
-          } catch (e) {
-            // ignore
+          const canonicalId = getPlayerId();
+          if (msg.playerId !== canonicalId) {
+            this.sessionRoomPlayerId = msg.playerId;
+          } else {
+            this.sessionRoomPlayerId = null;
           }
         }
         if (msg.reconnectToken) {
           this.setReconnectToken(msg.reconnectToken);
         }
         if (msg.room) {
-          this.currentRoom = msg.room;
-          this.activeRoomCode = msg.room.id;
+          const incomingRoom = msg.room;
+          const incomingEpoch = incomingRoom.epoch || 0;
+          const incomingRev = incomingRoom.rev || 0;
+
+          // Stale state rejection for SYNC_STATE:
+          // Ignore if same room, same server epoch, and incoming revision is <= last accepted revision
+          if (msg.type === 'SYNC_STATE' && this.lastAcceptedState) {
+            if (
+              this.lastAcceptedState.roomId === incomingRoom.id &&
+              this.lastAcceptedState.epoch === incomingEpoch &&
+              incomingRev <= this.lastAcceptedState.rev
+            ) {
+              console.debug(
+                `[WS] Stale SYNC_STATE ignored for room ${incomingRoom.id} (rev: ${incomingRev} <= lastAccepted: ${this.lastAcceptedState.rev}, epoch: ${incomingEpoch})`
+              );
+              return;
+            }
+          }
+
+          // Always accept ROOM_JOINED, newer SYNC_STATE, or state from a new room / new epoch
+          this.lastAcceptedState = {
+            roomId: incomingRoom.id,
+            epoch: incomingEpoch,
+            rev: incomingRev,
+          };
+
+          this.currentRoom = incomingRoom;
+          this.activeRoomCode = incomingRoom.id;
+          setInRoomStatus(true);
           try {
-            localStorage.setItem('njambo_active_room_code', msg.room.id);
+            localStorage.setItem('njambo_active_room_code', incomingRoom.id);
           } catch (e) {
             // ignore
           }
-          this.notifyRoomUpdate(msg.room);
+          this.notifyRoomUpdate(incomingRoom);
         }
 
         // Flush any queued room-bound messages now that room connection is fully confirmed
@@ -520,26 +612,22 @@ class WebSocketService {
         break;
 
       case 'ERROR':
-        if (msg.error) {
-          const lowerErr = msg.error.toLowerCase();
-          if (
-            lowerErr.includes('salon introuvable') ||
-            lowerErr.includes('introuvable') ||
-            lowerErr.includes('code vide') ||
-            lowerErr.includes('inexistant') ||
-            lowerErr.includes('expiré') ||
-            lowerErr.includes('impossible de rejoindre')
-          ) {
-            this.activeRoomCode = null;
-            this.currentRoom = null;
-            try {
-              localStorage.removeItem('njambo_active_room_code');
-            } catch (e) {
-              // ignore
-            }
-            this.notifyRoomUpdate(null);
+        const errorCode = msg.errorCode || 'GENERIC';
+        if (errorCode === 'ROOM_NOT_FOUND') {
+          this.activeRoomCode = null;
+          this.sessionRoomPlayerId = null;
+          this.lastAcceptedState = null;
+          setInRoomStatus(false);
+          this.currentRoom = null;
+          try {
+            localStorage.removeItem('njambo_active_room_code');
+          } catch (e) {
+            // ignore
           }
-          this.notifyError(msg.error);
+          this.notifyRoomUpdate(null);
+        }
+        if (msg.error) {
+          this.notifyError(msg.error, errorCode, msg.activeGameRoomCode);
         }
         break;
 
@@ -607,19 +695,21 @@ class WebSocketService {
       enableUnder21: boolean;
       turnTimerSeconds?: number;
       isPublic?: boolean;
-    }
+    },
+    confirmLeaveCurrent?: boolean
   ): Promise<void> {
     await this.connect();
-    const playerId = localStorage.getItem('njambo_player_id') || 'usr_' + Math.random().toString(36).substring(2, 9);
-    localStorage.setItem('njambo_player_id', playerId);
+    const playerId = this.getLocalPlayerId();
 
     const activeSanction = playerProfileService.getActiveSanction();
 
     this.userExplicitlyLeft = false;
+    this.lastAcceptedState = null;
     this.send({
       type: 'CREATE_ROOM',
       playerId,
       playerName: hostName,
+      confirmLeaveCurrent,
       fairPlaySanction: activeSanction ? {
         type: activeSanction.type,
         reason: activeSanction.reason,
@@ -630,13 +720,21 @@ class WebSocketService {
     });
   }
 
-  public async joinRoom(roomCode: string, playerName: string): Promise<void> {
+  public async joinRoom(roomCode: string, playerName: string, confirmLeaveCurrent?: boolean): Promise<void> {
     await this.connect();
     this.userExplicitlyLeft = false;
-    this.activeRoomCode = roomCode.toUpperCase();
-    const playerId = localStorage.getItem('njambo_player_id') || 'usr_' + Math.random().toString(36).substring(2, 9);
-    localStorage.setItem('njambo_player_id', playerId);
-    localStorage.setItem('njambo_active_room_code', this.activeRoomCode);
+    const upperCode = roomCode.toUpperCase();
+    if (this.lastAcceptedState && this.lastAcceptedState.roomId !== upperCode) {
+      this.lastAcceptedState = null;
+    }
+    this.activeRoomCode = upperCode;
+    setInRoomStatus(true);
+    const playerId = this.getLocalPlayerId();
+    try {
+      localStorage.setItem('njambo_active_room_code', this.activeRoomCode);
+    } catch (e) {
+      // ignore
+    }
 
     const activeSanction = playerProfileService.getActiveSanction();
 
@@ -645,6 +743,7 @@ class WebSocketService {
       roomCode: this.activeRoomCode,
       playerId,
       playerName,
+      confirmLeaveCurrent,
       fairPlaySanction: activeSanction ? {
         type: activeSanction.type,
         reason: activeSanction.reason,
@@ -656,7 +755,7 @@ class WebSocketService {
 
   public setReady(isReady: boolean): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'SET_READY',
       roomCode: this.activeRoomCode,
@@ -672,7 +771,8 @@ class WebSocketService {
       return;
     }
     this.activeRoomCode = roomCode;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    setInRoomStatus(true);
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'START_GAME',
       roomCode,
@@ -682,7 +782,7 @@ class WebSocketService {
 
   public playCard(cardId: string): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'PLAY_CARD',
       roomCode: this.activeRoomCode,
@@ -693,7 +793,7 @@ class WebSocketService {
 
   public readyForNextPartie(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'READY_NEXT_PARTIE',
       roomCode: this.activeRoomCode,
@@ -703,7 +803,7 @@ class WebSocketService {
 
   public forceNextPartie(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'FORCE_NEXT_PARTIE',
       roomCode: this.activeRoomCode,
@@ -713,7 +813,7 @@ class WebSocketService {
 
   public updateRoomSettings(settings: Partial<MultiplayerRoom>): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'UPDATE_SETTINGS',
       roomCode: this.activeRoomCode,
@@ -732,14 +832,14 @@ class WebSocketService {
 
   public kickPlayer(targetPlayerId: string): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     if (!playerId) return;
     this.send({ type: 'KICK_PLAYER', roomCode: this.activeRoomCode, playerId, targetPlayerId });
   }
 
   public alertUnreadyPlayers(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'ALERT_UNREADY_PLAYERS',
       roomCode: this.activeRoomCode,
@@ -749,7 +849,7 @@ class WebSocketService {
 
   public claimHost(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'CLAIM_HOST',
       roomCode: this.activeRoomCode,
@@ -759,7 +859,7 @@ class WebSocketService {
 
   public voteBots(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'VOTE_BOTS',
       roomCode: this.activeRoomCode,
@@ -769,7 +869,7 @@ class WebSocketService {
 
   public sendEmote(text: string, emoji?: string): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'SEND_EMOTE',
       roomCode: this.activeRoomCode,
@@ -781,7 +881,7 @@ class WebSocketService {
 
   public foldRound(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'FOLD_ROUND',
       roomCode: this.activeRoomCode,
@@ -791,7 +891,7 @@ class WebSocketService {
 
   public claimForfeitVictory(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'CLAIM_FORFEIT_VICTORY',
       roomCode: this.activeRoomCode,
@@ -801,7 +901,7 @@ class WebSocketService {
 
   public triggerKoraHunterAlert(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'KORA_HUNTER_ALERT',
       roomCode: this.activeRoomCode,
@@ -811,7 +911,7 @@ class WebSocketService {
 
   public dismissKoraHunterAlert(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'DISMISS_KORA_ALERT',
       roomCode: this.activeRoomCode,
@@ -821,7 +921,7 @@ class WebSocketService {
 
   public proposeBetIncrease(proposedBet: number): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'PROPOSE_BET_INCREASE',
       roomCode: this.activeRoomCode,
@@ -832,7 +932,7 @@ class WebSocketService {
 
   public respondBetIncrease(agree: boolean): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'RESPOND_BET_INCREASE',
       roomCode: this.activeRoomCode,
@@ -843,7 +943,7 @@ class WebSocketService {
 
   public cancelBetIncrease(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'CANCEL_BET_INCREASE',
       roomCode: this.activeRoomCode,
@@ -853,7 +953,7 @@ class WebSocketService {
 
   public requestIntegration(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     const playerName = localStorage.getItem('njambo_player_name') || 'Joueur';
     const avatarSeed = localStorage.getItem('njambo_avatar_seed') || 'avatar_1';
     this.send({
@@ -867,7 +967,7 @@ class WebSocketService {
 
   public respondIntegrationVote(agree: boolean): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'RESPOND_INTEGRATION_VOTE',
       roomCode: this.activeRoomCode,
@@ -878,7 +978,7 @@ class WebSocketService {
 
   public proposeCapacityExtension(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'PROPOSE_CAPACITY_EXTENSION',
       roomCode: this.activeRoomCode,
@@ -888,7 +988,7 @@ class WebSocketService {
 
   public respondCapacityExtension(agree: boolean): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'RESPOND_CAPACITY_EXTENSION',
       roomCode: this.activeRoomCode,
@@ -899,7 +999,7 @@ class WebSocketService {
 
   public proposeEarlyClose(): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'PROPOSE_EARLY_CLOSE',
       roomCode: this.activeRoomCode,
@@ -909,7 +1009,7 @@ class WebSocketService {
 
   public respondEarlyClose(agree: boolean): void {
     if (!this.activeRoomCode) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'RESPOND_EARLY_CLOSE',
       roomCode: this.activeRoomCode,
@@ -921,13 +1021,16 @@ class WebSocketService {
   public leaveRoom(): void {
     this.userExplicitlyLeft = true;
     if (this.activeRoomCode) {
-      const playerId = localStorage.getItem('njambo_player_id') || '';
+      const playerId = this.getLocalPlayerId();
       this.send({
         type: 'LEAVE_ROOM',
         roomCode: this.activeRoomCode,
         playerId,
       });
       this.activeRoomCode = null;
+      this.sessionRoomPlayerId = null;
+      this.lastAcceptedState = null;
+      setInRoomStatus(false);
       this.currentRoom = null;
       try {
         localStorage.removeItem('njambo_active_room_code');
@@ -982,19 +1085,18 @@ class WebSocketService {
 
   public async requestPublicRooms(): Promise<void> {
     await this.connect();
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'GET_PUBLIC_ROOMS',
       playerId,
     });
   }
 
-  public async quickMatch(settings?: { baseBet?: number; initialCapital?: number }): Promise<void> {
+  public async quickMatch(settings?: { baseBet?: number; initialCapital?: number }, confirmLeaveCurrent?: boolean): Promise<void> {
     await this.connect();
-    const playerId = localStorage.getItem('njambo_player_id') || 'usr_' + Math.random().toString(36).substring(2, 9);
+    const playerId = this.getLocalPlayerId();
     const playerName = localStorage.getItem('njambo_player_name') || 'Joueur';
     const avatarSeed = localStorage.getItem('njambo_avatar_seed') || 'avatar_1';
-    localStorage.setItem('njambo_player_id', playerId);
 
     const activeSanction = playerProfileService.getActiveSanction();
 
@@ -1003,6 +1105,7 @@ class WebSocketService {
       playerId,
       playerName,
       avatarSeed,
+      confirmLeaveCurrent,
       fairPlaySanction: activeSanction ? {
         type: activeSanction.type,
         reason: activeSanction.reason,
@@ -1023,7 +1126,7 @@ class WebSocketService {
 
   public async sendDirectInvite(targetPlayerId: string, roomCode: string): Promise<void> {
     await this.connect();
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     const playerName = localStorage.getItem('njambo_player_name') || 'Ami';
     const avatarSeed = localStorage.getItem('njambo_avatar_seed') || 'host';
 
@@ -1037,8 +1140,8 @@ class WebSocketService {
     });
   }
 
-  public respondDirectInvite(inviteId: string, agree: boolean): void {
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+  public respondDirectInvite(inviteId: string, agree: boolean, confirmLeaveCurrent?: boolean): void {
+    const playerId = this.getLocalPlayerId();
     const playerName = localStorage.getItem('njambo_player_name') || 'Joueur';
     const avatarSeed = localStorage.getItem('njambo_avatar_seed') || 'avatar_1';
 
@@ -1049,6 +1152,7 @@ class WebSocketService {
       avatarSeed,
       inviteId,
       agree,
+      confirmLeaveCurrent,
     });
   }
 
@@ -1060,8 +1164,8 @@ class WebSocketService {
     return this.socket ? this.socket.readyState : WebSocket.CLOSED;
   }
 
-  public respondToDirectInvite(inviteId: string, fromUserId?: string, agree: boolean = true, roomCode?: string): void {
-    this.respondDirectInvite(inviteId, agree);
+  public respondToDirectInvite(inviteId: string, fromUserId?: string, agree: boolean = true, roomCode?: string, confirmLeaveCurrent?: boolean): void {
+    this.respondDirectInvite(inviteId, agree, confirmLeaveCurrent);
   }
 
   public onPublicRooms(listener: PublicRoomsListener): () => void {
@@ -1087,7 +1191,7 @@ class WebSocketService {
 
   public getFriendsPresence(friendUserIds: string[]): void {
     if (!friendUserIds || friendUserIds.length === 0) return;
-    const playerId = localStorage.getItem('njambo_player_id') || '';
+    const playerId = this.getLocalPlayerId();
     this.send({
       type: 'GET_FRIENDS_PRESENCE',
       playerId,
@@ -1177,8 +1281,8 @@ class WebSocketService {
     this.roomUpdateListeners.forEach((l) => l(room));
   }
 
-  private notifyError(error: string): void {
-    this.errorListeners.forEach((l) => l(error));
+  private notifyError(error: string, errorCode?: string, activeGameRoomCode?: string): void {
+    this.errorListeners.forEach((l) => l(error, errorCode, activeGameRoomCode));
   }
 
   private notifyEmote(emote: EmoteMessage): void {

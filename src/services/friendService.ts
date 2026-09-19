@@ -1,5 +1,6 @@
 import { LocalContact, FriendDocument, FriendStatus, GameInvitation, UserPresence, PublicRoomSummary } from '../types';
 import { db, auth } from '../lib/firebase';
+import { getPlayerId } from './identity';
 import {
   collection,
   doc,
@@ -59,7 +60,7 @@ export class FriendService {
   }
 
   public static addLocalContact(contact: Omit<LocalContact, 'addedAt'>): LocalContact {
-    const localId = localStorage.getItem('njambo_player_id') || '';
+    const localId = getPlayerId();
     const localName = (localStorage.getItem('njambo_player_name') || '').trim().toLowerCase();
 
     // Prevent adding self
@@ -113,7 +114,7 @@ export class FriendService {
       const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed)) return [];
 
-      const localId = localStorage.getItem('njambo_player_id') || '';
+      const localId = getPlayerId();
       const localName = (localStorage.getItem('njambo_player_name') || '').trim().toLowerCase();
       const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
 
@@ -139,7 +140,7 @@ export class FriendService {
     const nameTrimmed = player.name.trim();
     if (!nameTrimmed || nameTrimmed.toLowerCase() === 'katika' || player.id.startsWith('bot_')) return;
 
-    const localId = currentLocalPlayerId || localStorage.getItem('njambo_player_id') || '';
+    const localId = currentLocalPlayerId || getPlayerId();
     const localName = (localStorage.getItem('njambo_player_name') || '').trim().toLowerCase();
 
     // Strict Self-Exclusion: local player must never be added to recent opponents

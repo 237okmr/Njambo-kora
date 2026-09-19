@@ -571,6 +571,8 @@ export interface MultiplayerRoom {
   lastSeenAt?: number;
   actionSequence?: number; // Sequence ID to prevent race conditions
   serverTimestamp?: number; // Server-authoritative timestamp for clock sync and timers
+  rev?: number;
+  epoch?: number;
   version?: number;
   protocolVersion?: number;
   serverVersion?: string;

@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Users, Globe, PlusCircle, ArrowRight, Bot, Shield, Zap, Sparkles, X, Check, Copy, Timer } from 'lucide-react';
-import { getLocalPlayerName, setLocalPlayerName } from '../services/multiplayerService';
+import { getLocalPlayerName, setLocalPlayerName } from '../services/identity';
 import { getKatikaConfigSync } from '../katika/services/katikaService';
 
 interface MultiplayerHubModalProps {

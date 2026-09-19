@@ -1,6 +1,7 @@
 export interface KatikaEngineConfig {
   turnTimerSeconds: number;
   reconnectGracePeriodSeconds: number;
+  aiRelayGraceSeconds?: number;
   reconnectTimeoutSeconds?: number;
   lobbyDisconnectGraceSeconds?: number;
   hostLobbyGraceSeconds?: number;
@@ -38,6 +39,7 @@ export const DEFAULT_ENGINE_CONFIG: KatikaEngineConfig = {
   emptyRoomTimeoutMinutes: 5,
   turnTimerSeconds: 15,
   reconnectGracePeriodSeconds: 180,
+  aiRelayGraceSeconds: 8,
   reconnectTimeoutSeconds: 180,
   lobbyDisconnectGraceSeconds: 180,
   hostLobbyGraceSeconds: 180,

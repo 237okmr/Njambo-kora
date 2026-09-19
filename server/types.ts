@@ -2,6 +2,7 @@ import { Card, GameState, MultiplayerRoom, Player, RoomPlayer, RoomStatus, Emote
 
 export interface ClientMessage {
   type:
+    | 'AUTH'
     | 'JOIN_ROOM'
     | 'CREATE_ROOM'
     | 'SET_READY'
@@ -39,6 +40,7 @@ export interface ClientMessage {
   roomCode?: string;
   playerId: string;
   playerName?: string;
+  idToken?: string;
   avatarSeed?: string;
   reconnectToken?: string;
   cardId?: string;
@@ -69,10 +71,24 @@ export interface ClientMessage {
   isGuest?: boolean;
   authProvider?: string;
   fairPlaySanction?: { type: string; reason: string; expiresAt: number | null; active: boolean };
+  confirmLeaveCurrent?: boolean;
   clientVersion?: string;
   protocolVersion?: number;
   timestamp?: number;
 }
+
+export type ServerErrorCode =
+  | 'ROOM_NOT_FOUND'
+  | 'TURN_EXPIRED'
+  | 'VOTE_CLOSED'
+  | 'INVITE_EXPIRED'
+  | 'JOIN_REFUSED'
+  | 'RATE_LIMITED'
+  | 'BANNED'
+  | 'MAINTENANCE'
+  | 'ACTIVE_GAME_IN_PROGRESS'
+  | 'SEAT_TAKEN'
+  | 'GENERIC';
 
 export interface ServerMessage {
   type:
@@ -91,6 +107,7 @@ export interface ServerMessage {
     | 'FRIENDS_PRESENCE_UPDATE'
     | 'QUICK_MATCH_RESULT'
     | 'VERSION_HANDSHAKE';
+  errorCode?: ServerErrorCode;
   room?: MultiplayerRoom;
   playerId?: string;
   reconnectToken?: string;
@@ -114,6 +131,7 @@ export interface ServerMessage {
   presence?: UserPresence;
   presences?: UserPresence[];
   matchedRoomCode?: string;
+  activeGameRoomCode?: string;
   protocolVersion?: number;
   serverVersion?: string;
   updateRecommended?: boolean;

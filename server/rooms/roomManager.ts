@@ -4,112 +4,25 @@ import { ClientMessage, ServerMessage } from '../types';
 import { ActiveRoomState, ServerGameEngine, maskOpponentCards, selectBotToReplace, syncRoomPlayersWithGameState } from '../engine/serverGameEngine';
 import { getEngineConfig, updateEngineConfig as applyEngineConfigUpdate, KatikaEngineConfig, DEFAULT_ENGINE_CONFIG } from '../engine/engineConfig';
 import { pushService } from '../pushService';
-import { db } from '../../src/lib/firebase';
-import { doc, setDoc, onSnapshot, collection, deleteDoc } from 'firebase/firestore';
 import { APP_VERSION } from '../../src/version';
+import { verifyFirebaseIdToken } from '../firebaseAdmin';
 
 export interface ConnectedClient {
   socket: WebSocket;
   playerId: string;
   roomCode: string | null;
   reconnectToken: string;
+  sessionId?: string;
   lastPing: number;
+  isAuthenticated?: boolean;
+  authUid?: string;
+  isAuthenticating?: boolean;
+  messageQueue?: string[];
 }
 
+const SERVER_EPOCH = Date.now();
+
 export class RoomManager {
-  private static isFirestoreInitialized = false;
-
-  public static initFirestoreSync() {
-    if (this.isFirestoreInitialized || !db) return;
-    this.isFirestoreInitialized = true;
-    
-    console.log('[RoomManager] Initializing Firestore Multi-Instance Sync...');
-    
-    onSnapshot(collection(db, 'rooms'), (snapshot) => {
-      snapshot.docChanges().forEach((change) => {
-        const room = change.doc.data() as MultiplayerRoom;
-        const docId = change.doc.id;
-        
-        if (!room || !room.id || docId === 'TEST_CLI' || !room.players) {
-          if (change.type !== 'removed') {
-            console.log(`[RoomManager] Deleting corrupted room document ${docId} from Firestore...`);
-            deleteDoc(doc(db, 'rooms', docId)).catch(console.error);
-          }
-          return;
-        }
-
-        if (change.type === 'removed') {
-          this.rooms.delete(room.id);
-          this.roomStates.delete(room.id);
-        } else {
-          // Check if this room is older than 15 minutes without any living WebSocket client
-          const now = Date.now();
-          const lastActivity = room.lastSeenAt || room.updatedAt || room.createdAt || 0;
-          const ageMs = now - lastActivity;
-          const hasAnyLivingClient = (room.players || []).some(
-            (p) => p.isHuman && this.clients.has(p.id) && this.clients.get(p.id)!.socket.readyState === WebSocket.OPEN
-          );
-
-          if (!hasAnyLivingClient && ageMs > 15 * 60 * 1000) {
-            console.log(`[RoomManager] Purging stale room ${docId} (age: ${Math.round(ageMs / 60000)}m) from Firestore...`);
-            deleteDoc(doc(db, 'rooms', docId)).catch(console.error);
-            this.rooms.delete(room.id);
-            this.roomStates.delete(room.id);
-            return;
-          }
-
-          // Sync real connection state with memory
-          (room.players || []).forEach((p) => {
-            if (p.isHuman) {
-              const client = this.clients.get(p.id);
-              p.connected = Boolean(client && client.socket.readyState === WebSocket.OPEN);
-            }
-          });
-
-          // Check if we need to update
-          const existing = this.rooms.get(room.id);
-          if (!existing || existing.serverTimestamp !== room.serverTimestamp) {
-            // Mark as from firestore to prevent echo write
-            (room as any)._fromFirestore = true;
-            this.rooms.set(room.id, room);
-            
-            if (!this.roomStates.has(room.id) && room.gameState) {
-               this.roomStates.set(room.id, {
-                  room: room,
-                  turnTimeoutTimer: null,
-                  trickResolutionTimer: null,
-                  nextPartieTimer: null,
-                  botMoveTimer: null,
-                  instantWinTimer: null,
-                  disconnectTimers: new Map<string, NodeJS.Timeout>(),
-                  consecutiveTimeouts: new Map<string, number>(),
-               });
-            }
-            
-            this.broadcastRoomState(room.id);
-          }
-        }
-      });
-    });
-  }
-
-  private static async syncRoomToFirestore(room: MultiplayerRoom) {
-    if (!db) return;
-    
-    if ((room as any)._fromFirestore) {
-      delete (room as any)._fromFirestore;
-      return;
-    }
-    
-    try {
-       const clone = JSON.parse(JSON.stringify(room));
-       delete clone._fromFirestore;
-       await setDoc(doc(db, 'rooms', room.id), clone);
-    } catch(e) {
-       console.error('[RoomManager] Firestore sync error:', e);
-    }
-  }
-
   private static rooms = new Map<string, MultiplayerRoom>();
   private static roomStates = new Map<string, ActiveRoomState>();
   private static clients = new Map<string, ConnectedClient>(); // playerId -> ConnectedClient
@@ -120,6 +33,8 @@ export class RoomManager {
   private static pendingInvitations = new Map<string, GameInvitation>(); // inviteId -> GameInvitation
   private static lastEmoteTimestamps = new Map<string, number>(); // playerId -> lastEmoteTimestamp
   private static cleanupInterval: NodeJS.Timeout | null = null;
+  private static roomTickInterval: NodeJS.Timeout | null = null;
+  private static isTickingRooms = new Set<string>();
   private static lastTurnAlerts = new Map<string, string>(); // roomCode -> "playerId_trickNumber_tricksCount"
   private static lastGameStartAlerts = new Set<string>(); // roomCode
 
@@ -222,6 +137,19 @@ export class RoomManager {
 
     if (sanction.status === 'ACTIVE' && !sanction.sanctionType) return null;
     return sanction;
+  }
+
+  public static getActiveGameForPlayer(playerId: string, excludeRoomCode?: string): { roomCode: string; room: MultiplayerRoom } | null {
+    for (const [roomCode, room] of this.rooms.entries()) {
+      if (excludeRoomCode && roomCode === excludeRoomCode) continue;
+      if (room.status === 'PLAYING') {
+        const p = (room.players || []).find((player) => player.id === playerId);
+        if (p && !p.isSpectator && !p.isEliminated && !p.isForfeit) {
+          return { roomCode, room };
+        }
+      }
+    }
+    return null;
   }
 
   public static recordPlayerForfeit(playerId: string, reason: string): {
@@ -337,6 +265,7 @@ export class RoomManager {
     if (client && client.socket.readyState === WebSocket.OPEN) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'BANNED',
         error: `Votre compte a été suspendu par le Katika Master. Motif: ${reason}`,
       });
       client.socket.close();
@@ -438,6 +367,7 @@ export class RoomManager {
         if (c.socket.readyState === WebSocket.OPEN) {
           this.sendMessage(c.socket, {
             type: 'ERROR',
+            errorCode: 'MAINTENANCE',
             error: updated.maintenanceNotice,
           });
         }
@@ -498,29 +428,49 @@ export class RoomManager {
     let token: string;
 
     if (reconnectToken && this.tokenToPlayerId.has(reconnectToken)) {
-      playerId = this.tokenToPlayerId.get(reconnectToken)!;
-      token = reconnectToken;
-      this.playerIdToToken.set(playerId, token);
+      const tokenPlayerId = this.tokenToPlayerId.get(reconnectToken)!;
+      if (tokenPlayerId.startsWith('usr_')) {
+        playerId = tokenPlayerId;
+        token = reconnectToken;
+        this.playerIdToToken.set(playerId, token);
+      } else {
+        // Google UID token: assign temporary guest until AUTH message confirms identity
+        playerId = 'usr_' + Math.random().toString(36).substring(2, 9);
+        token = 'tk_' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+        this.tokenToPlayerId.set(token, playerId);
+        this.playerIdToToken.set(playerId, token);
+      }
     } else if (requestedPlayerId) {
-      // Reconnect/Takeover policy:
-      // If a player reconnects from the same or fresh tab with the same playerId,
-      // the new connection takes over cleanly without destroying room state.
-      const existingToken = this.playerIdToToken.get(requestedPlayerId);
-      const existingClient = this.clients.get(requestedPlayerId);
-
-      if (existingClient && existingClient.socket !== socket && existingClient.socket.readyState === WebSocket.OPEN) {
-        console.log(`[Session Reconnect] Replacing previous connection for playerId '${requestedPlayerId}'.`);
-        try {
-          existingClient.socket.close(1000, 'Connexion transférée vers nouvelle socket');
-        } catch (e) {
-          // ignore
+      if (!requestedPlayerId.startsWith('usr_')) {
+        // Unverified Google UID: reject claim on connection. Assign temporary guest id until AUTH is received.
+        playerId = 'usr_' + Math.random().toString(36).substring(2, 9);
+        token = 'tk_' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+        this.tokenToPlayerId.set(token, playerId);
+        this.playerIdToToken.set(playerId, token);
+      } else {
+        // Guest ID ('usr_...')
+        const existingToken = this.playerIdToToken.get(requestedPlayerId);
+        if (existingToken) {
+          if (reconnectToken && reconnectToken === existingToken) {
+            // Valid reconnect token for guest
+            playerId = requestedPlayerId;
+            token = reconnectToken;
+          } else {
+            // Missing or invalid reconnect token: allocate fresh guest ID (prevent session hijack)
+            console.warn(`[Security] Denied claim of guest ID '${requestedPlayerId}' without matching reconnectToken.`);
+            playerId = 'usr_' + Math.random().toString(36).substring(2, 9);
+            token = 'tk_' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+            this.tokenToPlayerId.set(token, playerId);
+            this.playerIdToToken.set(playerId, token);
+          }
+        } else {
+          // Fresh unbound guest ID
+          playerId = requestedPlayerId;
+          token = reconnectToken || ('tk_' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36));
+          this.tokenToPlayerId.set(token, playerId);
+          this.playerIdToToken.set(playerId, token);
         }
       }
-
-      playerId = requestedPlayerId;
-      token = reconnectToken || existingToken || ('tk_' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36));
-      this.tokenToPlayerId.set(token, playerId);
-      this.playerIdToToken.set(playerId, token);
     } else {
       playerId = 'usr_' + Math.random().toString(36).substring(2, 9);
       token = 'tk_' + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
@@ -528,11 +478,19 @@ export class RoomManager {
       this.playerIdToToken.set(playerId, token);
     }
 
-    // Also close any previous socket cleanly without triggering fatal takeover code
+    // Close any previous socket for this confirmed playerId (e.g. valid guest token reconnect)
     const prevClient = this.clients.get(playerId);
     if (prevClient && prevClient.socket !== socket && prevClient.socket.readyState === WebSocket.OPEN) {
+      const isDifferentSession = Boolean(
+        prevClient.sessionId && sessionId && prevClient.sessionId !== sessionId
+      );
+      console.log(`[Session Reconnect] Replacing previous connection for playerId '${playerId}' (differentSession: ${isDifferentSession}).`);
       try {
-        prevClient.socket.close(1000, 'Connexion transférée vers nouvelle socket');
+        if (isDifferentSession) {
+          prevClient.socket.close(4001, 'SESSION_TAKEOVER');
+        } else {
+          prevClient.socket.close(1000, 'Connexion transférée vers nouvelle socket');
+        }
       } catch (e) {
         // ignore
       }
@@ -543,7 +501,12 @@ export class RoomManager {
       playerId,
       roomCode: prevClient?.roomCode || null,
       reconnectToken: token,
+      sessionId,
       lastPing: Date.now(),
+      isAuthenticated: false,
+      authUid: undefined,
+      isAuthenticating: false,
+      messageQueue: [],
     };
 
     this.clients.set(playerId, client);
@@ -691,35 +654,131 @@ export class RoomManager {
     }
   }
 
-  public static handleMessage(client: ConnectedClient, rawData: string): void {
-    try {
-      const msg: ClientMessage = JSON.parse(rawData);
+  private static handleAuthMessage(client: ConnectedClient, msg: ClientMessage): void {
+    if (!msg.idToken) {
+      this.sendMessage(client.socket, {
+        type: 'ERROR',
+        errorCode: 'GENERIC',
+        error: 'Jeton d\'authentification manquant.',
+      });
+      return;
+    }
 
-      // Secure playerId sync: verify that target playerId is not owned by another token
-      if (msg.playerId && msg.playerId !== client.playerId) {
-        const boundToken = this.playerIdToToken.get(msg.playerId);
-        const providedToken = msg.reconnectToken || client.reconnectToken;
-        const isLegitSession = boundToken && providedToken && boundToken === providedToken;
-        if (boundToken && !isLegitSession && boundToken !== client.reconnectToken) {
-          console.warn(`[Security] Rejected unauthorized playerId switch from ${client.playerId} to ${msg.playerId}`);
+    client.isAuthenticating = true;
+    verifyFirebaseIdToken(msg.idToken)
+      .then((result) => {
+        client.isAuthenticating = false;
+        if (!result || !result.uid) {
+          console.warn(`[Auth] ID token verification failed for client ${client.playerId}`);
           this.sendMessage(client.socket, {
             type: 'ERROR',
-            error: 'Accès refusé : Cet identifiant joueur est protégé et actif sur une autre session.',
+            errorCode: 'JOIN_REFUSED',
+            error: 'Authentification Google invalide ou expirée.',
           });
           return;
         }
 
-        // Clean up previous client mapping
-        this.clients.delete(client.playerId);
-        this.playerIdToToken.delete(client.playerId);
+        const verifiedUid = result.uid;
+        const oldPlayerId = client.playerId;
 
-        client.playerId = msg.playerId;
-        if (providedToken) {
-          client.reconnectToken = providedToken;
+        if (oldPlayerId !== verifiedUid) {
+          // Takeover handling for verified Google user
+          const existingClient = this.clients.get(verifiedUid);
+          if (existingClient && existingClient.socket !== client.socket && existingClient.socket.readyState === WebSocket.OPEN) {
+            const isDifferentSession = Boolean(
+              existingClient.sessionId && client.sessionId && existingClient.sessionId !== client.sessionId
+            );
+            console.log(`[Auth Takeover] Closing previous socket for verified Google user '${verifiedUid}' (diffSession: ${isDifferentSession})`);
+            try {
+              if (isDifferentSession) {
+                existingClient.socket.close(4001, 'SESSION_TAKEOVER');
+              } else {
+                existingClient.socket.close(1000, 'Connexion transférée vers nouvelle socket');
+              }
+            } catch (e) {
+              // ignore
+            }
+          }
+
+          // Clean up temporary guest mappings if any
+          if (oldPlayerId.startsWith('usr_')) {
+            this.clients.delete(oldPlayerId);
+            this.playerIdToToken.delete(oldPlayerId);
+          }
+
+          client.playerId = verifiedUid;
+          if (existingClient?.roomCode && !client.roomCode) {
+            client.roomCode = existingClient.roomCode;
+          }
         }
-        this.tokenToPlayerId.set(client.reconnectToken, client.playerId);
-        this.playerIdToToken.set(client.playerId, client.reconnectToken);
-        this.clients.set(client.playerId, client);
+
+        client.isAuthenticated = true;
+        client.authUid = verifiedUid;
+        this.clients.set(verifiedUid, client);
+
+        // Bind a reconnect token for this verified user
+        let userToken = this.playerIdToToken.get(verifiedUid) || client.reconnectToken;
+        this.tokenToPlayerId.set(userToken, verifiedUid);
+        this.playerIdToToken.set(verifiedUid, userToken);
+        client.reconnectToken = userToken;
+
+        console.log(`[Auth] Authenticated Google player: ${verifiedUid} (email: ${result.email || 'n/a'})`);
+
+        // Drain any messages that arrived while authenticating
+        if (client.messageQueue && client.messageQueue.length > 0) {
+          const queue = [...client.messageQueue];
+          client.messageQueue = [];
+          for (const raw of queue) {
+            this.handleMessage(client, raw);
+          }
+        }
+      })
+      .catch((err) => {
+        client.isAuthenticating = false;
+        console.error('[Auth] Unexpected error verifying idToken:', err);
+        this.sendMessage(client.socket, {
+          type: 'ERROR',
+          errorCode: 'GENERIC',
+          error: 'Erreur lors de la vérification de votre identité.',
+        });
+      });
+  }
+
+  public static handleMessage(client: ConnectedClient, rawData: string): void {
+    if (client.isAuthenticating) {
+      if (!client.messageQueue) client.messageQueue = [];
+      client.messageQueue.push(rawData);
+      return;
+    }
+
+    try {
+      const msg: ClientMessage = JSON.parse(rawData);
+
+      if (msg.type === 'AUTH') {
+        this.handleAuthMessage(client, msg);
+        return;
+      }
+
+      // Step 3 (Security): Reject any msg.playerId different from client.playerId
+      if (msg.playerId && msg.playerId !== client.playerId) {
+        console.warn(`[Security] Rejected message: msg.playerId '${msg.playerId}' != client.playerId '${client.playerId}' (type: ${msg.type})`);
+        this.sendMessage(client.socket, {
+          type: 'ERROR',
+          errorCode: 'GENERIC',
+          error: 'Action non autorisée : identifiant joueur invalide pour cette connexion.',
+        });
+        return;
+      }
+
+      // Step 1 (Security): A non-guest playerId (Google UID) is rejected without valid AUTH
+      if (!client.playerId.startsWith('usr_') && !client.isAuthenticated) {
+        console.warn(`[Security] Unauthenticated client attempting action with Google UID '${client.playerId}' without AUTH verification.`);
+        this.sendMessage(client.socket, {
+          type: 'ERROR',
+          errorCode: 'GENERIC',
+          error: 'Action non autorisée : authentification requise.',
+        });
+        return;
       }
 
       // Check if player is banned
@@ -729,6 +788,7 @@ export class RoomManager {
         if (!isExpired) {
           this.sendMessage(client.socket, {
             type: 'ERROR',
+            errorCode: 'BANNED',
             error: `Accès refusé : Votre compte a été suspendu. Motif: ${sanction.bannedReason || 'Sanction administrative'}`,
           });
           try {
@@ -742,9 +802,14 @@ export class RoomManager {
         }
       }
 
+      // Step 3 (Security): Only set client.roomCode if player is an active member or spectator of that room
       if (msg.roomCode && (!client.roomCode || client.roomCode !== msg.roomCode)) {
-        if (this.rooms.has(msg.roomCode)) {
-          client.roomCode = msg.roomCode;
+        const targetRoom = this.rooms.get(msg.roomCode);
+        if (targetRoom) {
+          const isMember = (targetRoom.players || []).some((p) => p.id === client.playerId);
+          if (isMember) {
+            client.roomCode = msg.roomCode;
+          }
         }
       }
 
@@ -936,10 +1001,24 @@ export class RoomManager {
       }
     }
 
-    this.removePlayerFromOtherRooms(client.playerId);
+    // Active game protection: block if player is in an active PLAYING game unless confirmed
+    if (!msg.confirmLeaveCurrent) {
+      const activeGame = this.getActiveGameForPlayer(client.playerId);
+      if (activeGame) {
+        this.sendMessage(client.socket, {
+          type: 'ERROR',
+          errorCode: 'ACTIVE_GAME_IN_PROGRESS',
+          error: `Vous avez une partie en cours (salon ${activeGame.roomCode}). Retournez-y ou quittez-la explicitement.`,
+          activeGameRoomCode: activeGame.roomCode,
+        });
+        return;
+      }
+    }
+
     if (this.engineConfig.isMaintenanceMode) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'MAINTENANCE',
         error: 'Impossible de créer un salon : ' + this.engineConfig.maintenanceNotice,
       });
       return;
@@ -948,6 +1027,7 @@ export class RoomManager {
     if (this.engineConfig.allowNewRooms === false) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'JOIN_REFUSED',
         error: "L'ouverture de nouvelles tables est temporairement suspendue par l'administration Katika.",
       });
       return;
@@ -957,6 +1037,7 @@ export class RoomManager {
     if (playerName.toLowerCase() === 'katika') {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'JOIN_REFUSED',
         error: "Le pseudonyme 'Katika' est réservé à l'administration.",
       });
       return;
@@ -979,6 +1060,7 @@ export class RoomManager {
           const remainingMinutes = effectiveSanction.expiresAt ? Math.ceil((effectiveSanction.expiresAt - Date.now()) / 60000) : 0;
           this.sendMessage(client.socket, {
             type: 'ERROR',
+            errorCode: 'BANNED',
             error: `🚫 Action restreinte par le Fair-Play (${sType}) : ${effectiveSanction.reason}${
               remainingMinutes > 0 ? ` (expire dans ${remainingMinutes} min)` : ''
             }`,
@@ -1010,10 +1092,14 @@ export class RoomManager {
     if (settings.requireGoogleAuth && msg.isGuest) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'JOIN_REFUSED',
         error: "Connexion Google requise : Cette table a été configurée pour exiger un compte Google.",
       });
       return;
     }
+
+    // Now that all validations have passed, remove player from other rooms
+    this.removePlayerFromOtherRooms(client.playerId);
 
     const hostPlayer: RoomPlayer = {
       id: client.playerId,
@@ -1139,10 +1225,6 @@ export class RoomManager {
   private static handleJoinRoom(client: ConnectedClient, msg: ClientMessage): void {
     const roomCode = msg.roomCode?.toUpperCase();
     
-    if (roomCode) {
-      this.removePlayerFromOtherRooms(client.playerId, roomCode);
-    }
-    
     const clientKey = client.playerId || client.reconnectToken;
 
     // Rate limiting on brute force room code guesses
@@ -1152,6 +1234,7 @@ export class RoomManager {
       if (attemptInfo && attemptInfo.resetAt > now && attemptInfo.count >= 6) {
         this.sendMessage(client.socket, {
           type: 'ERROR',
+          errorCode: 'RATE_LIMITED',
           error: 'Trop de tentatives de connexion. Veuillez patienter quelques secondes.',
         });
         return;
@@ -1171,6 +1254,7 @@ export class RoomManager {
 
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'ROOM_NOT_FOUND',
         error: `Salon introuvable : ${roomCode || 'Code vide'}`,
       });
       return;
@@ -1193,6 +1277,7 @@ export class RoomManager {
       if (this.engineConfig.versionPolicy === 'STRICT') {
         this.sendMessage(client.socket, {
           type: 'ERROR',
+          errorCode: 'GENERIC',
           error: "Protocole obsolète : Veuillez recharger l'application pour synchroniser la version compatible du jeu.",
           isProtocolCompatible: false,
           serverVersion: this.SERVER_VERSION,
@@ -1246,6 +1331,7 @@ export class RoomManager {
     if (room.bannedPlayerIds && room.bannedPlayerIds.includes(client.playerId) && !existingPlayer) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'BANNED',
         error: "Vous avez été expulsé de ce salon et ne pouvez pas le rejoindre.",
       });
       return;
@@ -1273,6 +1359,7 @@ export class RoomManager {
           const remainingMinutes = effectiveSanction.expiresAt ? Math.ceil((effectiveSanction.expiresAt - Date.now()) / 60000) : 0;
           this.sendMessage(client.socket, {
             type: 'ERROR',
+            errorCode: 'BANNED',
             error: `🚫 Accès refusé par le Fair-Play (${sType}) : ${effectiveSanction.reason}${
               remainingMinutes > 0 ? ` (expire dans ${remainingMinutes} min)` : ''
             }`,
@@ -1286,6 +1373,7 @@ export class RoomManager {
     if (room.requireGoogleAuth && !existingPlayer && msg.isGuest) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'JOIN_REFUSED',
         error: "Connexion Google requise : L'hôte de cette table a restreint l'accès aux comptes Google.",
       });
       return;
@@ -1295,6 +1383,7 @@ export class RoomManager {
     if (this.engineConfig.isMaintenanceMode && !existingPlayer) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'MAINTENANCE',
         error: "Accès restreint : " + this.engineConfig.maintenanceNotice,
       });
       return;
@@ -1304,9 +1393,24 @@ export class RoomManager {
     if (playerName.toLowerCase() === 'katika') {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'JOIN_REFUSED',
         error: "Le pseudonyme 'Katika' est réservé à l'administration.",
       });
       return;
+    }
+
+    // Active game protection: block if player is in an active PLAYING game on another table unless confirmed
+    if (!msg.confirmLeaveCurrent) {
+      const activeGame = this.getActiveGameForPlayer(client.playerId, roomCode);
+      if (activeGame) {
+        this.sendMessage(client.socket, {
+          type: 'ERROR',
+          errorCode: 'ACTIVE_GAME_IN_PROGRESS',
+          error: `Vous avez une partie en cours (salon ${activeGame.roomCode}). Retournez-y ou quittez-la explicitement.`,
+          activeGameRoomCode: activeGame.roomCode,
+        });
+        return;
+      }
     }
 
     if (existingPlayer) {
@@ -1314,7 +1418,11 @@ export class RoomManager {
       const providedToken = msg.reconnectToken || client.reconnectToken;
       const oldClient = this.clients.get(existingPlayer.id);
       const isOldSocketAlive = oldClient && oldClient.socket !== client.socket && oldClient.socket.readyState === WebSocket.OPEN;
-      const isTokenValid = (client.playerId === existingPlayer.id) || !expectedToken || (providedToken && providedToken === expectedToken) || !existingPlayer.connected || !isOldSocketAlive;
+
+      // Step 1: For Google authenticated accounts, verified UID identity proves ownership
+      const isGoogleVerified = Boolean(client.isAuthenticated && client.authUid === existingPlayer.id);
+      // Step 2: For guests, the reconnect token proves ownership
+      const isTokenValid = isGoogleVerified || (providedToken && expectedToken && providedToken === expectedToken) || !expectedToken;
 
       if (!isTokenValid) {
         console.warn(`[Security] Session reconnect token mismatch for player '${client.playerId}' in room '${roomCode}'.`);
@@ -1349,11 +1457,13 @@ export class RoomManager {
             lastSeen: Date.now(),
           };
 
+          this.removePlayerFromOtherRooms(client.playerId, roomCode);
           room.players.push(spectatorPlayer);
           this.setRoomPlayerToken(roomCode, client.playerId, client.reconnectToken);
 
           this.sendMessage(client.socket, {
             type: 'ERROR',
+            errorCode: 'SEAT_TAKEN',
             error: "Session protégée : Ce siège est réservé par un autre appareil. Vous avez été admis sur la table en mode spectateur.",
           });
         } else {
@@ -1361,6 +1471,7 @@ export class RoomManager {
           if (isOldSocketAlive) {
             this.sendMessage(client.socket, {
               type: 'ERROR',
+              errorCode: 'SEAT_TAKEN',
               error: 'Ce siège est déjà occupé par un joueur actif.',
             });
             return;
@@ -1390,10 +1501,12 @@ export class RoomManager {
             lastSeen: Date.now(),
           };
 
+          this.removePlayerFromOtherRooms(client.playerId, roomCode);
           room.players.push(newPlayer);
           this.setRoomPlayerToken(roomCode, client.playerId, client.reconnectToken);
         }
       } else {
+        this.removePlayerFromOtherRooms(client.playerId, roomCode);
         if (oldClient && oldClient.socket !== client.socket && oldClient.socket.readyState === WebSocket.OPEN) {
           try {
             oldClient.socket.close(1000, 'Session remplacée par une nouvelle connexion');
@@ -1479,10 +1592,13 @@ export class RoomManager {
         if (isFull) {
           this.sendMessage(client.socket, {
             type: 'ERROR',
+            errorCode: 'JOIN_REFUSED',
             error: "Mince, un autre joueur a été plus rapide ! La table est déjà complète.",
           });
           return;
         }
+
+        this.removePlayerFromOtherRooms(client.playerId, roomCode);
 
         const newPlayer: RoomPlayer = {
           id: client.playerId,
@@ -1508,6 +1624,9 @@ export class RoomManager {
         // Between rounds: join directly as seated player if seats available, or as observer
         const activeCount = (room.players || []).filter((p) => !p.isSpectator).length;
         const willBeSpectator = activeCount >= room.maxPlayers;
+        
+        this.removePlayerFromOtherRooms(client.playerId, roomCode);
+
         const newPlayer: RoomPlayer = {
           id: client.playerId,
           name: willBeSpectator ? `${playerName} (Obs)` : playerName,
@@ -1534,6 +1653,8 @@ export class RoomManager {
           ? room.manchePartiesPlayed
           : (room.gameState ? Math.max(0, room.gameState.partieCount - 1) : 0);
         const prorataCapital = Math.max(room.baseBet, room.initialCapital - (partiesPlayed * room.baseBet));
+
+        this.removePlayerFromOtherRooms(client.playerId, roomCode);
 
         const spectatorPlayer: RoomPlayer = {
           id: client.playerId,
@@ -1862,6 +1983,7 @@ export class RoomManager {
     if (!targetRoomCode || !this.rooms.has(targetRoomCode)) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'ROOM_NOT_FOUND',
         error: 'Salon introuvable pour démarrer la partie.',
       });
       return;
@@ -1884,6 +2006,7 @@ export class RoomManager {
     if (!isHost && !isEmergencyStart) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: 'Seul l’hôte peut lancer la partie.',
       });
       return;
@@ -1892,6 +2015,7 @@ export class RoomManager {
     if (connectedHumans.length < 2 && !(room.isPublic && room.fillWithBots)) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: 'Un salon multijoueur requiert au moins 2 joueurs humains connectés pour démarrer la partie.',
       });
       return;
@@ -1900,6 +2024,7 @@ export class RoomManager {
     if (!room.fillWithBots && connectedHumans.length < maxCapacity) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: `Ce salon 100% humains est configuré pour ${maxCapacity} joueurs. Veuillez attendre ${maxCapacity - connectedHumans.length} joueur(s) supplémentaire(s) ou activer l'option "Remplir avec des Bots".`,
       });
       return;
@@ -1933,6 +2058,7 @@ export class RoomManager {
     } else if (unreadyGuests.length > 0) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: 'Tous les invités doivent avoir cliqué sur "Prêt" avant de lancer la partie.',
       });
       return;
@@ -1991,6 +2117,7 @@ export class RoomManager {
         if (targetClient.socket.readyState === WebSocket.OPEN) {
           this.sendMessage(targetClient.socket, {
             type: 'ERROR',
+            errorCode: 'BANNED',
             error: "Vous avez été expulsé du salon par l'hôte.",
           });
         }
@@ -2025,6 +2152,7 @@ export class RoomManager {
     if (room.status !== 'LOBBY' && room.status !== 'MANCHE_OVER') {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: "Le rôle d'hôte ne peut être repris que dans le salon d'attente.",
       });
       return;
@@ -2039,6 +2167,7 @@ export class RoomManager {
     if (!isHostDisconnected && !isGraceExpiredOrNear) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: "L'hôte actuel est encore actif. Le transfert n'est autorisé qu'en cas d'inactivité ou de déconnexion de l'hôte.",
       });
       return;
@@ -2071,7 +2200,9 @@ export class RoomManager {
 
   private static handleVoteBots(client: ConnectedClient, msg: ClientMessage): void {
     if (!client.roomCode || !this.rooms.has(client.roomCode)) return;
-    const room = this.rooms.get(client.roomCode)!;
+    this.tickRoom(client.roomCode);
+    const room = this.rooms.get(client.roomCode);
+    if (!room) return;
 
     const player = (room.players || []).find((p) => p.id === client.playerId);
     if (!player || !player.isHuman) return;
@@ -2146,6 +2277,7 @@ export class RoomManager {
       if (turnExpired) {
         this.sendMessage(client.socket, {
           type: 'ERROR',
+          errorCode: 'TURN_EXPIRED',
           error: 'Tour expiré',
         });
       }
@@ -2154,7 +2286,9 @@ export class RoomManager {
 
   private static handleReadyNextPartie(client: ConnectedClient, msg: ClientMessage): void {
     if (!client.roomCode || !this.rooms.has(client.roomCode)) return;
-    const room = this.rooms.get(client.roomCode)!;
+    this.tickRoom(client.roomCode);
+    const room = this.rooms.get(client.roomCode);
+    if (!room) return;
 
     const player = (room.players || []).find((p) => p.id === client.playerId);
     if (!player || player.isSpectator) return;
@@ -2187,7 +2321,9 @@ export class RoomManager {
 
   private static handleForceNextPartie(client: ConnectedClient, msg: ClientMessage): void {
     if (!client.roomCode || !this.rooms.has(client.roomCode)) return;
-    const room = this.rooms.get(client.roomCode)!;
+    this.tickRoom(client.roomCode);
+    const room = this.rooms.get(client.roomCode);
+    if (!room) return;
 
     // Only host can force the next partie
     if (client.playerId !== room.hostId) {
@@ -2288,6 +2424,7 @@ export class RoomManager {
     if (room.hostId !== client.playerId) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: 'Seul l’hôte peut modifier les paramètres du salon.',
       });
       return;
@@ -2405,9 +2542,6 @@ export class RoomManager {
       }
       this.rooms.delete(roomCode);
       this.deleteRoomTokens(roomCode);
-      if (db) {
-        deleteDoc(doc(db, 'rooms', roomCode)).catch(console.error);
-      }
     } else {
       if (room.hostId === playerId) {
         // Pass host to next connected human
@@ -2509,6 +2643,7 @@ export class RoomManager {
     if (room.gameState && room.gameState.phase === 'PLAYING') {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'ACTIVE_GAME_IN_PROGRESS',
         error: 'Les demandes de hausse de mise se font uniquement entre deux parties.',
       });
       return;
@@ -2517,6 +2652,7 @@ export class RoomManager {
     if (room.betIncreaseProposal) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: 'Une proposition de hausse de mise est déjà en cours de vote.',
       });
       return;
@@ -2527,6 +2663,7 @@ export class RoomManager {
     if (rawProposed <= currentBet) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: `La nouvelle mise doit être supérieure à la mise actuelle (${currentBet} 🪙).`,
       });
       return;
@@ -2540,6 +2677,7 @@ export class RoomManager {
     if (rawProposed > minCapital || minCapital <= currentBet) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: `Impossible d'augmenter la mise à ${rawProposed} 🪙 : un joueur le moins fortuné n'a que ${minCapital} jetons.`,
       });
       return;
@@ -2603,10 +2741,13 @@ export class RoomManager {
 
   private static handleRespondBetIncrease(client: ConnectedClient, msg: ClientMessage): void {
     if (!client.roomCode || !this.rooms.has(client.roomCode)) return;
-    const room = this.rooms.get(client.roomCode)!;
+    this.tickRoom(client.roomCode);
+    const room = this.rooms.get(client.roomCode);
+    if (!room) return;
     if (!room.betIncreaseProposal) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'VOTE_CLOSED',
         error: 'Ce vote est déjà clos ou expiré.',
       });
       return;
@@ -2696,7 +2837,9 @@ export class RoomManager {
 
   private static handleCancelBetIncrease(client: ConnectedClient, msg: ClientMessage): void {
     if (!client.roomCode || !this.rooms.has(client.roomCode)) return;
-    const room = this.rooms.get(client.roomCode)!;
+    this.tickRoom(client.roomCode);
+    const room = this.rooms.get(client.roomCode);
+    if (!room) return;
     if (!room.betIncreaseProposal) return;
 
     if (room.betIncreaseProposal.proposerId === client.playerId) {
@@ -2720,6 +2863,7 @@ export class RoomManager {
     if (humanPlayers.length >= 4) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'JOIN_REFUSED',
         error: 'La table contient déjà 4 joueurs humains.',
       });
       return;
@@ -2733,6 +2877,7 @@ export class RoomManager {
     if (prorataCapital < room.baseBet) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'JOIN_REFUSED',
         error: `Capital restant insuffisant (${prorataCapital} 🪙 < mise de ${room.baseBet} 🪙). Vous pouvez continuer à observer.`,
       });
       return;
@@ -2741,6 +2886,7 @@ export class RoomManager {
     if (room.integrationProposal && room.integrationProposal.status === 'VOTING') {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: "Un vote d'intégration est déjà en cours pour cette table.",
       });
       return;
@@ -2754,6 +2900,7 @@ export class RoomManager {
     if (!targetBot) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: "Aucun bot n'est disponible pour être remplacé dans cette partie.",
       });
       return;
@@ -2908,6 +3055,7 @@ export class RoomManager {
     if (!room.integrationProposal || room.integrationProposal.status !== 'VOTING') {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'VOTE_CLOSED',
         error: 'Ce vote est déjà clos ou expiré.',
       });
       return;
@@ -2980,6 +3128,7 @@ export class RoomManager {
     if (room.hostId !== client.playerId) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: 'Seul l’hôte peut proposer d’étendre la capacité.',
       });
       return;
@@ -3015,10 +3164,13 @@ export class RoomManager {
 
   private static handleRespondCapacityExtension(client: ConnectedClient, msg: ClientMessage): void {
     if (!client.roomCode || !this.rooms.has(client.roomCode)) return;
-    const room = this.rooms.get(client.roomCode)!;
+    this.tickRoom(client.roomCode);
+    const room = this.rooms.get(client.roomCode);
+    if (!room) return;
     if (!room.capacityExtensionProposal || room.capacityExtensionProposal.status !== 'VOTING') {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'VOTE_CLOSED',
         error: 'Ce vote est déjà clos ou expiré.',
       });
       return;
@@ -3103,7 +3255,9 @@ export class RoomManager {
 
   private static handleRespondEarlyClose(client: ConnectedClient, msg: ClientMessage): void {
     if (!client.roomCode || !this.rooms.has(client.roomCode)) return;
-    const room = this.rooms.get(client.roomCode)!;
+    this.tickRoom(client.roomCode);
+    const room = this.rooms.get(client.roomCode);
+    if (!room) return;
     if (!room.earlyCloseProposal || room.status !== 'PLAYING' || !room.gameState) return;
 
     const player = (room.players || []).find((p) => p.id === client.playerId);
@@ -3165,8 +3319,125 @@ export class RoomManager {
     if (!success) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: 'Impossible de réclamer la victoire par forfait actuellement.',
       });
+    }
+  }
+
+  public static tickRoom(roomCode: string): boolean {
+    if (!roomCode || this.isTickingRooms.has(roomCode)) return false;
+    const room = this.rooms.get(roomCode);
+    if (!room) return false;
+
+    this.isTickingRooms.add(roomCode);
+    try {
+      const now = Date.now();
+      let changed = false;
+
+      // 1. Auto-expire bet increase proposals after 15 seconds
+      if (
+        room.betIncreaseProposal &&
+        room.betIncreaseProposal.expiresAt &&
+        now >= room.betIncreaseProposal.expiresAt
+      ) {
+        if (room.betIncreaseProposal.previousReadyStates) {
+          const prev = room.betIncreaseProposal.previousReadyStates;
+          (room.players || []).forEach((p) => {
+            p.readyForNextPartie = prev[p.id] ?? p.readyForNextPartie;
+          });
+        }
+        room.betIncreaseProposal = null;
+
+        const emote: EmoteMessage = {
+          id: 'em_' + Math.random().toString(36).substring(2, 9),
+          playerId: 'system',
+          playerName: 'Table',
+          text: `⏳ Vote expiré (15s) : la hausse de mise n'a pas été validée. La mise reste à ${room.baseBet} 🪙.`,
+          emoji: '⏳',
+          timestamp: Date.now(),
+          isBot: true,
+        };
+        room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
+        room.updatedAt = Date.now();
+        changed = true;
+
+        // If everyone was ready, advance to next partie
+        const activeHumans = (room.players || []).filter(
+          (p) => p.isHuman && !p.isEliminated && !p.isSpectator && p.connected
+        );
+        const allReady = activeHumans.length > 0 && activeHumans.every((p) => p.readyForNextPartie);
+        if (allReady && (room.status === 'PARTIE_OVER' || room.gameState?.phase === 'PARTIE_OVER')) {
+          const state = this.getOrCreateActiveState(room.id, room);
+          ServerGameEngine.advanceToNextPartie(
+            room,
+            (updatedRoom) => {
+              this.broadcastRoomState(updatedRoom.id);
+              this.evaluateAutoStart(updatedRoom.id);
+            },
+            state
+          );
+        }
+      }
+
+      // 2. Cleanup permanently disconnected players from LOBBY or MANCHE_OVER if grace period expired
+      if (room.status === 'LOBBY' || room.status === 'MANCHE_OVER') {
+        const graceTimeoutMs = (room.disconnectGraceSeconds || this.engineConfig.reconnectGracePeriodSeconds || 30) * 1000;
+        const initialCount = (room.players || []).length;
+        room.players = (room.players || []).filter((p) => {
+          if (!p.connected) {
+            const isGraceExpired = p.disconnectGraceExpiresAt
+              ? now > p.disconnectGraceExpiresAt
+              : (now - (p.lastSeen || room.createdAt || now) > graceTimeoutMs);
+            if (isGraceExpired) {
+              console.log(`[Lobby Cleanup] Kicking permanently disconnected player ${p.name} (${p.id}) from room ${roomCode}`);
+              return false;
+            }
+          }
+          return true;
+        });
+
+        if (room.players.length !== initialCount) {
+          changed = true;
+          if (room.players.length === 0) {
+            this.rooms.delete(roomCode);
+            this.deleteRoomTokens(roomCode);
+            return false;
+          } else {
+            const currentHost = (room.players || []).find((p) => p.id === room.hostId);
+            if (!currentHost) {
+              const activeHumans = (room.players || []).filter((p) => p.isHuman && p.connected);
+              if (activeHumans.length > 0) {
+                room.hostId = activeHumans[0].id;
+              } else if ((room.players || []).length > 0) {
+                room.hostId = room.players[0].id;
+              }
+            }
+            (room.players || []).forEach((p) => (p.isHost = p.id === room.hostId));
+            room.updatedAt = now;
+          }
+        }
+      }
+
+      // 3. Trigger push notification alerts for offline / inactive players
+      try {
+        this.triggerPushNotificationsForRoom(room);
+      } catch (err) {
+        console.error('[RoomManager] Failed to trigger push notifications:', err);
+      }
+
+      // 4. Filter out expired emotes (older than 3.5 seconds)
+      if (room.activeEmotes && room.activeEmotes.length > 0) {
+        const initialEmotesCount = room.activeEmotes.length;
+        room.activeEmotes = room.activeEmotes.filter((e) => now - e.timestamp < 3500);
+        if (room.activeEmotes.length !== initialEmotesCount) {
+          changed = true;
+        }
+      }
+
+      return changed;
+    } finally {
+      this.isTickingRooms.delete(roomCode);
     }
   }
 
@@ -3176,105 +3447,12 @@ export class RoomManager {
 
     const now = Date.now();
 
-    // Auto-expire bet increase proposals after 15 seconds
-    if (
-      room.betIncreaseProposal &&
-      room.betIncreaseProposal.expiresAt &&
-      now >= room.betIncreaseProposal.expiresAt
-    ) {
-      if (room.betIncreaseProposal.previousReadyStates) {
-        const prev = room.betIncreaseProposal.previousReadyStates;
-        (room.players || []).forEach((p) => {
-          p.readyForNextPartie = prev[p.id] ?? p.readyForNextPartie;
-        });
-      }
-      room.betIncreaseProposal = null;
-
-      const emote: EmoteMessage = {
-        id: 'em_' + Math.random().toString(36).substring(2, 9),
-        playerId: 'system',
-        playerName: 'Table',
-        text: `⏳ Vote expiré (15s) : la hausse de mise n'a pas été validée. La mise reste à ${room.baseBet} 🪙.`,
-        emoji: '⏳',
-        timestamp: Date.now(),
-        isBot: true,
-      };
-      room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
-      room.updatedAt = Date.now();
-
-      // If everyone was ready, advance to next partie
-      const activeHumans = (room.players || []).filter((p) => p.isHuman && !p.isEliminated && !p.isSpectator && p.connected);
-      const allReady = activeHumans.length > 0 && activeHumans.every((p) => p.readyForNextPartie);
-      if (allReady && (room.status === 'PARTIE_OVER' || room.gameState?.phase === 'PARTIE_OVER')) {
-        const state = this.getOrCreateActiveState(room.id, room);
-        ServerGameEngine.advanceToNextPartie(
-          room,
-          (updatedRoom) => {
-            this.broadcastRoomState(updatedRoom.id);
-          this.evaluateAutoStart(updatedRoom.id);
-          },
-          state
-        );
-      }
-    }
-
     // Synchronize room.players with room.gameState.players for atomic data consistency
     syncRoomPlayersWithGameState(room);
 
-    // Cleanup permanently disconnected players from LOBBY or MANCHE_OVER if grace period expired
-    if (room.status === 'LOBBY' || room.status === 'MANCHE_OVER') {
-      let changed = false;
-      const graceTimeoutMs = (room.disconnectGraceSeconds || this.engineConfig.reconnectGracePeriodSeconds || 30) * 1000;
-      room.players = (room.players || []).filter((p) => {
-        if (!p.connected) {
-          const isGraceExpired = p.disconnectGraceExpiresAt
-            ? now > p.disconnectGraceExpiresAt
-            : (now - (p.lastSeen || room.createdAt || now) > graceTimeoutMs);
-          if (isGraceExpired) {
-            changed = true;
-            console.log(`[Lobby Cleanup] Kicking permanently disconnected player ${p.name} (${p.id}) from room ${roomCode}`);
-            return false;
-          }
-        }
-        return true;
-      });
-      if (changed) {
-        if ((room.players || []).length === 0) {
-          this.rooms.delete(roomCode);
-          this.deleteRoomTokens(roomCode);
-          if (db) {
-            deleteDoc(doc(db, 'rooms', roomCode)).catch(console.error);
-          }
-          return;
-        } else {
-          const currentHost = (room.players || []).find((p) => p.id === room.hostId);
-          if (!currentHost) {
-            const activeHumans = (room.players || []).filter(p => p.isHuman && p.connected);
-            if (activeHumans.length > 0) {
-              room.hostId = activeHumans[0].id;
-            } else if ((room.players || []).length > 0) {
-              room.hostId = room.players[0].id;
-            }
-          }
-          (room.players || []).forEach(p => p.isHost = p.id === room.hostId);
-          room.updatedAt = now;
-        }
-      }
-    }
-
-    // Trigger push notification alerts for offline / inactive players
-    try {
-      this.triggerPushNotificationsForRoom(room);
-    } catch (err) {
-      console.error('[RoomManager] Failed to trigger push notifications:', err);
-    }
-
-    // Filter out expired emotes (older than 3.5 seconds)
-    if (room.activeEmotes && room.activeEmotes.length > 0) {
-      room.activeEmotes = (room.activeEmotes || []).filter((e) => now - e.timestamp < 3500);
-    }
-
     // Optimize performance: create base clone ONCE per broadcast tick instead of N times for N players
+    room.rev = (room.rev || 0) + 1;
+    room.epoch = SERVER_EPOCH;
     room.serverTimestamp = now;
     const baseClonedRoom: MultiplayerRoom = JSON.parse(JSON.stringify(room));
 
@@ -3289,9 +3467,6 @@ export class RoomManager {
         });
       }
     });
-
-    RoomManager.syncRoomToFirestore(room);
-
   }
 
   private static triggerPushNotificationsForRoom(room: MultiplayerRoom): void {
@@ -3581,6 +3756,7 @@ export class RoomManager {
     if (client && client.socket.readyState === WebSocket.OPEN) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'BANNED',
         error: 'Vous avez été expulsé de la table par le Katika Master.',
       });
       client.socket.close();
@@ -3624,6 +3800,7 @@ export class RoomManager {
       if (client && client.socket.readyState === WebSocket.OPEN) {
         this.sendMessage(client.socket, {
           type: 'ERROR',
+          errorCode: 'ROOM_NOT_FOUND',
           error: 'Cette table a été fermée administrativement par le Katika Master.',
         });
       }
@@ -3636,9 +3813,6 @@ export class RoomManager {
     }
     this.rooms.delete(roomCode);
     this.deleteRoomTokens(roomCode);
-    if (db) {
-      deleteDoc(doc(db, 'rooms', roomCode)).catch(console.error);
-    }
     return true;
   }
 
@@ -3948,6 +4122,7 @@ export class RoomManager {
     if (msg.isGuest) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'JOIN_REFUSED',
         error: "Connexion Google requise : L'envoi d'invitations privées nécessite un compte Google authentifié.",
       });
       return;
@@ -3956,6 +4131,7 @@ export class RoomManager {
     if (!msg.targetPlayerId || !msg.roomCode) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'GENERIC',
         error: 'Paramètres d\'invitation incomplets.',
       });
       return;
@@ -3965,6 +4141,7 @@ export class RoomManager {
     if (!room) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'ROOM_NOT_FOUND',
         error: 'Salon introuvable pour envoyer l\'invitation.',
       });
       return;
@@ -4034,6 +4211,7 @@ export class RoomManager {
     if (!invite) {
       this.sendMessage(client.socket, {
         type: 'ERROR',
+        errorCode: 'INVITE_EXPIRED',
         error: 'Cette invitation a expiré ou n\'existe plus.',
       });
       return;
@@ -4065,13 +4243,12 @@ export class RoomManager {
         playerName: msg.playerName,
         avatarSeed: msg.avatarSeed,
         roomCode: invite.roomCode,
+        confirmLeaveCurrent: msg.confirmLeaveCurrent,
       });
     }
   }
 
   public static handleQuickMatchRequest(client: ConnectedClient, msg: ClientMessage): void {
-    this.removePlayerFromOtherRooms(client.playerId);
-    
     // Fair-play check: reject if player has active TEMP_BAN or BANNED status
     const serverSanction = this.getActivePlayerSanction(client.playerId);
     const effectiveSanction = serverSanction ? {
@@ -4088,12 +4265,27 @@ export class RoomManager {
           const remainingMinutes = effectiveSanction.expiresAt ? Math.ceil((effectiveSanction.expiresAt - Date.now()) / 60000) : 0;
           this.sendMessage(client.socket, {
             type: 'ERROR',
+            errorCode: 'BANNED',
             error: `🚫 Accès refusé par le Fair-Play (${effectiveSanction.type}) : ${effectiveSanction.reason}${
               remainingMinutes > 0 ? ` (expire dans ${remainingMinutes} min)` : ''
             }`,
           });
           return;
         }
+      }
+    }
+
+    // Active game protection: block if player is in an active PLAYING game unless confirmed
+    if (!msg.confirmLeaveCurrent) {
+      const activeGame = this.getActiveGameForPlayer(client.playerId);
+      if (activeGame) {
+        this.sendMessage(client.socket, {
+          type: 'ERROR',
+          errorCode: 'ACTIVE_GAME_IN_PROGRESS',
+          error: `Vous avez une partie en cours (salon ${activeGame.roomCode}). Retournez-y ou quittez-la explicitement.`,
+          activeGameRoomCode: activeGame.roomCode,
+        });
+        return;
       }
     }
 
@@ -4119,6 +4311,7 @@ export class RoomManager {
         avatarSeed: msg.avatarSeed,
         roomCode: candidateRoom.id,
         fairPlaySanction: msg.fairPlaySanction,
+        confirmLeaveCurrent: msg.confirmLeaveCurrent,
       });
       this.sendMessage(client.socket, {
         type: 'QUICK_MATCH_RESULT',
@@ -4135,6 +4328,7 @@ export class RoomManager {
         avatarSeed: msg.avatarSeed,
         roomCode: newRoomCode,
         fairPlaySanction: msg.fairPlaySanction,
+        confirmLeaveCurrent: msg.confirmLeaveCurrent,
         settings: {
           fillWithBots: true,
           maxPlayers: 4,
@@ -4155,10 +4349,23 @@ export class RoomManager {
 
   /**
    * Periodic room cleanup task:
-   * Dynamically removes rooms from memory and Firestore when all human players have left
+   * Dynamically removes rooms from memory when all human players have left
    * for more than emptyRoomTimeoutMinutes (default 5 min, configured in Katika Master settings).
    */
   public static initRoomCleanupInterval(): void {
+    if (!this.roomTickInterval) {
+      this.roomTickInterval = setInterval(() => {
+        const roomCodes = Array.from(this.rooms.keys());
+        for (const roomCode of roomCodes) {
+          const changed = this.tickRoom(roomCode);
+          if (changed) {
+            this.broadcastRoomState(roomCode);
+            this.evaluateAutoStart(roomCode);
+          }
+        }
+      }, 1000);
+    }
+
     if (this.cleanupInterval) return;
 
     this.cleanupInterval = setInterval(() => {
@@ -4188,7 +4395,7 @@ export class RoomManager {
         }
 
         // When 0 humans are connected (whether in LOBBY, PLAYING, PARTIE_OVER, or MANCHE_OVER):
-        // Automatically close and remove from memory and Firestore after emptyRoomTimeoutMs
+        // Automatically close and remove from memory after emptyRoomTimeoutMs
         if (inactiveDuration >= emptyRoomTimeoutMs) {
           console.log(
             `[Room Cleanup] Auto-closing room ${roomCode} (${room.status}) after ${Math.round(

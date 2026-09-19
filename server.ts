@@ -11,6 +11,8 @@ import { collection, getDocs, query, limit, orderBy } from 'firebase/firestore';
 import { db } from './src/lib/firebase';
 
 const PORT = 3000;
+const instanceId = 'inst_' + Math.random().toString(36).substring(2, 10) + '_' + Date.now().toString(36);
+const bootedAt = new Date().toISOString();
 
 async function startServer() {
   const app = express();
@@ -21,7 +23,6 @@ async function startServer() {
 
   // Initialize Room Cleanup Interval (2h public / 24h private / 15m bots)
   RoomManager.initRoomCleanupInterval();
-  RoomManager.initFirestoreSync();
 
   // WebSocket Server Setup
   const wss = new WebSocketServer({ noServer: true });
@@ -180,6 +181,8 @@ async function startServer() {
   app.get('/api/health', (req, res) => {
     res.json({
       status: 'ok',
+      instanceId,
+      bootedAt,
       activeRooms: RoomManager.getActiveRoomsCount(),
       timestamp: Date.now(),
     });

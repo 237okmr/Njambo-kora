@@ -11,6 +11,7 @@ import {
 } from 'firebase/firestore';
 import { db, auth } from '../lib/firebase';
 import { playerProfileService } from './playerProfileService';
+import { getPlayerId } from './identity';
 
 export type GameRecordStatus = 'completed' | 'in_progress' | 'abandoned';
 
@@ -141,7 +142,7 @@ export const telemetryService = {
     // 3. Update player profile stats if this game is completed or finished
     if (entry.status === 'completed' || entry.isMancheFinalWin || entry.isAbandoned) {
       try {
-        const localId = localStorage.getItem('njambo_player_id');
+        const localId = getPlayerId();
         const localName = localStorage.getItem('njambo_player_name');
 
         // Locate human player

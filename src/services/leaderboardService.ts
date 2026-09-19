@@ -10,6 +10,7 @@ import {
 import { computeHonorificTitle, computeMasteryScore, DEFAULT_PLAYER_STATS, playerProfileService, applyStatsFallback } from './playerProfileService';
 import { FriendService } from './friendService';
 import { AvatarOptionId, HONORIFIC_TITLES } from '../types/playerProfile';
+import { getPlayerId } from './identity';
 
 const LEADERBOARD_CACHE_KEY = 'njambo_leaderboard_cache_v5';
 const CACHE_TTL_MS = 20 * 1000; // 20 seconds local cache
@@ -28,7 +29,7 @@ export class LeaderboardService {
     currentUserRank: CurrentUserRankSummary | null;
   }> {
     const localProfile = playerProfileService.getLocalProfile();
-    const localPlayerId = localProfile.uid || localStorage.getItem('njambo_player_id') || 'usr_guest';
+    const localPlayerId = localProfile.uid || getPlayerId();
     const localPlayerName = localProfile.displayName || localStorage.getItem('njambo_player_name') || 'Joueur';
     const localAvatar = (localProfile.avatarId || localStorage.getItem('njambo_avatar_seed') as AvatarOptionId) || 'lion';
     const isGuest = !auth.currentUser || auth.currentUser.isAnonymous;

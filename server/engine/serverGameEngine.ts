@@ -621,7 +621,7 @@ export class ServerGameEngine {
     }
 
     // Play is legal! Clear timers
-    this.clearAllTimers(activeRoomState);
+    this.clearTurnTimers(activeRoomState);
     if (activeRoomState.consecutiveTimeouts) {
       activeRoomState.consecutiveTimeouts.set(playerId, 0);
     }
@@ -1410,7 +1410,7 @@ export class ServerGameEngine {
     const isBot = !currentPlayer.isHuman;
     const isDisconnected = !(room.players || []).find((p) => p.id === currentPlayer.id)?.connected;
 
-    if (isBot || isDisconnected || currentPlayer.isAiRelay) {
+    if (isBot || (isDisconnected && currentPlayer.isAiRelay) || (!currentPlayer.isHuman && currentPlayer.isAiRelay)) {
       // Bot or AI Relay plays after a realistic thinking delay
       const cfg = this.getConfig(activeRoomState);
       const thinkDelay = isDisconnected ? 800 : cfg.botThinkTimeMs;
@@ -1437,6 +1437,11 @@ export class ServerGameEngine {
         const playableCards = getPlayableCards(currentPlayer.hand, gs.currentTrick.leadSuit);
         if (playableCards.length > 0) {
           const cardToPlay = chooseRelayAICard(currentPlayer.hand, gs.currentTrick.leadSuit);
+          const rp = (room.players || []).find((p) => p.id === currentPlayer.id);
+          if (rp) {
+            rp.aiRelayPlaysCount = (rp.aiRelayPlaysCount || 0) + 1;
+          }
+          currentPlayer.aiRelayPlaysCount = (currentPlayer.aiRelayPlaysCount || 0) + 1;
           this.handlePlayCard(room, currentPlayer.id, cardToPlay.id, onStateChange, activeRoomState, true);
         } else {
           gs.currentTurnIndex = (gs.currentTurnIndex + 1) % (gs.players || []).length;
@@ -1483,7 +1488,6 @@ export class ServerGameEngine {
 
     rp.connected = false;
     rp.lastSeen = Date.now();
-    rp.isAiRelay = true;
 
     const gs = room.gameState;
     if (!gs || room.status !== 'PLAYING') {
@@ -1495,7 +1499,6 @@ export class ServerGameEngine {
     const gp = (gs.players || []).find((p) => p.id === playerId);
     if (gp) {
       gp.connected = false;
-      gp.isAiRelay = true;
     }
 
     if (rp.isEliminated || rp.isForfeit) {
@@ -1504,26 +1507,88 @@ export class ServerGameEngine {
       return;
     }
 
-    // Announce AI Relay warning to table (relayed for current partie, forfeit if offline at next partie)
-    const emote: EmoteMessage = {
-      id: 'em_' + Math.random().toString(36).substring(2, 9),
-      playerId: 'system',
-      playerName: 'Table',
-      text: `🤖 ${rp.name} s'est déconnecté. Un relais IA termine la donne en cours avec des cartes neutres. Forfait aux donnes suivantes si absent.`,
-      emoji: '🤖',
-      timestamp: Date.now(),
-      isBot: true,
-    };
-    room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
+    const cfg = this.getConfig(activeRoomState);
+
+    // Reconnect grace / forfeit timer (reconnectGracePeriodSeconds, e.g. 180s) starts on disconnect
+    const reconnectGraceSecs = cfg.reconnectGracePeriodSeconds || 180;
+    const graceExpiresAt = Date.now() + reconnectGraceSecs * 1000;
+    rp.disconnectGraceExpiresAt = graceExpiresAt;
+    if (gp) {
+      gp.disconnectGraceExpiresAt = graceExpiresAt;
+    }
+
+    if (!activeRoomState.disconnectTimers) {
+      activeRoomState.disconnectTimers = new Map();
+    }
+    if (activeRoomState.disconnectTimers.has(playerId)) {
+      clearTimeout(activeRoomState.disconnectTimers.get(playerId)!);
+      activeRoomState.disconnectTimers.delete(playerId);
+    }
+    const forfeitTimeout = setTimeout(() => {
+      activeRoomState.disconnectTimers.delete(playerId);
+      const target = (room.players || []).find((p) => p.id === playerId);
+      if (target && !target.connected && !target.isForfeit && !target.isEliminated) {
+        console.log(`[Forfeit] Reconnect grace expired (${reconnectGraceSecs}s) for player ${target.name} (${playerId}) in room ${room.id}`);
+        this.forfeitPlayer(room, playerId, onStateChange, activeRoomState);
+      }
+    }, reconnectGraceSecs * 1000);
+    activeRoomState.disconnectTimers.set(playerId, forfeitTimeout);
+
+    // AI Relay tolerance timer (aiRelayGraceSeconds, e.g. 8s)
+    if (!activeRoomState.aiRelayTimers) {
+      activeRoomState.aiRelayTimers = new Map();
+    }
+    if (activeRoomState.aiRelayTimers.has(playerId)) {
+      clearTimeout(activeRoomState.aiRelayTimers.get(playerId)!);
+      activeRoomState.aiRelayTimers.delete(playerId);
+    }
+
+    const aiGraceSecs = cfg.aiRelayGraceSeconds ?? 8;
+    const relayTimer = setTimeout(() => {
+      activeRoomState.aiRelayTimers?.delete(playerId);
+      const targetRp = (room.players || []).find((p) => p.id === playerId);
+      if (!targetRp || targetRp.connected || targetRp.isForfeit || targetRp.isEliminated) {
+        return;
+      }
+
+      // Mark isAiRelay = true
+      targetRp.isAiRelay = true;
+      const targetGp = room.gameState?.players?.find((p) => p.id === playerId);
+      if (targetGp) {
+        targetGp.isAiRelay = true;
+      }
+
+      // Announce AI Relay warning to table
+      const emote: EmoteMessage = {
+        id: 'em_' + Math.random().toString(36).substring(2, 9),
+        playerId: 'system',
+        playerName: 'Table',
+        text: `🤖 ${targetRp.name} s'est déconnecté. Un relais IA termine la donne en cours avec des cartes neutres. Forfait aux donnes suivantes si absent.`,
+        emoji: '🤖',
+        timestamp: Date.now(),
+        isBot: true,
+      };
+      room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
+      room.updatedAt = Date.now();
+      onStateChange(room);
+
+      // If it is currently this player's turn, launch the AI relay move
+      const currentGs = room.gameState;
+      if (
+        currentGs &&
+        currentGs.phase === 'PLAYING' &&
+        room.status === 'PLAYING' &&
+        currentGs.players[currentGs.currentTurnIndex]?.id === playerId
+      ) {
+        this.clearTurnTimers(activeRoomState);
+        this.scheduleTurnAction(room, onStateChange, activeRoomState);
+      }
+    }, aiGraceSecs * 1000);
+
+    activeRoomState.aiRelayTimers.set(playerId, relayTimer);
 
     room.updatedAt = Date.now();
     onStateChange(room);
-
-    // If it is currently this player's turn, execute AI move immediately
-    if (gs.phase === 'PLAYING' && gs.players[gs.currentTurnIndex]?.id === playerId) {
-      this.clearAllTimers(activeRoomState);
-      this.scheduleTurnAction(room, onStateChange, activeRoomState);
-    }
   }
 
   public static handlePlayerReconnect(
@@ -1544,6 +1609,8 @@ export class ServerGameEngine {
     const rp = (room.players || []).find((p) => p.id === playerId);
     const gs = room.gameState;
     const relayCount = rp?.aiRelayPlaysCount || (gs?.players.find((p) => p.id === playerId)?.aiRelayPlaysCount) || 0;
+    const hadAiRelayStarted = (rp?.isAiRelay || (gs?.players.find((p) => p.id === playerId)?.isAiRelay) || relayCount > 0);
+
     if (rp) {
       rp.connected = true;
       rp.lastSeen = Date.now();
@@ -1572,27 +1639,29 @@ export class ServerGameEngine {
       }
     }
 
-    const relayInfoText = relayCount > 0
-      ? ` (L'IA a joué ${relayCount} tour${relayCount > 1 ? 's' : ''} en votre absence)`
-      : '';
+    if (hadAiRelayStarted) {
+      const relayInfoText = relayCount > 0
+        ? ` (L'IA a joué ${relayCount} tour${relayCount > 1 ? 's' : ''} en votre absence)`
+        : '';
 
-    const emote: EmoteMessage = {
-      id: 'em_' + Math.random().toString(36).substring(2, 9),
-      playerId: 'system',
-      playerName: 'Table',
-      text: `🟢 ${rp?.name || 'Le joueur'} s'est reconnecté et a repris la main !${relayInfoText}`,
-      emoji: '🟢',
-      timestamp: Date.now(),
-      isBot: true,
-    };
-    room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
+      const emote: EmoteMessage = {
+        id: 'em_' + Math.random().toString(36).substring(2, 9),
+        playerId: 'system',
+        playerName: 'Table',
+        text: `🟢 ${rp?.name || 'Le joueur'} s'est reconnecté et a repris la main !${relayInfoText}`,
+        emoji: '🟢',
+        timestamp: Date.now(),
+        isBot: true,
+      };
+      room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
+    }
 
     room.updatedAt = Date.now();
     onStateChange(room);
 
     // If player reconnected and it is their turn, give them standard turn control
     if (gs && gs.phase === 'PLAYING' && !rp?.isForfeit && gs.players[gs.currentTurnIndex]?.id === playerId) {
-      this.clearAllTimers(activeRoomState);
+      this.clearTurnTimers(activeRoomState);
       this.scheduleTurnAction(room, onStateChange, activeRoomState);
     }
   }
@@ -2389,6 +2458,21 @@ export class ServerGameEngine {
 
     room.updatedAt = Date.now();
     onStateChange(room);
+  }
+
+  public static clearTurnTimers(activeRoomState: ActiveRoomState): void {
+    if (activeRoomState.turnTimeoutTimer) {
+      clearTimeout(activeRoomState.turnTimeoutTimer);
+      activeRoomState.turnTimeoutTimer = null;
+    }
+    if (activeRoomState.botMoveTimer) {
+      clearTimeout(activeRoomState.botMoveTimer);
+      activeRoomState.botMoveTimer = null;
+    }
+    if (activeRoomState.trickResolutionTimer) {
+      clearTimeout(activeRoomState.trickResolutionTimer);
+      activeRoomState.trickResolutionTimer = null;
+    }
   }
 
   public static clearAllTimers(activeRoomState: ActiveRoomState): void {
