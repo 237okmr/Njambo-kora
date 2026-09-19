@@ -338,13 +338,13 @@ export const GameSetupModal: React.FC<GameSetupModalProps> = ({
       id: 'EXPERT' as AIDifficulty,
       label: 'Difficile',
       stars: '★★★☆',
-      tagline: 'Comptage des cartes & rupture des séries',
+      tagline: 'Calcul des cartes, jeu prudent',
     },
     {
       id: 'GRAND_MASTER' as AIDifficulty,
       label: 'Élite',
       stars: '★★★★',
-      tagline: 'Monte Carlo & inférence des vides',
+      tagline: 'Chasseur de Kora, pots à haut risque',
     },
   ];
 

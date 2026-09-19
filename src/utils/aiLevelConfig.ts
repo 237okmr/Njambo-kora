@@ -49,10 +49,9 @@ export const EXPERT_CONFIG = {
   BATCH_SIZE: 10,
   /** Multiplicateur espéré pour une victoire standard du pot (x1) */
   STANDARD_PAYOFF_MULTIPLIER: 1.0,
-  /** Multiplicateur espéré pour un Kora (x1.5) */
-  KORA_PAYOFF_MULTIPLIER: 1.5,
-  /** Multiplicateur espéré pour un Double Kora (x2.0) */
-  DOUBLE_KORA_PAYOFF_MULTIPLIER: 2.0,
+  /** Réglage de style : rend Expert prudent sur le Kora, ne modifie pas les gains réels */
+  KORA_PAYOFF_MULTIPLIER: 0.5,
+  DOUBLE_KORA_PAYOFF_MULTIPLIER: 0.5,
   /** Aucun coup aléatoire */
   RANDOM_MOVE_RATE: 0.0,
   /** Suivi dynamique complet des cartes maîtresses */
