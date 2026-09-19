@@ -491,20 +491,14 @@ async function startServer() {
 
                 // Calcul événementiel des points de maîtrise avec plafond solo 30 pts/jour
                 let eventPotential = 0;
-                if (g.recordType === 'PARTIE') {
-                  eventPotential = computeEventMasteryScore({
-                    mode: g.mode,
-                    difficulty: g.aiDifficulty,
-                    partiesWon: 1,
-                    koras: g.winType === 'KORA' ? 1 : 0,
-                    doubleKoras: g.winType === 'DOUBLE_KORA' ? 1 : 0,
-                  });
-                } else {
+                if (g.isMancheFinalWin === true && g.status === 'completed') {
                   eventPotential = computeEventMasteryScore({
                     mode: g.mode,
                     difficulty: g.aiDifficulty,
                     isMancheWinner: true,
                     isForfeitWin: g.winType === 'FORFEIT',
+                    koras: g.winType === 'KORA' ? 1 : 0,
+                    doubleKoras: g.winType === 'DOUBLE_KORA' ? 1 : 0,
                   });
                 }
 
@@ -644,9 +638,10 @@ async function startServer() {
             stats: {
               ...u.stats,
               ...tStats,
-              partiesPlayed: tStats.gamesPlayed || u.stats?.partiesPlayed || 0,
-              partiesWon: tStats.gamesWon || u.stats?.partiesWon || 0,
-              winRate: tStats.gamesPlayed > 0 ? Math.round(((tStats.gamesWon || 0) / tStats.gamesPlayed) * 100) : (u.stats?.winRate || 0),
+              partiesPlayed: tStats.gamesPlayed || 0,
+              partiesWon: tStats.gamesWon || 0,
+              winRate: (tStats.gamesPlayed || 0) > 0 ? Math.round(((tStats.gamesWon || 0) / tStats.gamesPlayed) * 100) : 0,
+              masteryScore: tStats.masteryScore || 0,
             }
           };
         });

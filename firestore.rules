@@ -2,6 +2,8 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // ===== Helpers : authentification et rôles =====
+
     function isAuthenticated() {
       return request.auth != null;
     }
@@ -11,135 +13,291 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isAuthenticated() && (request.auth.token.email == '237okmr@gmail.com' || request.auth.token.admin == true);
+      return isAuthenticated()
+        && request.auth.token.get('email_verified', false) == true
+        && (request.auth.token.get('email', '') == '237okmr@gmail.com'
+            || request.auth.token.get('admin', false) == true);
     }
 
-    // Global settings and social links for Katika AI Copilot (Admin restricted)
+    // ===== Helpers : profil =====
+
+    function validDisplayName(data) {
+      return !('displayName' in data) || (
+        data.displayName is string
+        && data.displayName.size() > 0
+        && data.displayName.size() <= 30
+      );
+    }
+
+    // Aucun e-mail dans le document public (clé absente ou null tolérés)
+    function noPublicEmail(data) {
+      return !('email' in data) || data.email == null;
+    }
+
+    // Compteur borné à la création (cap = 0 pour un compte neuf)
+    function capAtCreate(stats, key, cap) {
+      return stats.get(key, 0) >= 0 && stats.get(key, 0) <= cap;
+    }
+
+    // Compteur sans baisse et avec plafond d'incrément par écriture
+    function ctr(oS, nS, key, maxDelta) {
+      return nS.get(key, 0) >= oS.get(key, 0)
+        && nS.get(key, 0) - oS.get(key, 0) <= maxDelta;
+    }
+
+    // Sanction non expirée : impossible de la supprimer, de la désactiver ou de reculer son échéance
+    function sanctionKept(oSan, nSan) {
+      return oSan == null
+        || oSan.get('active', false) != true
+        || (oSan.get('expiresAt', null) != null && oSan.get('expiresAt', null) <= request.time.toMillis())
+        || (
+          nSan != null
+          && nSan.get('active', false) == true
+          && (
+            oSan.get('expiresAt', null) == null
+              ? nSan.get('expiresAt', null) == null
+              : (nSan.get('expiresAt', null) == null || nSan.get('expiresAt', null) >= oSan.get('expiresAt', null))
+          )
+        );
+    }
+
+    function isPermBanned(data) {
+      let s = data.get('fairPlay', {}).get('activeSanction', null);
+      return s != null && s.get('active', false) == true && s.get('type', '') == 'PERM_BAN';
+    }
+
+    // ===== Création d'un profil (compte neuf ou première fusion invité) =====
+
+    function initialProfileValid(data) {
+      let stats = data.stats;
+      let merge = 'guestMergedAt' in data;
+      let g = merge ? 100 : 0;
+      let kc = merge ? 30 : 0;
+      let dc = merge ? 10 : 0;
+      let mc = merge ? 50000 : 0;
+      let fp = data.get('fairPlay', {});
+      let san = fp.get('activeSanction', null);
+      return data.uid == request.auth.uid
+        && validDisplayName(data)
+        && noPublicEmail(data)
+        && data.get('scoreVersion', 1) in [1, 2]
+        && (merge
+            ? (data.get('chips', 1000) >= 0 && data.get('chips', 1000) <= 20000)
+            : data.get('chips', 1000) == 1000)
+        && (san == null || san.get('active', false) == false)
+        && (merge || (
+              fp.get('totalForfeits', 0) == 0
+              && fp.get('consecutiveForfeits', 0) == 0
+              && fp.get('totalFoldRounds', 0) == 0
+              && fp.get('prolongedDisconnects', 0) == 0))
+        && capAtCreate(stats, 'masteryScore', merge ? 300 : 0)
+        && capAtCreate(stats, 'partiesPlayed', g)
+        && capAtCreate(stats, 'partiesWon', g)
+        && capAtCreate(stats, 'gamesPlayed', g)
+        && capAtCreate(stats, 'gamesWon', g)
+        && capAtCreate(stats, 'gamesLost', g)
+        && capAtCreate(stats, 'manchesPlayed', g)
+        && capAtCreate(stats, 'manchesWon', g)
+        && capAtCreate(stats, 'soloGamesPlayed', g)
+        && capAtCreate(stats, 'soloGamesWon', g)
+        && capAtCreate(stats, 'multiplayerGamesPlayed', g)
+        && capAtCreate(stats, 'multiplayerGamesWon', g)
+        && capAtCreate(stats, 'soloManchesWon', g)
+        && capAtCreate(stats, 'multiplayerManchesWon', g)
+        && capAtCreate(stats, 'soloManchesWonEasy', g)
+        && capAtCreate(stats, 'soloManchesWonNormal', g)
+        && capAtCreate(stats, 'soloManchesWonHard', g)
+        && capAtCreate(stats, 'soloGamesWonEasy', g)
+        && capAtCreate(stats, 'soloGamesWonNormal', g)
+        && capAtCreate(stats, 'soloGamesWonHard', g)
+        && capAtCreate(stats, 'koraCount', kc)
+        && capAtCreate(stats, 'soloKoraCount', kc)
+        && capAtCreate(stats, 'multiplayerKoraCount', kc)
+        && capAtCreate(stats, 'soloKorasEasy', kc)
+        && capAtCreate(stats, 'soloKorasNormal', kc)
+        && capAtCreate(stats, 'soloKorasHard', kc)
+        && capAtCreate(stats, 'doubleKoraCount', dc)
+        && capAtCreate(stats, 'soloDoubleKoraCount', dc)
+        && capAtCreate(stats, 'multiplayerDoubleKoraCount', dc)
+        && capAtCreate(stats, 'soloDoubleKorasEasy', dc)
+        && capAtCreate(stats, 'soloDoubleKorasNormal', dc)
+        && capAtCreate(stats, 'soloDoubleKorasHard', dc)
+        && capAtCreate(stats, 'multiplayerGains', mc)
+        && capAtCreate(stats, 'multiplayerPertes', mc)
+        && capAtCreate(stats, 'soloGains', mc)
+        && capAtCreate(stats, 'soloPertes', mc)
+        && capAtCreate(stats, 'fortune', mc)
+        && capAtCreate(stats, 'soloFortune', mc)
+        && capAtCreate(stats, 'biggestPotWon', mc);
+    }
+
+    // ===== Mise à jour d'un profil =====
+
+    function coherentProfile(data) {
+      let s = data.stats;
+      return validDisplayName(data)
+        && noPublicEmail(data)
+        && data.get('chips', 0) >= 0
+        && s.get('partiesWon', 0) <= s.get('partiesPlayed', 0)
+        && s.get('gamesWon', 0) <= s.get('gamesPlayed', 0)
+        && s.get('manchesWon', 0) <= s.get('manchesPlayed', 0)
+        && s.get('doubleKoraCount', 0) <= s.get('koraCount', 0)
+        && s.get('masteryScore', 0) >= 0;
+    }
+
+    function validProfileUpdate(existing, incoming) {
+      let oS = existing.stats;
+      let nS = incoming.stats;
+      // Fusion invité unique sur un compte existant : plafonds élargis, une seule fois
+      let one = !('guestMergedAt' in existing) && ('guestMergedAt' in incoming);
+      let maxG = one ? 100 : 20;
+      let maxK = one ? 30 : 10;
+      let maxD = 10;
+      let oFP = existing.get('fairPlay', {});
+      let nFP = incoming.get('fairPlay', {});
+      return incoming.get('scoreVersion', 1) >= existing.get('scoreVersion', 1)
+        && (!('guestMergedAt' in existing) || incoming.get('guestMergedAt', null) == existing.guestMergedAt)
+        // Fair-Play : aucun compteur ne baisse, sanction active protégée
+        && nFP.get('totalForfeits', 0) >= oFP.get('totalForfeits', 0)
+        && nFP.get('totalFoldRounds', 0) >= oFP.get('totalFoldRounds', 0)
+        && nFP.get('prolongedDisconnects', 0) >= oFP.get('prolongedDisconnects', 0)
+        && sanctionKept(oFP.get('activeSanction', null), nFP.get('activeSanction', null))
+        // Jetons
+        && incoming.get('chips', 0) - existing.get('chips', 0) <= (one ? 20000 : 50000)
+        && existing.get('chips', 0) - incoming.get('chips', 0) <= 25000
+        // Score : ne baisse que de la pénalité d'abandon (5 points)
+        && nS.get('masteryScore', 0) >= oS.get('masteryScore', 0) - 5
+        && nS.get('masteryScore', 0) - oS.get('masteryScore', 0) <= (one ? 300 : 100)
+        // Compteurs
+        && ctr(oS, nS, 'partiesPlayed', maxG)
+        && ctr(oS, nS, 'partiesWon', maxG)
+        && ctr(oS, nS, 'gamesPlayed', maxG)
+        && ctr(oS, nS, 'gamesWon', maxG)
+        && ctr(oS, nS, 'gamesLost', maxG)
+        && ctr(oS, nS, 'manchesPlayed', maxG)
+        && ctr(oS, nS, 'manchesWon', maxG)
+        && ctr(oS, nS, 'soloGamesPlayed', maxG)
+        && ctr(oS, nS, 'soloGamesWon', maxG)
+        && ctr(oS, nS, 'multiplayerGamesPlayed', maxG)
+        && ctr(oS, nS, 'multiplayerGamesWon', maxG)
+        && ctr(oS, nS, 'soloManchesWon', maxG)
+        && ctr(oS, nS, 'multiplayerManchesWon', maxG)
+        && ctr(oS, nS, 'soloManchesWonEasy', maxG)
+        && ctr(oS, nS, 'soloManchesWonNormal', maxG)
+        && ctr(oS, nS, 'soloManchesWonHard', maxG)
+        && ctr(oS, nS, 'soloGamesWonEasy', maxG)
+        && ctr(oS, nS, 'soloGamesWonNormal', maxG)
+        && ctr(oS, nS, 'soloGamesWonHard', maxG)
+        && ctr(oS, nS, 'koraCount', maxK)
+        && ctr(oS, nS, 'soloKoraCount', maxK)
+        && ctr(oS, nS, 'multiplayerKoraCount', maxK)
+        && ctr(oS, nS, 'soloKorasEasy', maxK)
+        && ctr(oS, nS, 'soloKorasNormal', maxK)
+        && ctr(oS, nS, 'soloKorasHard', maxK)
+        && ctr(oS, nS, 'doubleKoraCount', maxD)
+        && ctr(oS, nS, 'soloDoubleKoraCount', maxD)
+        && ctr(oS, nS, 'multiplayerDoubleKoraCount', maxD)
+        && ctr(oS, nS, 'soloDoubleKorasEasy', maxD)
+        && ctr(oS, nS, 'soloDoubleKorasNormal', maxD)
+        && ctr(oS, nS, 'soloDoubleKorasHard', maxD)
+        && ctr(oS, nS, 'multiplayerGains', 50000)
+        && ctr(oS, nS, 'multiplayerPertes', 25000)
+        && ctr(oS, nS, 'soloGains', 50000)
+        && ctr(oS, nS, 'soloPertes', 25000)
+        && ctr(oS, nS, 'biggestPotWon', 50000)
+        && nS.get('fortune', 0) - oS.get('fortune', 0) <= 50000
+        && oS.get('fortune', 0) - nS.get('fortune', 0) <= 25000
+        && nS.get('soloFortune', 0) - oS.get('soloFortune', 0) <= 50000
+        && oS.get('soloFortune', 0) - nS.get('soloFortune', 0) <= 25000;
+    }
+
+    // ===== Collections =====
+
+    // Réglages Katika : lecture publique, écriture admin
     match /katika_settings/{settingId} {
       allow read: if true;
       allow write: if isAdmin();
     }
 
-    // Telemetry and analytical game records for official Palmarès Mondial & Katika Cockpit
-    // Enforcing authenticated submission to prevent fraud and spam
+    // Enregistrements de parties
     match /njambo_game_records/{recordId} {
       allow read: if true;
-      allow create, update: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.creatorUid == request.auth.uid;
+      allow update: if isAuthenticated() && (
+        resource.data.get('creatorUid', null) == request.auth.uid
+        || (!('creatorUid' in resource.data) && resource.data.get('winnerId', null) == request.auth.uid)
+        || isAdmin()
+      );
       allow delete: if isAdmin();
     }
 
-    function validDifficultyProgression(bStats, aStats, field, maxInc) {
-      let oldVal = (bStats != null && field in bStats) ? bStats[field] : 0;
-      let newVal = (aStats != null && field in aStats) ? aStats[field] : oldVal;
-      return newVal >= oldVal && (newVal - oldVal) <= maxInc;
-    }
-
-    function validCountersUpdate(bData, aData) {
-      let bStats = ('stats' in bData) ? bData.stats : null;
-      let aStats = ('stats' in aData) ? aData.stats : null;
-      let isFusion = !('guestMergedAt' in bData) && ('guestMergedAt' in aData);
-      let maxInc = isFusion ? 1000 : 1;
-      let maxDblInc = isFusion ? 1000 : 2;
-
-      return (aStats == null || bStats == null) ? true : (
-        validDifficultyProgression(bStats, aStats, 'soloGamesWonEasy', maxInc) &&
-        validDifficultyProgression(bStats, aStats, 'soloGamesWonNormal', maxInc) &&
-        validDifficultyProgression(bStats, aStats, 'soloGamesWonHard', maxInc) &&
-        validDifficultyProgression(bStats, aStats, 'soloKorasEasy', maxInc) &&
-        validDifficultyProgression(bStats, aStats, 'soloKorasNormal', maxInc) &&
-        validDifficultyProgression(bStats, aStats, 'soloKorasHard', maxInc) &&
-        validDifficultyProgression(bStats, aStats, 'soloDoubleKorasEasy', maxDblInc) &&
-        validDifficultyProgression(bStats, aStats, 'soloDoubleKorasNormal', maxDblInc) &&
-        validDifficultyProgression(bStats, aStats, 'soloDoubleKorasHard', maxDblInc)
-      );
-    }
-
-    function validCountersCreate(data) {
-      let stats = ('stats' in data) ? data.stats : null;
-      let isFusion = 'guestMergedAt' in data;
-      let maxInitial = isFusion ? 1000 : 0;
-
-      return stats == null ? true : (
-        (!('soloGamesWonEasy' in stats) || (stats.soloGamesWonEasy >= 0 && stats.soloGamesWonEasy <= maxInitial)) &&
-        (!('soloGamesWonNormal' in stats) || (stats.soloGamesWonNormal >= 0 && stats.soloGamesWonNormal <= maxInitial)) &&
-        (!('soloGamesWonHard' in stats) || (stats.soloGamesWonHard >= 0 && stats.soloGamesWonHard <= maxInitial)) &&
-        (!('soloKorasEasy' in stats) || (stats.soloKorasEasy >= 0 && stats.soloKorasEasy <= maxInitial)) &&
-        (!('soloKorasNormal' in stats) || (stats.soloKorasNormal >= 0 && stats.soloKorasNormal <= maxInitial)) &&
-        (!('soloKorasHard' in stats) || (stats.soloKorasHard >= 0 && stats.soloKorasHard <= maxInitial)) &&
-        (!('soloDoubleKorasEasy' in stats) || (stats.soloDoubleKorasEasy >= 0 && stats.soloDoubleKorasEasy <= maxInitial)) &&
-        (!('soloDoubleKorasNormal' in stats) || (stats.soloDoubleKorasNormal >= 0 && stats.soloDoubleKorasNormal <= maxInitial)) &&
-        (!('soloDoubleKorasHard' in stats) || (stats.soloDoubleKorasHard >= 0 && stats.soloDoubleKorasHard <= maxInitial))
-      );
-    }
-
-    // Player profiles and cloud synchronized palmares
+    // Profils joueurs
     match /users/{userId} {
       allow read: if true;
-      allow create: if isUser(userId) && (
-        (!('chips' in request.resource.data) || request.resource.data.chips >= 0) &&
-        // Do not allow email in public user document
-        (!('email' in request.resource.data) || request.resource.data.email == null) &&
-        // Counters initialized to 0 (or capped at fusion)
-        validCountersCreate(request.resource.data)
+      allow create: if isUser(userId) && initialProfileValid(request.resource.data);
+      allow update: if isAdmin() || (
+        isUser(userId)
+        && !isPermBanned(resource.data)
+        && coherentProfile(request.resource.data)
+        && validProfileUpdate(resource.data, request.resource.data)
       );
-      allow update: if isUser(userId) && (
-        // Prevent negative chips
-        (!('chips' in request.resource.data) || request.resource.data.chips >= 0) &&
-        // Do not allow email in public user document
-        (!('email' in request.resource.data) || request.resource.data.email == null) &&
-        // guestMergedAt is write-once, immutable once set
-        (!('guestMergedAt' in resource.data) || request.resource.data.guestMergedAt == resource.data.guestMergedAt) &&
-        // Enforce counter progression: no-decrease, fusion caps and incremental caps
-        validCountersUpdate(resource.data, request.resource.data)
-      );
-      allow delete: if isUser(userId) || isAdmin();
+      allow delete: if isAdmin();
 
-      // Private user profile data (email isolation)
+      // Données privées (e-mail)
       match /private/{docId} {
         allow read, write: if isUser(userId) || isAdmin();
       }
 
+      // Historique individuel
       match /history/{gameId} {
-        allow read: if isUser(userId);
-        allow create, update: if isUser(userId);
-        allow delete: if isUser(userId) || isAdmin();
+        allow read: if isUser(userId) || isAdmin();
+        allow create, update: if isUser(userId) && (
+          !('masteryPointsAwarded' in request.resource.data)
+          || (request.resource.data.masteryPointsAwarded >= -5 && request.resource.data.masteryPointsAwarded <= 30)
+        );
+        allow delete: if isAdmin();
       }
 
+      // Amis
       match /friends/{friendId} {
-        allow read: if isAuthenticated() && (request.auth.uid == userId || request.auth.uid == friendId);
-        allow write: if isAuthenticated() && (request.auth.uid == userId || request.auth.uid == friendId);
+        allow read, write: if isAuthenticated() && (
+          request.auth.uid == userId || request.auth.uid == friendId || isAdmin()
+        );
       }
     }
 
-    // Rooms for multiplayer card games (disallowed direct client access - managed strictly by in-memory authoritative server)
+    // Salles de jeu : gérées uniquement par le serveur
     match /rooms/{roomId} {
       allow read, write: if false;
     }
 
-    // Web Push notifications subscriptions (server push service & background sync)
+    // Abonnements Web Push (lecture/écriture par le serveur avec le SDK client : à migrer au lot 4)
     match /push_subscriptions/{subscriptionId} {
       allow read, write: if true;
     }
 
-    // Real-time table invitations (strictly accessible to sender and recipient)
+    // Invitations de table
     match /invitations/{invitationId} {
-      allow read: if isAuthenticated() && (resource.data.toUserId == request.auth.uid || resource.data.fromUserId == request.auth.uid);
+      allow read: if isAuthenticated() && (
+        resource.data.toUserId == request.auth.uid || resource.data.fromUserId == request.auth.uid
+      );
       allow create: if isAuthenticated() && request.resource.data.fromUserId == request.auth.uid;
-      allow update, delete: if isAuthenticated() && (resource.data.toUserId == request.auth.uid || resource.data.fromUserId == request.auth.uid);
+      allow update, delete: if isAuthenticated() && (
+        resource.data.toUserId == request.auth.uid || resource.data.fromUserId == request.auth.uid
+      );
     }
 
-    // Player presence and online status (strictly own presence)
+    // Présence en ligne
     match /presence/{userId} {
       allow read: if true;
       allow write: if isUser(userId);
     }
 
-    // Fair-play sanctions and moderation logs (Katika telemetry & audits)
+    // Sanctions Fair-Play
     match /fairplay_sanctions/{sanctionId} {
-      allow read: if isAuthenticated();
-      allow create, update: if isAuthenticated();
-      allow delete: if isAdmin();
+      allow read: if isAdmin() || (isAuthenticated() && resource.data.userId == request.auth.uid);
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAdmin();
     }
   }
 }
-

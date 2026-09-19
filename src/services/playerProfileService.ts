@@ -1310,7 +1310,14 @@ export const playerProfileService = {
           : 0;
 
       // Apply fallback rule for older users who have victories but no detail set
-      const finalConsolidatedStats = applyStatsFallback(consolidatedStats);
+      const rootScoreVersion = profileData.scoreVersion || profileData.stats?.scoreVersion || 1;
+      const isV2 = rootScoreVersion >= 2;
+      const finalConsolidatedStats = applyStatsFallback(consolidatedStats, rootScoreVersion);
+
+      // Pour scoreVersion >= 2, fetchConsolidatedStats ne doit JAMAIS réécrire masteryScore
+      if (isV2) {
+        finalConsolidatedStats.masteryScore = profileData.stats?.masteryScore ?? consolidatedStats.masteryScore ?? 0;
+      }
 
       // Reconcile chips: protect against browser cache wipe by prioritizing cloud balance
       const localProfile = this.getLocalProfile();
@@ -1333,7 +1340,12 @@ export const playerProfileService = {
       if (profileData.isGuest === false) {
         try {
           const userRef = doc(db, 'users', userId);
-          await setDoc(userRef, { chips: resolvedChips, stats: finalConsolidatedStats, updatedAt: Date.now() }, { merge: true });
+          const statsToSave = { ...finalConsolidatedStats };
+          if (isV2) {
+            // Pour scoreVersion >= 2, ne JAMAIS réécrire masteryScore
+            statsToSave.masteryScore = profileData.stats?.masteryScore ?? 0;
+          }
+          await setDoc(userRef, { chips: resolvedChips, stats: statsToSave, updatedAt: Date.now() }, { merge: true });
           console.log('[PlayerProfileService] Successfully consolidated and synced stats & chips to Firestore in background.');
           await this.flushOfflineSyncQueue();
         } catch (err) {
@@ -1446,8 +1458,17 @@ export const playerProfileService = {
       soloManchesWonHard: (cloudStats.soloManchesWonHard || 0) + (guestStats.soloManchesWonHard || 0),
       soloManchesWonNormal: (cloudStats.soloManchesWonNormal || 0) + (guestStats.soloManchesWonNormal || 0),
       soloManchesWonEasy: (cloudStats.soloManchesWonEasy || 0) + (guestStats.soloManchesWonEasy || 0),
+      soloGamesWonEasy: (cloudStats.soloGamesWonEasy || 0) + (guestStats.soloGamesWonEasy || 0),
+      soloGamesWonNormal: (cloudStats.soloGamesWonNormal || 0) + (guestStats.soloGamesWonNormal || 0),
+      soloGamesWonHard: (cloudStats.soloGamesWonHard || 0) + (guestStats.soloGamesWonHard || 0),
       koraCount: (cloudStats.koraCount || 0) + (guestStats.koraCount || 0),
       doubleKoraCount: (cloudStats.doubleKoraCount || 0) + (guestStats.doubleKoraCount || 0),
+      soloKorasEasy: (cloudStats.soloKorasEasy || 0) + (guestStats.soloKorasEasy || 0),
+      soloKorasNormal: (cloudStats.soloKorasNormal || 0) + (guestStats.soloKorasNormal || 0),
+      soloKorasHard: (cloudStats.soloKorasHard || 0) + (guestStats.soloKorasHard || 0),
+      soloDoubleKorasEasy: (cloudStats.soloDoubleKorasEasy || 0) + (guestStats.soloDoubleKorasEasy || 0),
+      soloDoubleKorasNormal: (cloudStats.soloDoubleKorasNormal || 0) + (guestStats.soloDoubleKorasNormal || 0),
+      soloDoubleKorasHard: (cloudStats.soloDoubleKorasHard || 0) + (guestStats.soloDoubleKorasHard || 0),
       under21Count: (cloudStats.under21Count || 0) + (guestStats.under21Count || 0),
       threeSevensCount: (cloudStats.threeSevensCount || 0) + (guestStats.threeSevensCount || 0),
       biggestPotWon: Math.max(cloudStats.biggestPotWon || 0, guestStats.biggestPotWon || 0),
@@ -1473,6 +1494,16 @@ export const playerProfileService = {
       multiplayerWinRate: 0,
     };
 
+    // Version du score : 2 par défaut pour un compte neuf, version existante pour un compte déjà enregistré
+    const targetScoreVersion = cloudProfile ? (cloudProfile.scoreVersion || cloudProfile.stats?.scoreVersion || 1) : 2;
+    const isTargetV2 = targetScoreVersion >= 2;
+
+    // Pour scoreVersion >= 2 : somme du score cloud v2 et des points de l'invité, pas de recalcul par compteurs
+    if (isTargetV2) {
+      const guestPoints = guestStats.masteryScore ?? computeMasteryScore(guestStats);
+      mergedStats.masteryScore = (cloudStats.masteryScore || 0) + guestPoints;
+    }
+
     // Non-destructive chips fusion: preserve earned chips (highest balance or additive delta)
     const cloudChips = typeof cloudProfile?.chips === 'number' && !isNaN(cloudProfile.chips) ? cloudProfile.chips : 1000;
     const guestChips = typeof guestProfile?.chips === 'number' && !isNaN(guestProfile.chips) ? guestProfile.chips : 1000;
@@ -1493,7 +1524,10 @@ export const playerProfileService = {
       ((mergedFairPlay.totalForfeits + mergedFairPlay.prolongedDisconnects) / Math.max(1, gamesPlayedCount + 1)).toFixed(2)
     );
 
-    const finalMergedStats = applyStatsFallback(mergedStats, cloudProfile?.scoreVersion || guestProfile.scoreVersion);
+    const finalMergedStats = applyStatsFallback(mergedStats, targetScoreVersion);
+    if (isTargetV2) {
+      finalMergedStats.masteryScore = mergedStats.masteryScore;
+    }
     const { currentTitle } = computeHonorificTitle(finalMergedStats);
 
     // Resolve display name: keep existing custom name if meaningful, else Google name
@@ -1518,6 +1552,7 @@ export const playerProfileService = {
       stats: finalMergedStats,
       fairPlay: mergedFairPlay,
       honorificTitleId: currentTitle.id,
+      scoreVersion: targetScoreVersion,
       guestMergedAt,
       createdAt: cloudProfile?.createdAt || guestProfile.createdAt || Date.now(),
       updatedAt: Date.now(),

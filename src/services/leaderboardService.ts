@@ -115,6 +115,7 @@ export class LeaderboardService {
           isGuest: false,
           chips: Math.max(0, localProfile.chips ?? 1000),
           stats: localProfile.stats || DEFAULT_PLAYER_STATS,
+          scoreVersion: localProfile.scoreVersion || 1,
           fairPlay: localProfile.fairPlay || { activeSanction: null },
         });
       }
@@ -179,7 +180,7 @@ export class LeaderboardService {
     currentUserRank: CurrentUserRankSummary | null;
   } {
     const formatted: LeaderboardEntry[] = rawUsers.map((u) => {
-      const stats = applyStatsFallback(u.stats || DEFAULT_PLAYER_STATS);
+      const stats = applyStatsFallback(u.stats || DEFAULT_PLAYER_STATS, u.scoreVersion);
       const gamesWon = stats.partiesWon || stats.gamesWon || 0;
       const partiesWon = stats.partiesWon || gamesWon;
       const gamesPlayed = Math.max(stats.partiesPlayed || stats.gamesPlayed || 0, gamesWon);

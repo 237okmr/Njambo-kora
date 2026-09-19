@@ -77,6 +77,7 @@ export interface PublicPlayerProfileData {
   doubleKoraCount: number;
   biggestPotWon: number;
   totalTricksWon: number;
+  scoreVersion?: number;
   masteryScore?: number;
   manchesWon?: number;
   soloManchesWon?: number;
