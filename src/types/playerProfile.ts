@@ -188,6 +188,8 @@ export interface PlayerProfile {
   chips: number; // Persistent wallet / token balance (default: 1000 for guests and new accounts)
   stats: PlayerStats;
   scoreVersion?: number;
+  chipsFixVersion?: number;
+  soloDaily?: { day: number; points: number };
   statsLegacyBackup?: PlayerStats;
   fairPlay?: PlayerFairPlay;
   honorificTitleId: string;
@@ -216,6 +218,7 @@ export interface PlayerGameHistoryItem {
   winnerId?: string;
   potWon: number;
   netChipsDelta?: number; // Net positive or negative change in chips for this player
+  chipsFix?: number;
   baseBet: number;
   roundsCount: number;
   partieNumber?: number;

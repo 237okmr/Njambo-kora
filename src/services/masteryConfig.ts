@@ -149,6 +149,13 @@ export function formatMasteryScore(score: number | undefined | null): string {
 }
 
 /**
+ * Returns integer day index for Douala timezone (UTC+1).
+ */
+export function getDoualaDayIndex(timestamp = Date.now()): number {
+  return Math.floor((timestamp + 3600000) / 86400000);
+}
+
+/**
  * Computes exact floating-point mastery score from cumulative profile stats.
  * Used as fallback or for profile calculation when history log is not available.
  */

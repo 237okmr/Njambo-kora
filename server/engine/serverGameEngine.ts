@@ -25,6 +25,7 @@ import {
   getRandomBotStrategy,
 } from '../../src/utils/ai';
 import { getEngineConfig, KatikaEngineConfig } from './engineConfig';
+import { computePartieOutcome, applyPartiePayout, detectInstantWin } from '../../src/utils/gameRules';
 
 export interface ActiveRoomState {
   room: MultiplayerRoom;
@@ -386,58 +387,29 @@ export class ServerGameEngine {
     const gs = room.gameState;
     if (!gs) return false;
 
-    // Check A: Three Sevens (777)
-    let threeSevensWinnerIdx: number | null = null;
-    (gs.players || []).forEach((player, pIdx) => {
-      if (!player.isEliminated && (player.hand || []).length > 0) {
-        const sevensCount = (player.hand || []).filter((c) => c.value === 7).length;
-        if (sevensCount >= 3) {
-          threeSevensWinnerIdx = pIdx;
-        }
-      }
+    const instantWin = detectInstantWin({
+      hands: (gs.players || []).map((p) => p.hand || []),
+      eligible: (gs.players || []).map((p) => !p.isEliminated && !p.isForfeit),
+      dealerIndex: gs.dealerIndex ?? 0,
+      enableUnder21: gs.enableUnder21 ?? false,
     });
 
-    if (threeSevensWinnerIdx !== null) {
-      const winner = gs.players[threeSevensWinnerIdx];
-      const count = (winner.hand || []).filter((c) => c.value === 7).length;
+    if (instantWin) {
+      const winnerIndex = instantWin.winnerIndex;
+      const winner = gs.players[winnerIndex];
+      const count = instantWin.winType === 'THREE_SEVENS'
+        ? (winner.hand || []).filter((c) => c.value === 7).length
+        : (winner.hand || []).reduce((acc, c) => acc + c.value, 0);
+
       const reveal: InstantWinReveal = {
-        winnerIndex: threeSevensWinnerIdx,
+        winnerIndex,
         winnerName: winner.name,
-        winType: 'THREE_SEVENS',
-        hand: [...winner.hand],
+        winType: instantWin.winType,
+        hand: [...(winner.hand || [])],
         scoreOrCount: count,
       };
       this.triggerInstantWinReveal(room, reveal, onStateChange, activeRoomState);
       return true;
-    }
-
-    // Check B: Moins de 21 points (<= 21)
-    if (gs.enableUnder21) {
-      let under21WinnerIdx: number | null = null;
-      let lowestSum = 999;
-
-      (gs.players || []).forEach((player, pIdx) => {
-        if (!player.isEliminated && (player.hand || []).length === 5) {
-          const sum = (player.hand || []).reduce((acc, c) => acc + c.value, 0);
-          if (sum <= 21 && sum < lowestSum) {
-            lowestSum = sum;
-            under21WinnerIdx = pIdx;
-          }
-        }
-      });
-
-      if (under21WinnerIdx !== null) {
-        const winner = gs.players[under21WinnerIdx];
-        const reveal: InstantWinReveal = {
-          winnerIndex: under21WinnerIdx,
-          winnerName: winner.name,
-          winType: 'UNDER_21',
-          hand: [...winner.hand],
-          scoreOrCount: lowestSum,
-        };
-        this.triggerInstantWinReveal(room, reveal, onStateChange, activeRoomState);
-        return true;
-      }
     }
 
     return false;
@@ -505,28 +477,31 @@ export class ServerGameEngine {
     gs.roundWinnerIndex = winnerIndex;
     gs.roundWinnerName = winner.name;
 
-    // Award pot to winner (with global rake deducted if configured)
-    const previousPot = gs.pot;
     const cfg = this.getConfig(activeRoomState);
-    const rakeAmount = 0; // cfg.globalRakePct > 0 ? Math.floor((previousPot * cfg.globalRakePct) / 100) : 0; (Désactivé en mode virtuel)
-    const netPot = previousPot - rakeAmount;
-    winner.capital += netPot;
-    winner.score = winner.capital;
-    gs.pot = 0;
+    const payout = applyPartiePayout({
+      capitals: (gs.players || []).map((p) => p.capital),
+      isEliminated: (gs.players || []).map((p) => p.isEliminated || p.isForfeit),
+      winnerIndex,
+      pot: gs.pot,
+      baseBet: gs.baseBet,
+      multiplier: 1,
+      rakePct: 0,
+    });
+    const netPot = payout.winnerReceived;
 
-    // Check eliminations
     let nonEliminatedCount = 0;
     let lastStandingPlayer: Player | null = null;
 
-    (gs.players || []).forEach((p) => {
-      if (p.capital < gs.baseBet) {
-        p.isEliminated = true;
-      } else {
+    (gs.players || []).forEach((p, idx) => {
+      p.capital = payout.capitals[idx];
+      p.score = payout.capitals[idx];
+      p.isEliminated = payout.eliminated[idx];
+      if (!p.isEliminated) {
         nonEliminatedCount++;
         lastStandingPlayer = p;
       }
-      p.score = p.capital;
     });
+    gs.pot = 0;
 
     if (nonEliminatedCount <= 1 && lastStandingPlayer) {
       gs.phase = 'MANCHE_OVER';
@@ -798,34 +773,30 @@ export class ServerGameEngine {
 
     // The winner of the 5th trick wins the standard partie!
     const lastTrick = gs.tricksHistory[gs.tricksHistory.length - 1];
-    const fifthTrickWinnerIndex = lastTrick.winnerIndex ?? 0;
-    const fifthTrickWinner = gs.players[fifthTrickWinnerIndex];
-    const isFifthTrickWonWithThree = lastTrick.winningCard?.value === 3;
+    const fifthTrickWinnerIndex = lastTrick?.winnerIndex ?? 0;
+    const fifthTrickWinningValue = lastTrick?.winningCard?.value ?? 0;
 
-    // Check Trick 4 to detect Double Kora (same player won trick 4 with a 3 and trick 5 with a 3)
     const fourthTrick = gs.tricksHistory.find((t) => t.trickNumber === 4) || gs.tricksHistory[3];
-    const isFourthTrickWonWithThree = Boolean(
-      fourthTrick &&
-      fourthTrick.winnerIndex === fifthTrickWinnerIndex &&
-      fourthTrick.winningCard?.value === 3
-    );
+    const fourthTrickWinnerIndex = fourthTrick?.winnerIndex;
+    const fourthTrickWinningValue = fourthTrick?.winningCard?.value;
 
-    let winType: PartieWinType = 'STANDARD';
-    let multiplier = 1;
-    const partieWinnerIndex = fifthTrickWinnerIndex;
+    const outcome = computePartieOutcome({
+      fifthTrickWinnerIndex,
+      fifthTrickWinningValue,
+      fourthTrickWinnerIndex,
+      fourthTrickWinningValue,
+      enableDoubleKora: gs.enableDoubleKora,
+    });
 
-    if (isFifthTrickWonWithThree) {
-      if (isFourthTrickWonWithThree && gs.enableDoubleKora) {
-        winType = 'DOUBLE_KORA';
-        multiplier = 4;
-        gs.doubleKoraAchievedByPlayer = {
-          ...(gs.doubleKoraAchievedByPlayer || {}),
-          [partieWinnerIndex]: true,
-        };
-      } else {
-        winType = 'KORA';
-        multiplier = 2;
-      }
+    const winType = outcome.winType;
+    const multiplier = outcome.multiplier;
+    const partieWinnerIndex = outcome.winnerIndex;
+
+    if (winType === 'DOUBLE_KORA') {
+      gs.doubleKoraAchievedByPlayer = {
+        ...(gs.doubleKoraAchievedByPlayer || {}),
+        [partieWinnerIndex]: true,
+      };
     }
 
     const winner = gs.players[partieWinnerIndex];
@@ -841,56 +812,56 @@ export class ServerGameEngine {
       capitalsBefore[p.id] = p.capital;
     });
 
-    // Collect extra penalty chips from losers if Kora (x2) or Double Kora (x4)
-    let totalExtraCollected = 0;
+    // Determine who participated or folded (non-participants shouldn't pay extra penalty)
+    const nonParticipatingMask = (gs.players || []).map((p, idx) => {
+      if (idx === partieWinnerIndex || p.isEliminated || p.isForfeit) return true; // not a loser
+      const participated = gs.tricksHistory.some((t) => t.plays.some((play) => play.playerIndex === idx)) || p.isFoldedInRound;
+      return !participated; // if did not participate, treat as "eliminated/exempt" from penalty in applyPartiePayout
+    });
+
+    const cfg = this.getConfig(activeRoomState);
+    const payout = applyPartiePayout({
+      capitals: (gs.players || []).map((p) => p.capital),
+      isEliminated: nonParticipatingMask,
+      winnerIndex: partieWinnerIndex,
+      pot: gs.pot,
+      baseBet: gs.baseBet,
+      multiplier,
+      rakePct: 0,
+    });
+    const netWon = payout.winnerReceived;
+
     if (multiplier > 1) {
-      const extraCostPerLoser = (multiplier - 1) * gs.baseBet;
       (gs.players || []).forEach((p, idx) => {
-        // Official Fold rule: All losers who actively participated in this partie or folded during it pay the Kora/Double Kora penalty
-        const participatedInThisPartie = gs.tricksHistory.some((t) => t.plays.some((play) => play.playerIndex === idx)) || p.isFoldedInRound;
-        if (idx !== partieWinnerIndex && participatedInThisPartie) {
-          const penalty = Math.min(p.capital, extraCostPerLoser);
-          p.capital = Math.max(0, p.capital - penalty);
-          p.score = p.capital;
-          totalExtraCollected += penalty;
-          if (p.isFoldedInRound) {
-            const emote: EmoteMessage = {
-              id: 'em_' + Math.random().toString(36).substring(2, 9),
-              playerId: 'system',
-              playerName: 'Table',
-              text: `⚖️ Règle officielle de l'abandon : ${p.name} ayant abandonné subit la pénalité ${multiplier === 4 ? 'Double Kora (x4)' : 'Kora (x2)'} de ${penalty} 🪙.`,
-              emoji: '⚖️',
-              timestamp: Date.now(),
-              isBot: true,
-            };
-            room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
-          }
+        if (p.isFoldedInRound && idx !== partieWinnerIndex && !nonParticipatingMask[idx]) {
+          const penalty = Math.min(capitalsBefore[p.id] ?? p.capital, (multiplier - 1) * gs.baseBet);
+          const emote: EmoteMessage = {
+            id: 'em_' + Math.random().toString(36).substring(2, 9),
+            playerId: 'system',
+            playerName: 'Table',
+            text: `⚖️ Règle officielle de l'abandon : ${p.name} ayant abandonné subit la pénalité ${multiplier === 4 ? 'Double Kora (x4)' : 'Kora (x2)'} de ${penalty} 🪙.`,
+            emoji: '⚖️',
+            timestamp: Date.now(),
+            isBot: true,
+          };
+          room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
         }
       });
     }
 
-    // Distribute pot + extra penalty to winner (applying global rake if configured)
-    const totalWon = gs.pot + totalExtraCollected;
-    const cfg = this.getConfig(activeRoomState);
-    const rakeAmount = 0; // cfg.globalRakePct > 0 ? Math.floor((totalWon * cfg.globalRakePct) / 100) : 0; (Désactivé en mode virtuel)
-    const netWon = totalWon - rakeAmount;
-    winner.capital += netWon;
-    winner.score = winner.capital;
-    gs.pot = 0;
-
-    // Check eliminations (capital < baseBet)
     let nonEliminatedCount = 0;
     let lastStandingPlayer: Player | null = null;
 
-    (gs.players || []).forEach((p) => {
-      if (p.capital < gs.baseBet) {
-        p.isEliminated = true;
-      } else {
+    (gs.players || []).forEach((p, idx) => {
+      p.capital = payout.capitals[idx];
+      p.score = payout.capitals[idx];
+      p.isEliminated = payout.eliminated[idx];
+      if (!p.isEliminated) {
         nonEliminatedCount++;
         lastStandingPlayer = p;
       }
-      p.score = p.capital;
     });
+    gs.pot = 0;
 
     // Check if Manche Over (only 1 player remaining with chips)
     if (nonEliminatedCount <= 1 && lastStandingPlayer) {
@@ -2031,40 +2002,31 @@ export class ServerGameEngine {
 
       // Après forfaits, le joueur restant gagne le pot en victoire STANDARD (multiplicateur 1)
       const partieWinType: PartieWinType = 'STANDARD';
-      const multiplier = 1;
+      const cfg = this.getConfig(activeRoomState);
 
-      // Collect penalties from folded losers to prevent tactical fold evasion
-      const extraCostPerLoser = (multiplier - 1) * gs.baseBet;
-      let totalExtraCollected = 0;
-
-      (gs.players || []).forEach((p, idx) => {
-        if (p.isEliminated || idx === winnerIndex) return;
-        const actualPenalty = Math.min(p.capital, extraCostPerLoser);
-        totalExtraCollected += actualPenalty;
-        p.capital = Math.max(0, p.capital - actualPenalty);
-        p.score = p.capital;
+      const payout = applyPartiePayout({
+        capitals: (gs.players || []).map((p) => p.capital),
+        isEliminated: (gs.players || []).map((p) => p.isEliminated || p.isForfeit),
+        winnerIndex,
+        pot: gs.pot,
+        baseBet: gs.baseBet,
+        multiplier: 1,
+        rakePct: 0,
       });
 
-      const cfg = this.getConfig(activeRoomState);
-      const rawPotWon = gs.pot + totalExtraCollected;
-      const rakeAmount = 0; // cfg.globalRakePct > 0 ? Math.floor((rawPotWon * cfg.globalRakePct) / 100) : 0; (Désactivé en mode virtuel)
-      const potWon = rawPotWon - rakeAmount;
-      soleWinner.capital += potWon;
-      soleWinner.score = soleWinner.capital;
-      gs.pot = 0;
-
-      // Check eliminations
       let nonEliminatedCount = 0;
       let lastStandingPlayer: Player | null = null;
-      (gs.players || []).forEach((p) => {
-        if (p.capital < gs.baseBet) {
-          p.isEliminated = true;
-        } else {
+      (gs.players || []).forEach((p, idx) => {
+        p.capital = payout.capitals[idx];
+        p.score = payout.capitals[idx];
+        p.isEliminated = payout.eliminated[idx];
+        if (!p.isEliminated) {
           nonEliminatedCount++;
           lastStandingPlayer = p;
         }
-        p.score = p.capital;
       });
+      const potWon = payout.winnerReceived;
+      gs.pot = 0;
 
       const isMancheOver = nonEliminatedCount <= 1;
       gs.phase = isMancheOver ? 'MANCHE_OVER' : 'PARTIE_OVER';
@@ -2103,7 +2065,7 @@ export class ServerGameEngine {
         playersSummary: (gs.players || []).map((p) => ({
           id: p.id,
           name: p.name,
-          deltaCapital: p.id === soleWinner.id ? potWon - gs.baseBet : -(gs.baseBet + (multiplier > 1 ? extraCostPerLoser : 0)),
+          deltaCapital: p.id === soleWinner.id ? potWon - gs.baseBet : -gs.baseBet,
           finalCapital: p.capital,
         })),
       };

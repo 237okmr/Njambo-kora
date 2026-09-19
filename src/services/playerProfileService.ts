@@ -40,10 +40,52 @@ import {
   computeEventMasteryScore,
   computeMasteryScoreFromStats,
   getDoualaDateKey,
+  getDoualaDayIndex,
   formatMasteryScore,
 } from './masteryConfig';
 
 export { DEFAULT_PLAYER_STATS, DEFAULT_PLAYER_FAIR_PLAY };
+
+export function mergeSoloDaily(
+  d1?: { day: number; points: number },
+  d2?: { day: number; points: number }
+): { day: number; points: number } | undefined {
+  if (!d1) return d2;
+  if (!d2) return d1;
+  if (d1.day > d2.day) return d1;
+  if (d2.day > d1.day) return d2;
+  return { day: d1.day, points: Math.max(d1.points || 0, d2.points || 0) };
+}
+
+function computeAwardedSoloMastery(
+  potentialMastery: number,
+  profile: PlayerProfile,
+  history: PlayerGameHistoryItem[]
+): { awarded: number; soloDaily: { day: number; points: number } } {
+  const today = getDoualaDayIndex(Date.now());
+  let alreadyAwarded = 0;
+
+  if (profile.soloDaily && typeof profile.soloDaily.day === 'number') {
+    alreadyAwarded = profile.soloDaily.day === today ? (profile.soloDaily.points || 0) : 0;
+  } else {
+    // Initialisation fallback pour profil existant sans soloDaily
+    const todayKey = getDoualaDateKey(Date.now());
+    alreadyAwarded = history
+      .filter((h) => h.mode === 'SOLO' && getDoualaDateKey(h.createdAt) === todayKey)
+      .reduce((sum, h) => sum + (h.masteryPointsAwarded || 0), 0);
+  }
+
+  const cap = MASTERY_CONFIG.rules.dailySoloPointsCap; // 30
+  let awarded = 0;
+  if (potentialMastery > 0 && alreadyAwarded < cap) {
+    awarded = Math.min(potentialMastery, Math.max(0, cap - alreadyAwarded));
+  }
+
+  return {
+    awarded,
+    soloDaily: { day: today, points: alreadyAwarded + awarded },
+  };
+}
 
 const PROFILE_KEY = 'njambo_player_profile_v1';
 const HISTORY_KEY = 'njambo_player_history_v1';
@@ -401,6 +443,9 @@ export const playerProfileService = {
             isGuest: parsed.isGuest !== false,
             chips: typeof parsed.chips === 'number' && !isNaN(parsed.chips) ? parsed.chips : fallbackChips,
             stats: finalStats,
+            scoreVersion: parsed.scoreVersion,
+            chipsFixVersion: parsed.chipsFixVersion,
+            soloDaily: parsed.soloDaily,
             fairPlay: mergedFairPlay,
             honorificTitleId: parsed.honorificTitleId || 'APPRENTI',
             createdAt: typeof parsed.createdAt === 'number' ? parsed.createdAt : Date.now(),
@@ -779,18 +824,12 @@ export const playerProfileService = {
 
     // Apply daily solo cap (30 pts Douala date)
     let partieMasteryAwarded = 0;
-    if (params.mode === 'SOLO' && potentialMastery > 0) {
-      const todayKey = getDoualaDateKey(Date.now());
-      const todaySoloAwarded = history
-        .filter((h) => h.mode === 'SOLO' && getDoualaDateKey(h.createdAt) === todayKey)
-        .reduce((sum, h) => sum + (h.masteryPointsAwarded || 0), 0);
+    let updatedSoloDaily = profile.soloDaily;
 
-      const cap = MASTERY_CONFIG.rules.dailySoloPointsCap; // 30
-      if (todaySoloAwarded < cap) {
-        partieMasteryAwarded = Math.min(potentialMastery, cap - todaySoloAwarded);
-      } else {
-        partieMasteryAwarded = 0;
-      }
+    if (params.mode === 'SOLO' && potentialMastery > 0) {
+      const res = computeAwardedSoloMastery(potentialMastery, profile, history);
+      partieMasteryAwarded = res.awarded;
+      updatedSoloDaily = res.soloDaily;
     } else {
       partieMasteryAwarded = potentialMastery;
     }
@@ -814,6 +853,7 @@ export const playerProfileService = {
       chips: newChips,
       stats,
       fairPlay,
+      soloDaily: updatedSoloDaily,
       honorificTitleId: currentTitle.id,
       updatedAt: Date.now(),
     };
@@ -987,18 +1027,12 @@ export const playerProfileService = {
     }
 
     let gameMasteryAwarded = 0;
-    if (item.mode === 'SOLO' && potentialMastery > 0) {
-      const todayKey = getDoualaDateKey(Date.now());
-      const todaySoloAwarded = history
-        .filter((h) => h.mode === 'SOLO' && getDoualaDateKey(h.createdAt) === todayKey)
-        .reduce((sum, h) => sum + (h.masteryPointsAwarded || 0), 0);
+    let updatedSoloDaily = profile.soloDaily;
 
-      const cap = MASTERY_CONFIG.rules.dailySoloPointsCap; // 30
-      if (todaySoloAwarded < cap) {
-        gameMasteryAwarded = Math.min(potentialMastery, cap - todaySoloAwarded);
-      } else {
-        gameMasteryAwarded = 0;
-      }
+    if (item.mode === 'SOLO' && potentialMastery > 0) {
+      const res = computeAwardedSoloMastery(potentialMastery, profile, history);
+      gameMasteryAwarded = res.awarded;
+      updatedSoloDaily = res.soloDaily;
     } else {
       gameMasteryAwarded = potentialMastery;
     }
@@ -1020,6 +1054,7 @@ export const playerProfileService = {
       ...profile,
       stats,
       fairPlay,
+      soloDaily: updatedSoloDaily,
       honorificTitleId: currentTitle.id,
       updatedAt: Date.now(),
     };
@@ -1333,8 +1368,16 @@ export const playerProfileService = {
         ...profileData,
         chips: resolvedChips,
         stats: finalConsolidatedStats,
+        soloDaily: mergeSoloDaily(profileData.soloDaily, localProfile.soloDaily),
       };
       this.saveLocalProfile(updatedProfile);
+
+      // Trigger retroactive solo fortune migration if not yet executed for this profile
+      if (profileData && profileData.chipsFixVersion !== 1) {
+        this.migrateSoloFortuneHistory(updatedProfile, userId).catch((err) => {
+          console.warn('[PlayerProfileService] migrateSoloFortuneHistory error:', err);
+        });
+      }
 
       // Save consolidated stats back to Firestore for authenticated users to ensure permanent server-side correctness
       if (profileData.isGuest === false) {
@@ -1487,7 +1530,7 @@ export const playerProfileService = {
           if (h.recordType === 'PARTIE') {
             eventPotential = computeEventMasteryScore({
               mode: h.mode,
-              difficulty: h.aiDifficulty,
+              difficulty: h.difficulty ?? h.aiDifficulty,
               partiesWon: 1,
               koras: h.winType === 'KORA' ? 1 : 0,
               doubleKoras: h.winType === 'DOUBLE_KORA' ? 1 : 0,
@@ -1495,7 +1538,7 @@ export const playerProfileService = {
           } else if (h.isMancheFinalWin === true || h.isMancheOver || !h.recordType) {
             eventPotential = computeEventMasteryScore({
               mode: h.mode,
-              difficulty: h.aiDifficulty,
+              difficulty: h.difficulty ?? h.aiDifficulty,
               isMancheWinner: true,
               isForfeitWin: h.winType === 'FORFEIT',
               koras: h.winType === 'KORA' ? 1 : 0,
@@ -1659,6 +1702,8 @@ export const playerProfileService = {
       fairPlay: mergedFairPlay,
       honorificTitleId: currentTitle.id,
       scoreVersion: targetScoreVersion,
+      chipsFixVersion: cloudProfile?.chipsFixVersion || guestProfile?.chipsFixVersion,
+      soloDaily: mergeSoloDaily(cloudProfile?.soloDaily, guestProfile?.soloDaily),
       guestMergedAt,
       createdAt: cloudProfile?.createdAt || guestProfile.createdAt || Date.now(),
       updatedAt: Date.now(),
@@ -2003,6 +2048,137 @@ export const playerProfileService = {
     }
 
     return updatedProfile;
+  },
+
+  isChipsFixRunning: false,
+
+  /**
+   * Lot 4 - F: Migration rétroactive de la Fortune solo basée sur les gains réels des Koras.
+   * Exécutée une seule fois par profil (chipsFixVersion = 1), protégée par un verrou contre les exécutions concourantes.
+   */
+  async migrateSoloFortuneHistory(profileParam?: PlayerProfile, targetUserId?: string): Promise<boolean> {
+    if (this.isChipsFixRunning) return false;
+
+    const profile = profileParam || this.getLocalProfile();
+    if (profile.chipsFixVersion === 1) return false;
+
+    this.isChipsFixRunning = true;
+    try {
+      const uid = targetUserId || (auth?.currentUser ? auth.currentUser.uid : (profile.isGuest ? undefined : profile.uid));
+      let historyItems: PlayerGameHistoryItem[] = [];
+
+      if (uid && db && !profile.isGuest) {
+        try {
+          const histQuery = query(
+            collection(db, 'users', uid, 'history'),
+            orderBy('createdAt', 'desc'),
+            limit(1000)
+          );
+          const histSnap = await getDocs(histQuery);
+          historyItems = histSnap.docs.map((d) => d.data() as PlayerGameHistoryItem);
+        } catch (err) {
+          console.warn('[PlayerProfileService] Error fetching cloud history for solo fortune migration:', err);
+        }
+      }
+
+      if (historyItems.length === 0) {
+        historyItems = this.getLocalHistory();
+      }
+
+      let C = 0;
+      let itemsCorrectedCount = 0;
+      const modifiedHistoryItems: PlayerGameHistoryItem[] = [];
+
+      for (const h of historyItems) {
+        if (
+          h.recordType === 'PARTIE' &&
+          h.mode === 'SOLO' &&
+          (h.winType === 'KORA' || h.winType === 'DOUBLE_KORA') &&
+          !h.chipsFix
+        ) {
+          const m = h.winType === 'DOUBLE_KORA' ? 4 : 2;
+          const b = h.baseBet || 50;
+          const n = h.playerCount || 2;
+          const isWinner = Boolean(h.isWinner);
+
+          const newValue = isWinner ? m * b * (n - 1) : -m * b;
+          const recordedNet = typeof h.netChipsDelta === 'number' ? h.netChipsDelta : 0;
+          const ecart = newValue - recordedNet;
+
+          C += ecart;
+          itemsCorrectedCount++;
+
+          const updatedItem: PlayerGameHistoryItem = {
+            ...h,
+            netChipsDelta: newValue,
+            chipsFix: 1,
+          };
+          modifiedHistoryItems.push(updatedItem);
+        }
+      }
+
+      const currentStats: PlayerStats = { ...DEFAULT_PLAYER_STATS, ...(profile.stats || {}) };
+      if (itemsCorrectedCount > 0 && C !== 0) {
+        if (C < 0) {
+          currentStats.soloPertes = (currentStats.soloPertes || 0) + Math.abs(C);
+        } else if (C > 0) {
+          currentStats.soloGains = (currentStats.soloGains || 0) + C;
+        }
+        currentStats.soloFortune = (currentStats.soloGains || 0) - (currentStats.soloPertes || 0);
+      }
+
+      const updatedProfile: PlayerProfile = {
+        ...profile,
+        stats: currentStats,
+        chipsFixVersion: 1,
+        updatedAt: Date.now(),
+      };
+
+      // Save local profile and updated history
+      this.saveLocalProfile(updatedProfile);
+
+      if (modifiedHistoryItems.length > 0) {
+        const localHist = this.getLocalHistory();
+        const localMap = new Map<string, PlayerGameHistoryItem>();
+        localHist.forEach((item) => localMap.set(item.id, item));
+        modifiedHistoryItems.forEach((item) => localMap.set(item.id, item));
+        this.saveLocalHistory(Array.from(localMap.values()).slice(0, 100));
+      }
+
+      // Sync to Firestore if authenticated
+      if (uid && db && !profile.isGuest) {
+        try {
+          const userRef = doc(db, 'users', uid);
+          await setDoc(
+            userRef,
+            {
+              stats: currentStats,
+              chipsFixVersion: 1,
+              updatedAt: Date.now(),
+            },
+            { merge: true }
+          );
+
+          // Batch update history items safely (max 400 items per batch)
+          for (let i = 0; i < modifiedHistoryItems.length; i += 400) {
+            const batchChunk = modifiedHistoryItems.slice(i, i + 400);
+            for (const item of batchChunk) {
+              const itemRef = doc(db, 'users', uid, 'history', item.id);
+              await setDoc(itemRef, { netChipsDelta: item.netChipsDelta, chipsFix: 1 }, { merge: true });
+            }
+          }
+        } catch (err) {
+          console.warn('[PlayerProfileService] Error syncing solo fortune migration to Firestore:', err);
+        }
+      }
+
+      console.log(
+        `[PlayerProfileService] Solo fortune migration completed: ${itemsCorrectedCount} items corrected, adjustment C = ${C}.`
+      );
+      return true;
+    } finally {
+      this.isChipsFixRunning = false;
+    }
   },
 };
 

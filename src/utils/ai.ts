@@ -99,15 +99,25 @@ export function getRandomBotProfiles(count: number = 3, hokutoSpawnRatePct?: num
 
   if (includeRobam && robamProfile) {
     selected.push(robamProfile);
-    const shuffledOthers = [...otherProfiles].sort(() => Math.random() - 0.5);
+    const shuffledOthers = fisherYatesShuffle(otherProfiles);
     selected.push(...shuffledOthers.slice(0, safeCount - 1));
   } else {
-    const shuffledAll = [...ALL_BOT_PROFILES].sort(() => Math.random() - 0.5);
+    const shuffledAll = fisherYatesShuffle(ALL_BOT_PROFILES);
     selected = shuffledAll.slice(0, safeCount);
   }
 
   // Shuffle selected array so Robam Hokuto isn't always in the first bot position
-  return selected.sort(() => Math.random() - 0.5);
+  return fisherYatesShuffle(selected);
+}
+
+/** Fisher-Yates shuffle algorithm for unbiased array randomisation */
+export function fisherYatesShuffle<T>(array: T[]): T[] {
+  const result = [...array];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
 }
 
 export const STANDARD_BOT_STRATEGIES: AIStrategy[] = [
@@ -160,6 +170,16 @@ export function getHumanProfile(): HumanProfile {
   return globalHumanProfile;
 }
 
+interface HumanPlayRecord {
+  id: string;
+  isEarlyAggression: boolean;
+  isLateHoarding: boolean;
+}
+
+const countedPlayIds = new Set<string>();
+const recentHumanPlayRecords: HumanPlayRecord[] = [];
+const trackedKoraAttemptManches = new Set<string>();
+
 export function updateHumanProfileFromGame(
   tricksHistory: Trick[] = [],
   currentPlays: PlayedCard[] = [],
@@ -171,40 +191,69 @@ export function updateHumanProfileFromGame(
   const humanIndex = players.findIndex((p) => p.id === humanPlayer.id);
   if (humanIndex === -1) return globalHumanProfile;
 
-  let earlyAgg = 0;
-  let lateHoard = 0;
-  let totalCards = 0;
+  // 1. Process completed tricks in tricksHistory
+  tricksHistory.forEach((trick) => {
+    const trickNo = trick.trickNumber;
+    (trick.plays || []).forEach((p) => {
+      if (p.playerIndex === humanIndex) {
+        const playId = `trick_${trickNo}_card_${p.card.id}`;
+        if (!countedPlayIds.has(playId)) {
+          countedPlayIds.add(playId);
+          recentHumanPlayRecords.push({
+            id: playId,
+            isEarlyAggression: trickNo <= 2 && p.card.value >= 8,
+            isLateHoarding: trickNo >= 4 && p.card.value >= 8,
+          });
+          if (recentHumanPlayRecords.length > 60) {
+            const removed = recentHumanPlayRecords.shift();
+            if (removed) countedPlayIds.delete(removed.id);
+          }
+        }
+      }
+    });
+  });
 
-  const allPlaysSoFar = [
-    ...tricksHistory.flatMap((t) => t.plays || []),
-    ...currentPlays,
-  ];
-
-  allPlaysSoFar.forEach((p) => {
+  // 2. Process current in-progress trick plays
+  const currentTrickNo = tricksHistory.length + 1;
+  currentPlays.forEach((p) => {
     if (p.playerIndex === humanIndex) {
-      totalCards++;
-      const foundTrick = tricksHistory.find((t) => (t.plays || []).includes(p));
-      const trickNo = foundTrick ? foundTrick.trickNumber : (tricksHistory.length + 1);
-
-      if (trickNo <= 2 && p.card.value >= 8) {
-        earlyAgg++;
-      } else if (trickNo >= 4 && p.card.value >= 8) {
-        lateHoard++;
+      const playId = `trick_${currentTrickNo}_card_${p.card.id}`;
+      if (!countedPlayIds.has(playId)) {
+        countedPlayIds.add(playId);
+        recentHumanPlayRecords.push({
+          id: playId,
+          isEarlyAggression: currentTrickNo <= 2 && p.card.value >= 8,
+          isLateHoarding: currentTrickNo >= 4 && p.card.value >= 8,
+        });
+        if (recentHumanPlayRecords.length > 60) {
+          const removed = recentHumanPlayRecords.shift();
+          if (removed) countedPlayIds.delete(removed.id);
+        }
       }
     }
   });
 
-  if (totalCards > 0) {
-    globalHumanProfile.totalPlays += totalCards;
-    globalHumanProfile.earlyAggressionPlays += earlyAgg;
-    globalHumanProfile.lateHoardingPlays += lateHoard;
-
-    const earlyRate = globalHumanProfile.earlyAggressionPlays / Math.max(1, globalHumanProfile.totalPlays);
-    const lateRate = globalHumanProfile.lateHoardingPlays / Math.max(1, globalHumanProfile.totalPlays);
-
-    if (humanPlayer.tricksWonInRound >= 2) {
-      globalHumanProfile.koraAttempts++;
+  // 3. Track manche where human won both trick 1 and trick 2 (Kora attempt), once per manche
+  if (tricksHistory.length >= 2) {
+    const t1 = tricksHistory[0];
+    const t2 = tricksHistory[1];
+    if (t1 && t2 && t1.winnerIndex === humanIndex && t2.winnerIndex === humanIndex) {
+      const mancheKey = `manche_${t1.plays[0]?.card.id || '1'}`;
+      if (!trackedKoraAttemptManches.has(mancheKey)) {
+        trackedKoraAttemptManches.add(mancheKey);
+        globalHumanProfile.koraAttempts++;
+      }
     }
+  }
+
+  // 4. Update globalHumanProfile stats from sliding window (max 60 plays)
+  globalHumanProfile.totalPlays = recentHumanPlayRecords.length;
+  globalHumanProfile.earlyAggressionPlays = recentHumanPlayRecords.filter((r) => r.isEarlyAggression).length;
+  globalHumanProfile.lateHoardingPlays = recentHumanPlayRecords.filter((r) => r.isLateHoarding).length;
+
+  if (globalHumanProfile.totalPlays > 0) {
+    const earlyRate = globalHumanProfile.earlyAggressionPlays / globalHumanProfile.totalPlays;
+    const lateRate = globalHumanProfile.lateHoardingPlays / globalHumanProfile.totalPlays;
 
     if (earlyRate > 0.35) {
       globalHumanProfile.style = 'EARLY_AGGRESSIVE';

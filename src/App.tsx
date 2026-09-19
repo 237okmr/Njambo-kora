@@ -945,11 +945,26 @@ function GameApp() {
   const activeMancheSessionIdRef = useRef<string | null>(null);
   const mancheStartTimestampRef = useRef<number>(Date.now());
   const lastRecordedPartieKeyRef = useRef<string | null>(null);
+  const humanCapitalAtDealStartRef = useRef<number | null>(null);
+  const betAtDealStartRef = useRef<number | null>(null);
+  const prevPhaseRef = useRef<string | null>(null);
 
   useEffect(() => {
     const phase = activeGameState.phase;
+    const prevPhase = prevPhaseRef.current;
     const mode = isOnlineActive ? 'MULTIPLAYER' : 'SOLO';
     const roomId = isOnlineActive ? (multiplayerRoom?.id || 'online_room') : 'solo_game';
+
+    // Memorize human player capital and bet at deal start in solo mode
+    if (!isOnlineActive && phase === 'DEALING') {
+      const humanP = (activeGameState.players || []).find(
+        (p: any) => p.isHuman || p.id === 'p1' || p.id === localPlayerId
+      );
+      if (humanP && typeof humanP.capital === 'number') {
+        humanCapitalAtDealStartRef.current = humanP.capital;
+        betAtDealStartRef.current = activeGameState.baseBet || 50;
+      }
+    }
 
     // 1. Initialisation de la Manche au lancement (status: 'in_progress')
     if (currentScreen === 'GAME' && (phase === 'DEALING' || phase === 'PLAYING')) {
@@ -1019,7 +1034,8 @@ function GameApp() {
         Math.round((Date.now() - (mancheStartTimestampRef.current || Date.now() - 48000)) / 1000)
       );
 
-      const recordKey = `${mode}_${roomId}_p${partieCount}_${winnerIdx}_${winType}_${phase}`;
+      const mancheKeySegment = activeMancheSessionIdRef.current || (isOnlineActive ? `m_${roomId}` : 'm_solo');
+      const recordKey = `${mode}_${mancheKeySegment}_p${partieCount}_${winnerIdx}_${winType}_${phase}`;
       if (lastRecordedPartieKeyRef.current !== recordKey) {
         lastRecordedPartieKeyRef.current = recordKey;
 
@@ -1067,35 +1083,67 @@ function GameApp() {
             console.warn('[App] Telemetry auto-record warning:', err);
           });
 
-        // Lot 3 : Synchronisation durable des soldes de jetons et historique de la partie
-        const humanPlayerRecord = (activeGameState.players || []).find((p: any) => p.isHuman || p.id === localPlayerId || p.id === 'p1');
-        const isHumanEliminated = Boolean(humanPlayerRecord && (humanPlayerRecord.isEliminated || (humanPlayerRecord.capital !== undefined && humanPlayerRecord.capital < baseBetValue)));
+        const humanPlayerRecord = (activeGameState.players || []).find(
+          (p: any) => p.isHuman || p.id === localPlayerId || p.id === 'p1' || p.id === 'human'
+        );
 
-        const isLocalWinner = !isHumanEliminated && (isOnlineActive
+        // Lot 4 - C: Détection gagnant en solo basée sur isHuman de l'indice gagnant
+        const isLocalWinner = isOnlineActive
           ? Boolean(
               (winnerId && winnerId === localPlayerId) ||
-              (winnerIdx !== null && winnerIdx !== undefined && activeGameState.players[winnerIdx]?.id === localPlayerId) ||
+              (winnerIdx !== null && winnerIdx !== undefined && activeGameState.players?.[winnerIdx]?.id === localPlayerId) ||
               (winnerName && (winnerName === localPlayerName || winnerName === (localStorage.getItem('njambo_player_name') || 'Joueur')))
             )
           : Boolean(
-              (winnerIdx !== null && winnerIdx !== undefined && activeGameState.players[winnerIdx]?.isHuman === true) ||
-              (winnerId === 'p1') ||
-              (winnerName && (
-                winnerName === 'Vous' ||
-                winnerName === 'Joueur (Vous)' ||
-                winnerName === (localStorage.getItem('njambo_player_name') || 'Joueur')
-              ))
-            ));
-
-        let winMultiplier = 1;
-        if (winType === 'DOUBLE_KORA') winMultiplier = 4;
-        else if (winType === 'KORA') winMultiplier = 2;
+              winnerIdx !== null && winnerIdx !== undefined && activeGameState.players?.[winnerIdx]?.isHuman === true
+            );
 
         const effectiveBaseBet = baseBetValue;
-        const totalPotAttributed = effectivePot * winMultiplier;
-        const netDelta = isLocalWinner
-          ? totalPotAttributed - effectiveBaseBet
-          : -effectiveBaseBet;
+        let totalPotAttributed = 0;
+        let netDelta = 0;
+
+        if (isOnlineActive) {
+          // Multijoueur inchangé
+          let winMultiplier = 1;
+          if (winType === 'DOUBLE_KORA') winMultiplier = 4;
+          else if (winType === 'KORA') winMultiplier = 2;
+
+          totalPotAttributed = effectivePot * winMultiplier;
+          netDelta = isLocalWinner
+            ? totalPotAttributed - effectiveBaseBet
+            : -effectiveBaseBet;
+        } else {
+          // Lot 4 - A: Jetons exacts en solo
+          const finalHumanCapital = humanPlayerRecord?.capital ?? 0;
+          if (
+            humanCapitalAtDealStartRef.current !== null &&
+            humanCapitalAtDealStartRef.current !== undefined &&
+            betAtDealStartRef.current !== null &&
+            betAtDealStartRef.current !== undefined
+          ) {
+            const initialCapital = humanCapitalAtDealStartRef.current;
+            const dealBet = betAtDealStartRef.current;
+            const grossReceived = finalHumanCapital - initialCapital;
+            netDelta = finalHumanCapital - (initialCapital + dealBet);
+            totalPotAttributed = isLocalWinner ? Math.max(0, grossReceived) : 0;
+          } else {
+            // Fallback si ref non mémorisée
+            if (winType === 'KORA' || winType === 'DOUBLE_KORA') {
+              const m = winType === 'DOUBLE_KORA' ? 4 : 2;
+              netDelta = isLocalWinner
+                ? m * effectiveBaseBet * (playerCount - 1)
+                : -m * effectiveBaseBet;
+              totalPotAttributed = isLocalWinner ? (netDelta + effectiveBaseBet) : 0;
+            } else {
+              totalPotAttributed = isLocalWinner ? effectivePot : 0;
+              netDelta = isLocalWinner ? (effectivePot - effectiveBaseBet) : -effectiveBaseBet;
+            }
+          }
+        }
+
+        // Reset solo deal start refs
+        humanCapitalAtDealStartRef.current = null;
+        betAtDealStartRef.current = null;
 
         const opponentsList = (activeGameState.players || [])
           .filter((p: any) => p.id !== localPlayerId && p.name !== 'Vous')
@@ -1109,25 +1157,31 @@ function GameApp() {
 
         const localTricks = activeGameState.players?.find((p: any) => p.id === localPlayerId || p.name === 'Vous')?.tricksWonInRound || 0;
 
-        recordPartieResult({
-          mode,
-          partieNumber: partieCount,
-          playerCount,
-          winType: (winType as any) || 'STANDARD',
-          isWinner: isLocalWinner,
-          winnerName,
-          winnerId,
-          potWon: totalPotAttributed,
-          netChipsDelta: netDelta,
-          baseBet: effectiveBaseBet,
-          durationSeconds,
-          opponents: opponentsList,
-          tricksWon: localTricks,
-          roomId: isOnlineActive ? roomId : undefined,
-          difficulty: mode === 'SOLO' ? (activeGameState.aiDifficulty || gameState.aiDifficulty) : undefined,
-        }).catch((err) => {
-          console.warn('[App] recordPartieResult warning:', err);
-        });
+        // Lot 4 - B: Ne pas rappeler recordPartieResult si la donne a déjà été enregistrée à PARTIE_OVER
+        const isSolo = !isOnlineActive;
+        const shouldRecordPartie = !isSolo || (prevPhase === 'DEALING' || prevPhase === 'PLAYING' || prevPhase === null);
+
+        if (shouldRecordPartie) {
+          recordPartieResult({
+            mode,
+            partieNumber: partieCount,
+            playerCount,
+            winType: (winType as any) || 'STANDARD',
+            isWinner: isLocalWinner,
+            winnerName,
+            winnerId,
+            potWon: totalPotAttributed,
+            netChipsDelta: netDelta,
+            baseBet: effectiveBaseBet,
+            durationSeconds,
+            opponents: opponentsList,
+            tricksWon: localTricks,
+            roomId: isOnlineActive ? roomId : undefined,
+            difficulty: mode === 'SOLO' ? (activeGameState.aiDifficulty || gameState.aiDifficulty) : undefined,
+          }).catch((err) => {
+            console.warn('[App] recordPartieResult warning:', err);
+          });
+        }
 
         if (isCompleted) {
           recordGameResult({
@@ -1155,6 +1209,8 @@ function GameApp() {
         }
       }
     }
+
+    prevPhaseRef.current = phase;
   }, [
     currentScreen,
     isOnlineActive,

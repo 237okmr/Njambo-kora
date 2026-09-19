@@ -32,6 +32,7 @@ import {
 import { sounds, triggerHaptic } from '../utils/sound';
 import { getKatikaConfigSync, subscribeKatikaConfig } from '../katika/services/katikaService';
 import { KatikaGameConfig } from '../katika/types/katika';
+import { computePartieOutcome, applyPartiePayout, detectInstantWin } from '../utils/gameRules';
 
 export const ALL_AI_POOL = ALL_BOT_PROFILES;
 
@@ -244,10 +245,20 @@ export function useSoloGameEngine({
     gameStateRef.current = gameState;
   }, [gameState]);
 
+  const gameSpeedRef = useRef<GameSpeed>(gameSpeed);
+  useEffect(() => {
+    gameSpeedRef.current = gameSpeed;
+  }, [gameSpeed]);
+
+  const katikaConfigRef = useRef<KatikaGameConfig>(katikaConfig);
+  useEffect(() => {
+    katikaConfigRef.current = katikaConfig;
+  }, [katikaConfig]);
+
   // Speed multiplier helper for timeouts
   const getDelay = useCallback((baseMs: number) => {
-    return Math.round(baseMs / gameSpeed);
-  }, [gameSpeed]);
+    return Math.round(baseMs / gameSpeedRef.current);
+  }, []);
 
   const toggleGameSpeed = useCallback(() => {
     setGameSpeed((prev) => {
@@ -316,13 +327,13 @@ export function useSoloGameEngine({
       dealerIndex: number,
       currentPlayers: Player[],
       partieNumber: number,
-      currentBet: number = gameState.baseBet,
-      currentCap: number = gameState.initialCapital,
+      currentBet: number = gameStateRef.current.baseBet,
+      currentCap: number = gameStateRef.current.initialCapital,
       enableDoubleKoraOpt: boolean = true,
       enableUnder21Opt: boolean = true,
-      showBotIconsOpt: boolean = gameState.showBotPersonalityIcons,
-      enableKoraHunterAlertsOpt: boolean = gameState.enableKoraHunterAlerts,
-      aiDifficultyOpt: AIDifficulty = gameState.aiDifficulty || 'NORMAL',
+      showBotIconsOpt: boolean = gameStateRef.current.showBotPersonalityIcons,
+      enableKoraHunterAlertsOpt: boolean = gameStateRef.current.enableKoraHunterAlerts,
+      aiDifficultyOpt: AIDifficulty = gameStateRef.current.aiDifficulty || 'NORMAL',
       soloBetIncreaseModeOpt?: SoloBetIncreaseMode
     ) => {
       if (instantWinTimerRef.current) clearTimeout(instantWinTimerRef.current);
@@ -333,21 +344,23 @@ export function useSoloGameEngine({
 
       const effectiveMode: SoloBetIncreaseMode =
         soloBetIncreaseModeOpt ??
-        gameState.soloBetIncreaseMode ??
+        gameStateRef.current.soloBetIncreaseMode ??
         (localStorage.getItem('njambo_solo_bet_increase_mode') as SoloBetIncreaseMode) ??
         'souverain';
       localStorage.setItem('njambo_solo_bet_increase_mode', effectiveMode);
 
       let effectiveBet = currentBet;
-      const initialBet = gameState.initialBaseBet || currentBet;
+      const initialBet = partieNumber === 1 ? currentBet : (gameStateRef.current.initialBaseBet || currentBet);
+
+      const currentKatikaCfg = katikaConfigRef.current;
 
       // Auto stake escalation (Anti-stagnation) - strictly disabled in souverain mode
-      if (effectiveMode !== 'souverain' && katikaConfig.enableAutoBetEscalation !== false && partieNumber > 1) {
-        const interval = katikaConfig.autoBetEscalationInterval || 5;
+      if (effectiveMode !== 'souverain' && currentKatikaCfg.enableAutoBetEscalation !== false && partieNumber > 1) {
+        const interval = currentKatikaCfg.autoBetEscalationInterval || 5;
         if ((partieNumber - 1) % interval === 0) {
-          const maxMultiplier = katikaConfig.maxAutoBetMultiplier || 4;
+          const maxMultiplier = currentKatikaCfg.maxAutoBetMultiplier || 4;
           const maxAllowedBet = initialBet * maxMultiplier;
-          const ratePct = (katikaConfig.autoBetEscalationRatePct || 50) / 100;
+          const ratePct = (currentKatikaCfg.autoBetEscalationRatePct || 50) / 100;
           const increaseStep = Math.max(5, Math.round(currentBet * ratePct));
           const targetBet = currentBet + increaseStep;
 
@@ -362,16 +375,28 @@ export function useSoloGameEngine({
         }
       }
 
-      const activePlayers = currentPlayers.filter(
+      // Filter & mark players who cannot pay ante as eliminated
+      const updatedCapitalPlayers = currentPlayers.map((p) => {
+        if (!p.isEliminated && p.capital < effectiveBet) {
+          return { ...p, isEliminated: true };
+        }
+        return p;
+      });
+
+      const activePlayers = updatedCapitalPlayers.filter(
         (p) => !p.isEliminated && p.capital >= effectiveBet
       );
 
-      if (activePlayers.length <= 1) {
-        const survivor = activePlayers[0] || [...currentPlayers].sort((a, b) => b.capital - a.capital)[0];
-        const survivorIndex = currentPlayers.findIndex((p) => p.id === survivor.id);
+      const humanPlayer = updatedCapitalPlayers.find((p) => p.isHuman);
+      const isHumanEliminated = !humanPlayer || humanPlayer.isEliminated;
+
+      if (activePlayers.length <= 1 || isHumanEliminated) {
+        const survivor = activePlayers[0] || [...updatedCapitalPlayers].sort((a, b) => b.capital - a.capital)[0];
+        const survivorIndex = updatedCapitalPlayers.findIndex((p) => p.id === survivor.id);
 
         setGameState((prev) => ({
           ...prev,
+          players: updatedCapitalPlayers,
           phase: 'MANCHE_OVER',
           mancheWinnerIndex: survivorIndex,
           mancheWinnerName: survivor.name,
@@ -379,7 +404,7 @@ export function useSoloGameEngine({
         return;
       }
 
-      const updatedPlayers = currentPlayers.map((p) => {
+      const updatedPlayers = updatedCapitalPlayers.map((p) => {
         const botStrat = !p.isHuman ? (p.basePersonality || getRandomBotStrategy()) : undefined;
         if (!p.isEliminated && p.capital >= effectiveBet) {
           const newCap = p.capital - effectiveBet;
@@ -546,50 +571,55 @@ export function useSoloGameEngine({
       dealTimerRef.current = setTimeout(() => {
         setIsDealing(false);
 
-        // Instant Win check A: Trois 7 (777)
-        let threeSevensWinnerIdx: number | null = null;
-        playersWithCards.forEach((player, pIdx) => {
-          if (!player.isEliminated && player.hand.length > 0) {
-            const sevensCount = player.hand.filter((card) => card.value === 7).length;
-            if (sevensCount >= 3) {
-              threeSevensWinnerIdx = pIdx;
-            }
-          }
+        // Check Instant Win (THREE_SEVENS or UNDER_21)
+        const instantWin = detectInstantWin({
+          hands: playersWithCards.map((p) => p.hand || []),
+          eligible: playersWithCards.map((p) => !p.isEliminated),
+          dealerIndex: validDealerIdx,
+          enableUnder21: enableUnder21Opt,
         });
 
-        if (threeSevensWinnerIdx !== null) {
-          const winner = playersWithCards[threeSevensWinnerIdx];
+        if (instantWin) {
+          const winnerIdx = instantWin.winnerIndex;
+          const winner = playersWithCards[winnerIdx];
+          const winType = instantWin.winType;
+          const scoreOrCount = winType === 'THREE_SEVENS' ? 3 : winner.hand.reduce((acc, c) => acc + c.value, 0);
+
           setInstantWinReveal({
-            winnerIndex: threeSevensWinnerIdx,
+            winnerIndex: winnerIdx,
             winnerName: winner.name,
-            winType: 'THREE_SEVENS',
+            winType,
             hand: winner.hand,
-            scoreOrCount: 3,
+            scoreOrCount,
           });
           sounds.playCardPlay();
 
           instantWinTimerRef.current = setTimeout(() => {
-            sounds.playThreeSevens();
+            if (winType === 'THREE_SEVENS') {
+              sounds.playThreeSevens();
+            } else {
+              sounds.playUnder21();
+            }
             if (winner.isHuman) {
               triggerHaptic('success');
-              confetti({ particleCount: 140, spread: 85, origin: { y: 0.55 } });
+              confetti({ particleCount: winType === 'THREE_SEVENS' ? 140 : 160, spread: 85, origin: { y: 0.55 } });
             }
 
-            const rawPot = potForThisPartie;
-            const rakePct = 0; // katikaConfig.globalRakePct || 0; (Désactivé en mode virtuel)
-            const rakeAmount = 0; // rakePct > 0 ? Math.floor((rawPot * rakePct) / 100) : 0;
-            const netPot = rawPot - rakeAmount;
+            const payout = applyPartiePayout({
+              capitals: playersWithCards.map((p) => p.capital),
+              isEliminated: playersWithCards.map((p) => p.isEliminated),
+              winnerIndex: winnerIdx,
+              pot: potForThisPartie,
+              baseBet: currentBet,
+              multiplier: 1,
+              rakePct: 0,
+            });
 
-            const playersAfterPot = playersWithCards.map((p, idx) =>
-              idx === threeSevensWinnerIdx
-                ? { ...p, capital: p.capital + netPot, score: p.capital + netPot }
-                : p
-            );
-
-            const evaluatedPlayers = playersAfterPot.map((p) => ({
+            const evaluatedPlayers = playersWithCards.map((p, idx) => ({
               ...p,
-              isEliminated: p.isEliminated || p.capital < currentBet,
-              score: p.capital,
+              capital: payout.capitals[idx],
+              score: payout.capitals[idx],
+              isEliminated: payout.eliminated[idx],
             }));
 
             const remainingActive = evaluatedPlayers.filter((p) => !p.isEliminated);
@@ -609,9 +639,9 @@ export function useSoloGameEngine({
               initialCapital: currentCap,
               enableDoubleKora: enableDoubleKoraOpt,
               enableUnder21: enableUnder21Opt,
-              partieWinnerIndex: threeSevensWinnerIdx,
+              partieWinnerIndex: winnerIdx,
               partieWinnerName: winner.name,
-              partieWinType: 'THREE_SEVENS',
+              partieWinType: winType,
               mancheWinnerIndex: isMancheEnd ? mancheWinnerIdx : null,
               mancheWinnerName: isMancheEnd ? mancheWinnerPlayer.name : null,
               consecutiveThreesCountByPlayer: {},
@@ -619,90 +649,8 @@ export function useSoloGameEngine({
               partieCount: partieNumber,
             }));
             setIsResolvingTrick(false);
-          }, getDelay(katikaConfig.instantWinAnimationTimeMs || 3500));
+          }, getDelay(katikaConfigRef.current.instantWinAnimationTimeMs || 3500));
           return;
-        }
-
-        // Instant Win check B: Moins de 21
-        if (enableUnder21Opt) {
-          let under21WinnerIdx: number | null = null;
-          let lowestSum = 999;
-
-          playersWithCards.forEach((player, pIdx) => {
-            if (!player.isEliminated && player.hand.length === 5) {
-              const handSum = player.hand.reduce((acc, card) => acc + card.value, 0);
-              if (handSum <= 21 && handSum < lowestSum) {
-                lowestSum = handSum;
-                under21WinnerIdx = pIdx;
-              }
-            }
-          });
-
-          if (under21WinnerIdx !== null) {
-            const winner = playersWithCards[under21WinnerIdx];
-            setInstantWinReveal({
-              winnerIndex: under21WinnerIdx,
-              winnerName: winner.name,
-              winType: 'UNDER_21',
-              hand: winner.hand,
-              scoreOrCount: lowestSum,
-            });
-            sounds.playCardPlay();
-
-            instantWinTimerRef.current = setTimeout(() => {
-              sounds.playUnder21();
-              if (winner.isHuman) {
-                triggerHaptic('success');
-                confetti({ particleCount: 160, spread: 90, origin: { y: 0.55 } });
-              }
-
-              const rawPot = potForThisPartie;
-              const rakePct = 0; // katikaConfig.globalRakePct || 0; (Désactivé en mode virtuel)
-              const rakeAmount = 0; // rakePct > 0 ? Math.floor((rawPot * rakePct) / 100) : 0;
-              const netPot = rawPot - rakeAmount;
-
-              const playersAfterPot = playersWithCards.map((p, idx) =>
-                idx === under21WinnerIdx
-                  ? { ...p, capital: p.capital + netPot, score: p.capital + netPot }
-                  : p
-              );
-
-              const evaluatedPlayers = playersAfterPot.map((p) => ({
-                ...p,
-                isEliminated: p.isEliminated || p.capital < currentBet,
-                score: p.capital,
-              }));
-
-              const remainingActive = evaluatedPlayers.filter((p) => !p.isEliminated);
-              const humanIsEliminated = evaluatedPlayers.some((p) => p.isHuman && p.isEliminated);
-              const isMancheEnd = remainingActive.length <= 1 || humanIsEliminated;
-
-              const mancheWinnerPlayer = remainingActive[0] || [...evaluatedPlayers].sort((a, b) => b.capital - a.capital)[0];
-              const mancheWinnerIdx = evaluatedPlayers.findIndex((p) => p.id === mancheWinnerPlayer.id);
-
-              setInstantWinReveal(null);
-              setGameState((prev) => ({
-                ...prev,
-                phase: isMancheEnd ? 'MANCHE_OVER' : 'PARTIE_OVER',
-                players: evaluatedPlayers,
-                pot: potForThisPartie,
-                baseBet: currentBet,
-                initialCapital: currentCap,
-                enableDoubleKora: enableDoubleKoraOpt,
-                enableUnder21: enableUnder21Opt,
-                partieWinnerIndex: under21WinnerIdx,
-                partieWinnerName: winner.name,
-                partieWinType: 'UNDER_21',
-                mancheWinnerIndex: isMancheEnd ? mancheWinnerIdx : null,
-                mancheWinnerName: isMancheEnd ? mancheWinnerPlayer.name : null,
-                consecutiveThreesCountByPlayer: {},
-                doubleKoraAchievedByPlayer: {},
-                partieCount: partieNumber,
-              }));
-              setIsResolvingTrick(false);
-            }, getDelay(katikaConfig.instantWinAnimationTimeMs || 3500));
-            return;
-          }
         }
 
         const playersWithEvaluatedStrats = playersWithCards.map((p) => {
@@ -726,7 +674,7 @@ export function useSoloGameEngine({
         }));
       }, 1200);
     },
-    [gameState.baseBet, gameState.initialCapital, gameState.enableKoraHunterAlerts]
+    [getDelay, sendEmote]
   );
 
   // Initialize a fresh Manche with full initial capital
@@ -866,36 +814,21 @@ export function useSoloGameEngine({
 
       // Après forfaits, le joueur restant gagne le pot en victoire STANDARD (multiplicateur 1)
       const partieWinType: PartieWinType = 'STANDARD';
-      const multiplier = 1;
-
-      // Calculate penalties according to multiplier:
-      // All losers (including all folded players!) must pay the extra penalty
-      const extraCostPerLoser = (multiplier - 1) * current.baseBet;
-      let totalExtraCollected = 0;
-
-      const playersAfterPenalty = updatedPlayers.map((p, idx) => {
-        if (p.isEliminated || idx === winnerIdx) return p;
-        const actualPenalty = Math.min(p.capital, extraCostPerLoser);
-        totalExtraCollected += actualPenalty;
-        const newCap = p.capital - actualPenalty;
-        return { ...p, capital: newCap, score: newCap };
+      const payout = applyPartiePayout({
+        capitals: updatedPlayers.map((p) => p.capital),
+        isEliminated: updatedPlayers.map((p) => p.isEliminated),
+        winnerIndex: winnerIdx,
+        pot: current.pot,
+        baseBet: current.baseBet,
+        multiplier: 1,
+        rakePct: 0,
       });
 
-      const rawPotWon = current.pot + totalExtraCollected;
-      const rakePct = 0; // katikaConfig.globalRakePct || 0; (Désactivé en mode virtuel)
-      const rakeAmount = 0; // rakePct > 0 ? Math.floor((rawPotWon * rakePct) / 100) : 0;
-      const netPotWon = rawPotWon - rakeAmount;
-
-      const playersAfterPot = playersAfterPenalty.map((p, idx) =>
-        idx === winnerIdx
-          ? { ...p, capital: p.capital + netPotWon, score: p.capital + netPotWon }
-          : p
-      );
-
-      const evaluatedPlayers = playersAfterPot.map((p) => ({
+      const evaluatedPlayers = updatedPlayers.map((p, idx) => ({
         ...p,
-        isEliminated: p.isEliminated || p.capital < current.baseBet,
-        score: p.capital,
+        capital: payout.capitals[idx],
+        score: payout.capitals[idx],
+        isEliminated: payout.eliminated[idx],
       }));
 
       const remainingActive = evaluatedPlayers.filter((p) => !p.isEliminated);
@@ -989,6 +922,10 @@ export function useSoloGameEngine({
 
       if (player.isHuman) {
         if (!specificCard) return;
+        const inHand = player.hand.some((c) => c.id === specificCard.id);
+        if (!inHand) return;
+        const leadSuit = current.currentTrick.leadSuit;
+        if (!isCardPlayable(specificCard, player.hand, leadSuit)) return;
         cardToPlay = specificCard;
       } else {
         const activeCount = current.players.filter((p) => !p.isEliminated && !p.isFoldedInRound).length;
@@ -1267,63 +1204,45 @@ export function useSoloGameEngine({
 
               const winnerTricksCount = playersWithTrickScore[partieWinnerIdx]?.tricksWonInRound || 0;
 
-              let partieWinType: PartieWinType = 'STANDARD';
-              let multiplier = 1;
-
               // Check trick 4 in history to ensure 100% robustness against any state desync
               const trick4FromHistory = newHistory[3] || latestState.tricksHistory[3];
-              const isTrick4WonByWinnerWithThree = Boolean(
-                trick4FromHistory &&
-                trick4FromHistory.winnerIndex === partieWinnerIdx &&
-                trick4FromHistory.winningCard?.value === 3
-              );
+              const outcome = computePartieOutcome({
+                fifthTrickWinnerIndex: trickWinnerIndex,
+                fifthTrickWinningValue: finalWinnerPlay.card.value,
+                fourthTrickWinnerIndex: trick4FromHistory?.winnerIndex,
+                fourthTrickWinningValue: trick4FromHistory?.winningCard?.value,
+                enableDoubleKora: latestState.enableDoubleKora,
+              });
 
-              if (isWinningCardThree) {
-                if (
-                  (isTrick4WonByWinnerWithThree || prevConsecutive3s >= 1 || newConsecutive3s >= 2) &&
-                  latestState.enableDoubleKora
-                ) {
-                  partieWinType = 'DOUBLE_KORA';
-                  multiplier = 4;
-                } else {
-                  partieWinType = 'KORA';
-                  multiplier = 2;
-                }
-              }
+              const partieWinType: PartieWinType = outcome.winType;
+              const multiplier = outcome.multiplier;
 
-              const extraCostPerLoser = (multiplier - 1) * latestState.baseBet;
-              let totalExtraCollected = 0;
+              const payout = applyPartiePayout({
+                capitals: playersWithTrickScore.map((p) => p.capital),
+                isEliminated: playersWithTrickScore.map((p) => p.isEliminated),
+                winnerIndex: partieWinnerIdx,
+                pot: latestState.pot,
+                baseBet: latestState.baseBet,
+                multiplier,
+                rakePct: 0,
+              });
 
-              const playersAfterPenalty = playersWithTrickScore.map((p, idx) => {
-                if (p.isEliminated || idx === partieWinnerIdx) return p;
-                const actualPenalty = Math.min(p.capital, extraCostPerLoser);
-                totalExtraCollected += actualPenalty;
-                if (p.isFoldedInRound && multiplier > 1) {
+              playersWithTrickScore.forEach((p, idx) => {
+                if (p.isFoldedInRound && multiplier > 1 && idx !== partieWinnerIdx) {
+                  const penaltyPaid = Math.min(p.capital, (multiplier - 1) * latestState.baseBet);
                   sendEmote(
-                    `⚖️ Règle officielle : Forfait avec pénalité ${multiplier === 4 ? 'Double Kora (x4)' : 'Kora (x2)'} (${actualPenalty} 🪙).`,
+                    `⚖️ Règle officielle : Forfait avec pénalité ${multiplier === 4 ? 'Double Kora (x4)' : 'Kora (x2)'} (${penaltyPaid} 🪙).`,
                     '⚖️',
                     idx
                   );
                 }
-                const newCap = p.capital - actualPenalty;
-                return { ...p, capital: newCap, score: newCap };
               });
 
-              const rawPotWon = latestState.pot + totalExtraCollected;
-              const rakePct = 0; // katikaConfig.globalRakePct || 0; (Désactivé en mode virtuel)
-              const rakeAmount = 0; // rakePct > 0 ? Math.floor((rawPotWon * rakePct) / 100) : 0;
-              const netPotWon = rawPotWon - rakeAmount;
-
-              const playersAfterPot = playersAfterPenalty.map((p, idx) =>
-                idx === partieWinnerIdx
-                  ? { ...p, capital: p.capital + netPotWon, score: p.capital + netPotWon }
-                  : p
-              );
-
-              const evaluatedPlayers = playersAfterPot.map((p) => ({
+              const evaluatedPlayers = playersWithTrickScore.map((p, idx) => ({
                 ...p,
-                isEliminated: p.isEliminated || p.capital < latestState.baseBet,
-                score: p.capital,
+                capital: payout.capitals[idx],
+                score: payout.capitals[idx],
+                isEliminated: payout.eliminated[idx],
               }));
 
               const remainingActive = evaluatedPlayers.filter((p) => !p.isEliminated);
@@ -1514,19 +1433,29 @@ export function useSoloGameEngine({
             continue;
           }
 
-          if (state.enableUnder21) {
-            let lowestSum = 999;
-            let under21WinnerIdx: number | null = null;
+            if (state.enableUnder21) {
+              let lowestSum = 999;
+              let lowestOrderDistance = 999;
+              let under21WinnerIdx: number | null = null;
+              const numPlayers = playersWithCards.length;
+              const simLeadIdx = state.leadIndex ?? 0;
 
-            playersWithCards.forEach((player, pIdx) => {
-              if (!player.isEliminated && player.hand.length > 0) {
-                const sum = player.hand.reduce((acc, card) => acc + card.value, 0);
-                if (sum <= 21 && sum < lowestSum) {
-                  lowestSum = sum;
-                  under21WinnerIdx = pIdx;
+              playersWithCards.forEach((player, pIdx) => {
+                if (!player.isEliminated && player.hand.length > 0) {
+                  const sum = player.hand.reduce((acc, card) => acc + card.value, 0);
+                  const orderDistance = (pIdx - simLeadIdx + numPlayers) % numPlayers;
+                  if (sum <= 21) {
+                    if (
+                      sum < lowestSum ||
+                      (sum === lowestSum && orderDistance < lowestOrderDistance)
+                    ) {
+                      lowestSum = sum;
+                      lowestOrderDistance = orderDistance;
+                      under21WinnerIdx = pIdx;
+                    }
+                  }
                 }
-              }
-            });
+              });
 
             if (under21WinnerIdx !== null) {
               const winner = playersWithCards[under21WinnerIdx];
@@ -1844,62 +1773,35 @@ export function useSoloGameEngine({
                 },
               };
             } else {
-              const partieWinnerIdx = trickWinnerIndex;
-              const winner = playersWithTrickScore[partieWinnerIdx];
-
-              let partieWinType = 'STANDARD';
-              let multiplier = 1;
-
               const trick4FromHistory = newHistory[3] || state.tricksHistory[3];
-              const isTrick4WonByWinnerWithThree = Boolean(
-                trick4FromHistory &&
-                trick4FromHistory.winnerIndex === partieWinnerIdx &&
-                trick4FromHistory.winningCard?.value === 3
-              );
-
-              if (isWinningCardThree) {
-                if (
-                  (isTrick4WonByWinnerWithThree || prevConsecutive3s >= 1 || newConsecutive3s >= 2) &&
-                  state.enableDoubleKora
-                ) {
-                  partieWinType = 'DOUBLE_KORA';
-                  multiplier = 4;
-                } else {
-                  partieWinType = 'KORA';
-                  multiplier = 2;
-                }
-              }
-
-              const extraCostPerLoser = (multiplier - 1) * state.baseBet;
-              let totalExtraCollected = 0;
-
-              const playersAfterPenalty = playersWithTrickScore.map((p, idx) => {
-                if (p.isEliminated || idx === partieWinnerIdx) return p;
-                const finalCost = Math.min(p.capital, extraCostPerLoser);
-                totalExtraCollected += finalCost;
-                return {
-                  ...p,
-                  capital: p.capital - finalCost,
-                  score: p.capital - finalCost,
-                };
+              const outcome = computePartieOutcome({
+                fifthTrickWinnerIndex: trickWinnerIndex,
+                fifthTrickWinningValue: finalWinnerPlay.card.value,
+                fourthTrickWinnerIndex: trick4FromHistory?.winnerIndex,
+                fourthTrickWinningValue: trick4FromHistory?.winningCard?.value,
+                enableDoubleKora: state.enableDoubleKora,
               });
 
-              const winShare = state.pot + totalExtraCollected;
-              const playersWithPayout = playersAfterPenalty.map((p, idx) => {
-                if (idx === partieWinnerIdx) {
-                  return {
-                    ...p,
-                    capital: p.capital + winShare,
-                    score: p.capital + winShare,
-                  };
-                }
-                return p;
+              const partieWinnerIdx = outcome.winnerIndex;
+              const winner = playersWithTrickScore[partieWinnerIdx];
+              const partieWinType = outcome.winType;
+              const multiplier = outcome.multiplier;
+
+              const payout = applyPartiePayout({
+                capitals: playersWithTrickScore.map((p) => p.capital),
+                isEliminated: playersWithTrickScore.map((p) => p.isEliminated),
+                winnerIndex: partieWinnerIdx,
+                pot: state.pot,
+                baseBet: state.baseBet,
+                multiplier,
+                rakePct: 0,
               });
 
-              const evaluatedPlayers = playersWithPayout.map((p) => ({
+              const evaluatedPlayers = playersWithTrickScore.map((p, idx) => ({
                 ...p,
-                isEliminated: p.isEliminated || p.capital < state.baseBet,
-                score: p.capital,
+                capital: payout.capitals[idx],
+                score: payout.capitals[idx],
+                isEliminated: payout.eliminated[idx],
               }));
 
               const remainingActive = evaluatedPlayers.filter((p) => !p.isEliminated);

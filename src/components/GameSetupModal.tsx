@@ -320,7 +320,7 @@ export const GameSetupModal: React.FC<GameSetupModalProps> = ({
     },
   ];
 
-  // 4 horizontal buttons requested by the user: Facile / Normal / Difficile / Élite
+  // 4 horizontal buttons requested by the user: Facile / Normal / Expert / Grand Katika
   const difficultyOptions = [
     {
       id: 'EASY' as AIDifficulty,
@@ -336,13 +336,13 @@ export const GameSetupModal: React.FC<GameSetupModalProps> = ({
     },
     {
       id: 'EXPERT' as AIDifficulty,
-      label: 'Difficile',
+      label: 'Expert',
       stars: '★★★☆',
       tagline: 'Calcul des cartes, jeu prudent',
     },
     {
       id: 'GRAND_MASTER' as AIDifficulty,
-      label: 'Élite',
+      label: 'Grand Katika',
       stars: '★★★★',
       tagline: 'Chasseur de Kora, pots à haut risque',
     },
@@ -626,7 +626,7 @@ export const GameSetupModal: React.FC<GameSetupModalProps> = ({
               </div>
             </section>
 
-            {/* 1.3 Niveau de l'IA : 4 boutons horizontaux (Facile / Normal / Difficile / Élite) */}
+            {/* 1.3 Niveau de l'IA : 4 boutons horizontaux (Facile / Normal / Expert / Grand Katika) */}
             <section className="p-3 rounded-2xl bg-[#0d121c]/90 border border-white/[0.07] flex flex-col gap-1.5 shadow-sm">
               <div className="flex items-center justify-between px-0.5">
                 <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-slate-400">

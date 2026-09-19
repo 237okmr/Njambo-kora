@@ -66,6 +66,62 @@ service cloud.firestore {
       return s != null && s.get('active', false) == true && s.get('type', '') == 'PERM_BAN';
     }
 
+    // ===== Helpers : soloDaily et score =====
+
+    // Index de jour Douala (UTC+1)
+    function dayIdx(t) {
+      return (t.toMillis() + 3600000) / 86400000;
+    }
+
+    // Structure et bornes du champ soloDaily lorsqu'il est présent
+    function validSoloDaily(existing, incoming) {
+      let hasIn = 'soloDaily' in incoming && incoming.soloDaily != null;
+      let inSD = hasIn ? incoming.soloDaily : null;
+      let hasEx = 'soloDaily' in existing && existing.soloDaily != null;
+      let exSD = hasEx ? existing.soloDaily : null;
+      let oDay = (hasEx && 'day' in exSD) ? exSD.day : null;
+      let oPts = (hasEx && 'points' in exSD) ? exSD.points : 0;
+      return !hasIn || (
+        inSD is map
+        && 'day' in inSD && inSD.day is int
+        && inSD.day <= dayIdx(request.time)
+        && (oDay == null || inSD.day >= oDay)
+        && 'points' in inSD && (inSD.points is int || inSD.points is float)
+        && inSD.points >= 0 && inSD.points <= 30
+        && (oDay == null || inSD.day > oDay || inSD.points >= oPts)
+      );
+    }
+
+    // Calcul du gain solo déclaré de l'écriture
+    function getDeltaSolo(existing, incoming) {
+      let hasIn = 'soloDaily' in incoming && incoming.soloDaily != null;
+      let inSD = hasIn ? incoming.soloDaily : null;
+      let hasEx = 'soloDaily' in existing && existing.soloDaily != null;
+      let exSD = hasEx ? existing.soloDaily : null;
+      let oDay = (hasEx && 'day' in exSD) ? exSD.day : null;
+      let oPts = (hasEx && 'points' in exSD) ? exSD.points : 0;
+      return !hasIn ? 0 : (
+        (oDay != null && inSD.day == oDay)
+          ? (inSD.points - oPts)
+          : inSD.points
+      );
+    }
+
+    // Couplage entre la hausse de masteryScore et le gain solo + allocation multijoueur
+    function validMasteryScoreCoupling(existing, incoming) {
+      let oS = existing.stats;
+      let nS = incoming.stats;
+      let scoreIncrease = nS.get('masteryScore', 0) - oS.get('masteryScore', 0);
+      let one = !('guestMergedAt' in existing) && ('guestMergedAt' in incoming);
+      let isScoreMigration = incoming.get('scoreVersion', 1) > existing.get('scoreVersion', 1);
+      let dGamesWon = nS.get('multiplayerGamesWon', 0) - oS.get('multiplayerGamesWon', 0);
+      let dManchesWon = nS.get('multiplayerManchesWon', 0) - oS.get('multiplayerManchesWon', 0);
+      let dKoraCount = nS.get('multiplayerKoraCount', 0) - oS.get('multiplayerKoraCount', 0);
+      let allocHorsSolo = 20 * (dGamesWon + dManchesWon + dKoraCount) + 5;
+      let deltaSolo = getDeltaSolo(existing, incoming);
+      return one || isScoreMigration || (scoreIncrease <= deltaSolo + allocHorsSolo);
+    }
+
     // ===== Création d'un profil (compte neuf ou première fusion invité) =====
 
     function initialProfileValid(data) {
@@ -90,6 +146,13 @@ service cloud.firestore {
               && fp.get('consecutiveForfeits', 0) == 0
               && fp.get('totalFoldRounds', 0) == 0
               && fp.get('prolongedDisconnects', 0) == 0))
+        && (!('soloDaily' in data) || (
+              data.soloDaily is map
+              && 'day' in data.soloDaily && data.soloDaily.day is int
+              && data.soloDaily.day <= dayIdx(request.time)
+              && 'points' in data.soloDaily && (data.soloDaily.points is int || data.soloDaily.points is float)
+              && data.soloDaily.points >= 0 && data.soloDaily.points <= 30
+            ))
         && capAtCreate(stats, 'masteryScore', merge ? 300 : 0)
         && capAtCreate(stats, 'partiesPlayed', g)
         && capAtCreate(stats, 'partiesWon', g)
@@ -168,6 +231,9 @@ service cloud.firestore {
         // Score : ne baisse que de la pénalité d'abandon (5 points)
         && nS.get('masteryScore', 0) >= oS.get('masteryScore', 0) - 5
         && nS.get('masteryScore', 0) - oS.get('masteryScore', 0) <= (one ? 300 : 100)
+        // Validation soloDaily & couplage masteryScore
+        && validSoloDaily(existing, incoming)
+        && validMasteryScoreCoupling(existing, incoming)
         // Compteurs
         && ctr(oS, nS, 'partiesPlayed', maxG)
         && ctr(oS, nS, 'partiesWon', maxG)

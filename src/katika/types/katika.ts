@@ -1,4 +1,5 @@
 import { GameTelemetryRecord } from '../../services/telemetryService';
+import { AIDifficulty } from '../../types';
 
 export type KatikaTab = 'DASHBOARD' | 'ROOMS' | 'MATCHES' | 'PLAYERS' | 'SETTINGS' | 'LOGS' | 'AI_ASSISTANT';
 
@@ -307,7 +308,7 @@ export interface KatikaGameConfig {
   defaultFillWithBots?: boolean; // false (100% humain) par défaut
   allowJoinInProgress?: boolean; // Accepter spectateurs / nouveaux arrivants si table < 4
   emptyRoomTimeoutMinutes?: number; // Fermeture et suppression automatique des tables abandonnées sans humains (défaut: 5 min)
-  defaultAiDifficulty?: 'EASY' | 'NORMAL' | 'EXPERT';
+  defaultAiDifficulty?: AIDifficulty;
   hokutoSpawnRatePct?: number;
   globalRakePct?: number;
   allowAutoAdvance?: boolean;
