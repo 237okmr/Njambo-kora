@@ -1,8 +1,10 @@
 import { KatikaKPIs, KatikaLiveRoom, KatikaPlayer, KatikaGameConfig, KatikaAuditLog } from '../types/katika';
 import { telemetryService, GameTelemetryRecord, GlobalMancheCounts } from '../../services/telemetryService';
-import { collection, getDocs, doc, setDoc, updateDoc, deleteField } from 'firebase/firestore';
+import { collection, getDocs, doc, setDoc, updateDoc, deleteField, query, orderBy } from 'firebase/firestore';
 import { db } from '../../lib/firebase';
 import { playerProfileService, computeMasteryScore } from '../../services/playerProfileService';
+import { computeEventMasteryScore, getDoualaDateKey, MASTERY_CONFIG } from '../../services/masteryConfig';
+import { PlayerGameHistoryItem } from '../../types/playerProfile';
 import { setBotTimingConfig, setBotDialogueConfig } from '../../utils/ai';
 
 export interface ProfileCorrectionEntry {
@@ -1767,13 +1769,83 @@ export const KatikaService = {
         statsModified = true;
       }
 
-      // Re-calcul du score de maîtrise Lot 2
-      const calculatedMastery = computeMasteryScore(rawStats as any);
-      if (rawStats.masteryScore !== calculatedMastery || rawStats.scoreVersion !== 2) {
-        rawStats.masteryScore = calculatedMastery;
-        rawStats.scoreVersion = 2;
-        appliedFixes.push(`Score de maîtrise Lot 2 recalculé et synchronisé (${calculatedMastery} pts, v2)`);
+      // 4. Migration scoreVersion: 2 et calcul du score de maîtrise
+      if (data.scoreVersion !== 2) {
+        reasons.push(`Profil non migré en scoreVersion 2 (version actuelle: ${data.scoreVersion || 1})`);
+        patch.scoreVersion = 2;
+        needsUpdate = true;
+
+        // Calculer depuis le journal historique
+        let historyDocs: PlayerGameHistoryItem[] = [];
+        try {
+          const histSnap = await getDocs(
+            query(collection(db, 'users', uid, 'history'), orderBy('createdAt', 'asc'))
+          );
+          historyDocs = histSnap.docs.map((d) => d.data() as PlayerGameHistoryItem);
+        } catch (hErr) {
+          console.warn(`[KatikaService] Erreur lecture historique pour ${uid}:`, hErr);
+        }
+
+        const partiesCounted = getNum(rawStats.partiesPlayed, 0);
+        if (historyDocs.length < partiesCounted) {
+          reasons.push(
+            `Historique incomplet : ${historyDocs.length} entrées journal vs ${partiesCounted} parties comptabilisées.`
+          );
+          appliedFixes.push(
+            `Migration scoreVersion 2 effectuée avec historique partiel (${historyDocs.length}/${partiesCounted})`
+          );
+        }
+
+        if (historyDocs.length > 0) {
+          let journalMastery = 0;
+          const dailySoloPointsMap = new Map<string, number>();
+
+          historyDocs.forEach((item) => {
+            let eventPotential = 0;
+            if (item.recordType === 'PARTIE' && item.isWinner) {
+              eventPotential = computeEventMasteryScore({
+                mode: item.mode,
+                difficulty: item.difficulty,
+                partiesWon: 1,
+                koras: item.winType === 'KORA' ? 1 : 0,
+                doubleKoras: item.winType === 'DOUBLE_KORA' ? 1 : 0,
+              });
+            } else if ((item.recordType === 'MANCHE' || !item.recordType) && item.isWinner) {
+              eventPotential = computeEventMasteryScore({
+                mode: item.mode,
+                difficulty: item.difficulty,
+                isMancheWinner: true,
+                isForfeitWin: item.winType === 'FORFEIT',
+              });
+            }
+
+            let awarded = 0;
+            if (item.mode === 'SOLO' && eventPotential > 0) {
+              const dateKey = getDoualaDateKey(item.createdAt);
+              const currentDailySum = dailySoloPointsMap.get(dateKey) || 0;
+              const cap = MASTERY_CONFIG.rules.dailySoloPointsCap; // 30
+              if (currentDailySum < cap) {
+                awarded = Math.min(eventPotential, cap - currentDailySum);
+                dailySoloPointsMap.set(dateKey, currentDailySum + awarded);
+              }
+            } else {
+              awarded = eventPotential;
+            }
+            journalMastery += awarded;
+          });
+
+          rawStats.masteryScore = journalMastery > 0 ? journalMastery : computeMasteryScore(rawStats as any);
+        } else {
+          // Aucun journal disponible : repli sur les compteurs pour ne pas léser le joueur
+          rawStats.masteryScore = computeMasteryScore(rawStats as any);
+        }
+
+        appliedFixes.push(
+          `scoreVersion: 2 inscrit à la racine, score calculé via journal historique (${rawStats.masteryScore} pts)`
+        );
         statsModified = true;
+      } else {
+        // Déjà migré en scoreVersion 2 : préserver le score événementiel existant
       }
 
       if (statsModified || !data.stats) {

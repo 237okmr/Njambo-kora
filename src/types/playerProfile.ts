@@ -190,6 +190,7 @@ export interface PlayerProfile {
   statsLegacyBackup?: PlayerStats;
   fairPlay?: PlayerFairPlay;
   honorificTitleId: string;
+  guestMergedAt?: number;
   createdAt: number;
   updatedAt: number;
 }

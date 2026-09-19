@@ -164,20 +164,6 @@ export const PlayerProfileProvider: React.FC<{ children: ReactNode }> = ({ child
     return () => unsub();
   }, [profile.isGuest]);
 
-  // Auto-run scoreVersion = 2 migration if needed
-  useEffect(() => {
-    if (profile && profile.scoreVersion !== 2) {
-      playerProfileService.migratePlayerScoreVersion2(profile.uid)
-        .then((migrated) => {
-          setProfile(migrated);
-          setHistory(playerProfileService.getLocalHistory());
-        })
-        .catch((err) => {
-          console.warn('[PlayerProfileContext] Migration scoreVersion 2 failed:', err);
-        });
-    }
-  }, [profile?.scoreVersion, profile?.uid]);
-
   // Silent background stats consolidation to prevent desynchronization (Lot 3 Recommendation 2)
   useEffect(() => {
     if (!profile.isGuest && profile.uid) {

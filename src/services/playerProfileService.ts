@@ -82,8 +82,9 @@ export function sanitizeDisplayName(name: string): string {
   return cleaned.slice(0, 24);
 }
 
-export function applyStatsFallback(stats: PlayerStats | any): PlayerStats {
+export function applyStatsFallback(stats: PlayerStats | any, scoreVersion?: number): PlayerStats {
   const finalStats = { ...stats } as any;
+  const version = scoreVersion ?? finalStats.scoreVersion ?? 1;
 
   // 0. Legacy property mapping
   if (finalStats.korasCount !== undefined && finalStats.koraCount === undefined) {
@@ -186,7 +187,12 @@ export function applyStatsFallback(stats: PlayerStats | any): PlayerStats {
     : 0;
 
   // 6. Calculer le Score de Maîtrise consolidé
-  finalStats.masteryScore = computeMasteryScore(finalStats);
+  if (version >= 2 && typeof finalStats.masteryScore === 'number' && !isNaN(finalStats.masteryScore)) {
+    // Pour scoreVersion >= 2, conserver le score événementiel stocké (respect des plafonds solo, forfaits, abandons)
+  } else {
+    // Repli de calcul cumulatif pour profils legacy scoreVersion < 2
+    finalStats.masteryScore = computeMasteryScore(finalStats);
+  }
 
   return finalStats;
 }
@@ -364,7 +370,7 @@ export const playerProfileService = {
           mergedStats.gamesLost = Math.max(0, mergedStats.gamesPlayed - mergedStats.gamesWon);
 
           // Apply fallback rule for older users who have victories but no detail set
-          const finalStats = applyStatsFallback(mergedStats);
+          const finalStats = applyStatsFallback(mergedStats, parsed.scoreVersion);
 
           // Fair play defaults
           const mergedFairPlay: PlayerFairPlay = {
@@ -488,8 +494,23 @@ export const playerProfileService = {
   enqueueOfflineSync(item: Omit<PendingOfflineSyncItem, 'queuedAt' | 'retryCount'>): void {
     const queue = this.getPendingOfflineQueue();
     const filtered = queue.filter((q) => q.id !== item.id);
+
+    // Sanitize payload: never store 'email' in offline queue for users/{uid} root document
+    let sanitizedPayload = item.payload;
+    if (
+      item.docPath.startsWith('users/') &&
+      !item.docPath.includes('/private') &&
+      sanitizedPayload &&
+      typeof sanitizedPayload === 'object' &&
+      'email' in sanitizedPayload
+    ) {
+      const { email, ...rest } = sanitizedPayload;
+      sanitizedPayload = rest;
+    }
+
     filtered.push({
       ...item,
+      payload: sanitizedPayload,
       queuedAt: Date.now(),
       retryCount: 0,
     });
@@ -515,8 +536,21 @@ export const playerProfileService = {
 
     for (const item of queue) {
       try {
+        let payload = item.payload;
+        // Strict guard: ensure email is never written to users/{uid} root document
+        if (
+          item.docPath.startsWith('users/') &&
+          !item.docPath.includes('/private') &&
+          payload &&
+          typeof payload === 'object' &&
+          'email' in payload
+        ) {
+          const { email, ...rest } = payload;
+          payload = rest;
+        }
+
         const docRef = doc(db, item.docPath);
-        await setDoc(docRef, item.payload, { merge: true });
+        await setDoc(docRef, payload, { merge: true });
         syncedCount++;
       } catch (err) {
         console.warn(`[PlayerProfileService] Retry failed for offline item ${item.id}:`, err);
@@ -794,9 +828,10 @@ export const playerProfileService = {
     // Firestore persistence for authenticated users (with offline queue tolerance - Lot 3 - B)
     if (!profile.isGuest && auth.currentUser) {
       const uid = auth.currentUser.uid;
+      const { email: _unusedEmail, ...profilePayloadWithoutEmail } = updatedProfile;
       try {
         const userRef = doc(db, 'users', uid);
-        await setDoc(userRef, updatedProfile, { merge: true });
+        await setDoc(userRef, profilePayloadWithoutEmail, { merge: true });
       } catch (err) {
         console.warn('[PlayerProfileService] Firestore user profile sync failed, enqueuing to offline sync queue:', err);
         this.enqueueOfflineSync({
@@ -804,7 +839,7 @@ export const playerProfileService = {
           type: 'PROFILE',
           userId: uid,
           docPath: `users/${uid}`,
-          payload: updatedProfile,
+          payload: profilePayloadWithoutEmail,
         });
       }
 
@@ -999,9 +1034,10 @@ export const playerProfileService = {
     // If authenticated in Firestore, persist there asynchronously (with offline queue tolerance - Lot 3 - B)
     if (!profile.isGuest && auth.currentUser) {
       const uid = auth.currentUser.uid;
+      const { email: _unusedEmail, ...profilePayloadWithoutEmail } = updatedProfile;
       try {
         const userRef = doc(db, 'users', uid);
-        await setDoc(userRef, updatedProfile, { merge: true });
+        await setDoc(userRef, profilePayloadWithoutEmail, { merge: true });
       } catch (err) {
         console.warn('[PlayerProfileService] Firestore game user profile sync failed, enqueuing to offline sync queue:', err);
         this.enqueueOfflineSync({
@@ -1009,7 +1045,7 @@ export const playerProfileService = {
           type: 'PROFILE',
           userId: uid,
           docPath: `users/${uid}`,
-          payload: updatedProfile,
+          payload: profilePayloadWithoutEmail,
         });
       }
 
@@ -1122,9 +1158,10 @@ export const playerProfileService = {
     // Sync to Firestore & log to Katika fair-play audit (with offline queue tolerance - Lot 3 - B)
     if (!profile.isGuest && auth.currentUser) {
       const uid = auth.currentUser.uid;
+      const { email: _unusedEmail, ...profilePayloadWithoutEmail } = updatedProfile;
       try {
         const userRef = doc(db, 'users', uid);
-        await setDoc(userRef, updatedProfile, { merge: true });
+        await setDoc(userRef, profilePayloadWithoutEmail, { merge: true });
 
         if (newSanction) {
           const sanctionRef = doc(db, 'fairplay_sanctions', `sanction_${uid}_${now}`);
@@ -1145,7 +1182,7 @@ export const playerProfileService = {
           type: 'PROFILE',
           userId: uid,
           docPath: `users/${uid}`,
-          payload: updatedProfile,
+          payload: profilePayloadWithoutEmail,
         });
         if (newSanction) {
           this.enqueueOfflineSync({
@@ -1456,8 +1493,7 @@ export const playerProfileService = {
       ((mergedFairPlay.totalForfeits + mergedFairPlay.prolongedDisconnects) / Math.max(1, gamesPlayedCount + 1)).toFixed(2)
     );
 
-    const finalMergedStats = applyStatsFallback(mergedStats);
-    finalMergedStats.masteryScore = computeMasteryScore(finalMergedStats);
+    const finalMergedStats = applyStatsFallback(mergedStats, cloudProfile?.scoreVersion || guestProfile.scoreVersion);
     const { currentTitle } = computeHonorificTitle(finalMergedStats);
 
     // Resolve display name: keep existing custom name if meaningful, else Google name
@@ -1466,6 +1502,10 @@ export const playerProfileService = {
       chosenName = user.displayName;
     }
     chosenName = sanitizeDisplayName(chosenName);
+
+    // guestMergedAt: written once during guest-to-Google fusion, never modified thereafter
+    const existingMergedAt = cloudProfile?.guestMergedAt;
+    const guestMergedAt = existingMergedAt || (guestProfile.isGuest ? Date.now() : undefined);
 
     const mergedProfile: PlayerProfile = {
       uid: user.uid,
@@ -1478,6 +1518,7 @@ export const playerProfileService = {
       stats: finalMergedStats,
       fairPlay: mergedFairPlay,
       honorificTitleId: currentTitle.id,
+      guestMergedAt,
       createdAt: cloudProfile?.createdAt || guestProfile.createdAt || Date.now(),
       updatedAt: Date.now(),
     };
@@ -1486,10 +1527,25 @@ export const playerProfileService = {
     this.saveLocalProfile(mergedProfile);
     this.saveLocalHistory(mergedHistory);
 
-    // Sync to Firestore
+    // Sync to Firestore: strip email from public doc, persist email exclusively in private/profile
     try {
+      const { email: _unusedEmail, ...profilePayloadWithoutEmail } = mergedProfile;
       const userRef = doc(db, 'users', user.uid);
-      await setDoc(userRef, mergedProfile, { merge: true });
+      await setDoc(userRef, profilePayloadWithoutEmail, { merge: true });
+
+      // Store private email in users/{uid}/private/profile
+      if (user.email) {
+        const privateProfileRef = doc(db, 'users', user.uid, 'private', 'profile');
+        await setDoc(
+          privateProfileRef,
+          {
+            email: user.email,
+            uid: user.uid,
+            updatedAt: Date.now(),
+          },
+          { merge: true }
+        );
+      }
 
       // Write merged history items to subcollection
       for (const item of mergedHistory.slice(0, 30)) {
@@ -1762,6 +1818,13 @@ export const playerProfileService = {
 
     const { currentTitle } = computeHonorificTitle(newStats);
 
+    const isHistoryIncomplete = sortedHistory.length < (profile.stats?.partiesPlayed || 0);
+    if (isHistoryIncomplete) {
+      console.warn(
+        `[PlayerProfileService] Profile ${uid} has incomplete history: ${sortedHistory.length} entries in history journal vs ${profile.stats?.partiesPlayed || 0} parties counted.`
+      );
+    }
+
     const updatedProfile: PlayerProfile = {
       ...profile,
       stats: newStats,
@@ -1778,8 +1841,14 @@ export const playerProfileService = {
     // Save to Firestore if authenticated
     if (uid && !profile.isGuest && db) {
       try {
+        const { email: _unusedEmail, ...profilePayloadWithoutEmail } = updatedProfile;
         const userRef = doc(db, 'users', uid);
-        await setDoc(userRef, updatedProfile, { merge: true });
+        await setDoc(userRef, profilePayloadWithoutEmail, { merge: true });
+
+        if (profile.email) {
+          const privateProfileRef = doc(db, 'users', uid, 'private', 'profile');
+          await setDoc(privateProfileRef, { email: profile.email, uid, updatedAt: Date.now() }, { merge: true });
+        }
 
         // Update history items with new masteryPointsAwarded
         for (const h of sortedHistory.slice(0, 30)) {

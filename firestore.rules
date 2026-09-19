@@ -28,17 +28,76 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    function validDifficultyProgression(bStats, aStats, field, maxInc) {
+      let oldVal = (bStats != null && field in bStats) ? bStats[field] : 0;
+      let newVal = (aStats != null && field in aStats) ? aStats[field] : oldVal;
+      return newVal >= oldVal && (newVal - oldVal) <= maxInc;
+    }
+
+    function validCountersUpdate(bData, aData) {
+      let bStats = ('stats' in bData) ? bData.stats : null;
+      let aStats = ('stats' in aData) ? aData.stats : null;
+      let isFusion = !('guestMergedAt' in bData) && ('guestMergedAt' in aData);
+      let maxInc = isFusion ? 1000 : 1;
+      let maxDblInc = isFusion ? 1000 : 2;
+
+      return (aStats == null || bStats == null) ? true : (
+        validDifficultyProgression(bStats, aStats, 'soloGamesWonEasy', maxInc) &&
+        validDifficultyProgression(bStats, aStats, 'soloGamesWonNormal', maxInc) &&
+        validDifficultyProgression(bStats, aStats, 'soloGamesWonHard', maxInc) &&
+        validDifficultyProgression(bStats, aStats, 'soloKorasEasy', maxInc) &&
+        validDifficultyProgression(bStats, aStats, 'soloKorasNormal', maxInc) &&
+        validDifficultyProgression(bStats, aStats, 'soloKorasHard', maxInc) &&
+        validDifficultyProgression(bStats, aStats, 'soloDoubleKorasEasy', maxDblInc) &&
+        validDifficultyProgression(bStats, aStats, 'soloDoubleKorasNormal', maxDblInc) &&
+        validDifficultyProgression(bStats, aStats, 'soloDoubleKorasHard', maxDblInc)
+      );
+    }
+
+    function validCountersCreate(data) {
+      let stats = ('stats' in data) ? data.stats : null;
+      let isFusion = 'guestMergedAt' in data;
+      let maxInitial = isFusion ? 1000 : 0;
+
+      return stats == null ? true : (
+        (!('soloGamesWonEasy' in stats) || (stats.soloGamesWonEasy >= 0 && stats.soloGamesWonEasy <= maxInitial)) &&
+        (!('soloGamesWonNormal' in stats) || (stats.soloGamesWonNormal >= 0 && stats.soloGamesWonNormal <= maxInitial)) &&
+        (!('soloGamesWonHard' in stats) || (stats.soloGamesWonHard >= 0 && stats.soloGamesWonHard <= maxInitial)) &&
+        (!('soloKorasEasy' in stats) || (stats.soloKorasEasy >= 0 && stats.soloKorasEasy <= maxInitial)) &&
+        (!('soloKorasNormal' in stats) || (stats.soloKorasNormal >= 0 && stats.soloKorasNormal <= maxInitial)) &&
+        (!('soloKorasHard' in stats) || (stats.soloKorasHard >= 0 && stats.soloKorasHard <= maxInitial)) &&
+        (!('soloDoubleKorasEasy' in stats) || (stats.soloDoubleKorasEasy >= 0 && stats.soloDoubleKorasEasy <= maxInitial)) &&
+        (!('soloDoubleKorasNormal' in stats) || (stats.soloDoubleKorasNormal >= 0 && stats.soloDoubleKorasNormal <= maxInitial)) &&
+        (!('soloDoubleKorasHard' in stats) || (stats.soloDoubleKorasHard >= 0 && stats.soloDoubleKorasHard <= maxInitial))
+      );
+    }
+
     // Player profiles and cloud synchronized palmares
     match /users/{userId} {
       allow read: if true;
       allow create: if isUser(userId) && (
-        !('chips' in request.resource.data) || request.resource.data.chips >= 0
+        (!('chips' in request.resource.data) || request.resource.data.chips >= 0) &&
+        // Do not allow email in public user document
+        (!('email' in request.resource.data) || request.resource.data.email == null) &&
+        // Counters initialized to 0 (or capped at fusion)
+        validCountersCreate(request.resource.data)
       );
       allow update: if isUser(userId) && (
         // Prevent negative chips
-        (!('chips' in request.resource.data) || request.resource.data.chips >= 0)
+        (!('chips' in request.resource.data) || request.resource.data.chips >= 0) &&
+        // Do not allow email in public user document
+        (!('email' in request.resource.data) || request.resource.data.email == null) &&
+        // guestMergedAt is write-once, immutable once set
+        (!('guestMergedAt' in resource.data) || request.resource.data.guestMergedAt == resource.data.guestMergedAt) &&
+        // Enforce counter progression: no-decrease, fusion caps and incremental caps
+        validCountersUpdate(resource.data, request.resource.data)
       );
       allow delete: if isUser(userId) || isAdmin();
+
+      // Private user profile data (email isolation)
+      match /private/{docId} {
+        allow read, write: if isUser(userId) || isAdmin();
+      }
 
       match /history/{gameId} {
         allow read: if isUser(userId);
