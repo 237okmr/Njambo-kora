@@ -507,7 +507,7 @@ export const KatikaSettingsTab: React.FC<KatikaSettingsTabProps> = ({ onConfigUp
               <KatikaNumberSliderField
                 id="hokuto-spawn-field"
                 label="Taux d'apparition Boss IA (Robam Hokuto)"
-                description="Probabilité (0 à 100%) d'apparition de l'IA experte Hokuto lors de la génération de robots."
+                description="Probabilité (0 à 100%) d'apparition du bot adaptatif Robam Hokuto lors de la génération de robots."
                 value={config.hokutoSpawnRatePct || 75}
                 onChange={(val) => setConfig(prev => ({ ...prev, hokutoSpawnRatePct: val }))}
                 min={0}

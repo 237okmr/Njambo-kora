@@ -79,7 +79,7 @@ export const AI_DIFFICULTIES_INFO: Record<AIDifficulty, AIDifficultyInfo> = {
     id: 'EXPERT',
     name: 'Expert',
     subtitle: 'Maître',
-    description: 'Adversaires compétitifs : planification Kora mesurée, suivi des coupes et des cartes, jeu équilibré au pli 4 et rupture des séries.',
+    description: 'Adversaires compétitifs : simulation de fins de donne en Monte Carlo léger, planification Kora mesurée, suivi des cartes et des vides adverses.',
     icon: '👑',
     badgeBg: 'bg-rose-900/60 text-rose-300 border-rose-700/60',
   },

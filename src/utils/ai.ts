@@ -6,7 +6,7 @@ import {
   EXPERT_CONFIG,
   GRAND_MASTER_CONFIG,
 } from './aiLevelConfig';
-import { chooseGrandMasterMonteCarlo } from './aiMonteCarlo';
+import { chooseMonteCarloAICard, chooseGrandMasterMonteCarlo } from './aiMonteCarlo';
 
 export {
   EASY_CONFIG,
@@ -1026,9 +1026,8 @@ export function chooseAICard(
     strategy === 'HOKUTO_ADAPTIVE'
   );
 
-  // Force EXPERT difficulty for Robam Hokuto, unless table difficulty is GRAND_MASTER
-  const effectiveDifficulty: AIDifficulty =
-    difficulty === 'GRAND_MASTER' ? 'GRAND_MASTER' : isRobamHokuto ? 'EXPERT' : difficulty;
+  // Robam Hokuto plays at table difficulty level
+  const effectiveDifficulty: AIDifficulty = difficulty;
 
   // EASY DIFFICULTY: 22% random blunder rate (15-25% range)
   if (effectiveDifficulty === 'EASY' && Math.random() < EASY_CONFIG.RANDOM_MOVE_RATE) {
@@ -1157,111 +1156,38 @@ export function chooseAICard(
   }
 
   // =========================================================================
-  // --- TRICK 4 : SEQUENTIAL SETUP FOR TRICK 5 (EXPERT ONLY) ---
+  // --- EXPERT LEVEL: LIGHT MONTE CARLO (8ms budget, PIMC rollouts) ---
   // =========================================================================
-  if (trickNumber === 4 && effectiveDifficulty === 'EXPERT') {
-    // KORA_HUNTER tactical setup at trick 4:
-    // Only hunt Kora if opponents are confirmed void in that suit or probability is near-certain (>= 0.90).
-    // Otherwise, play the standard winning line for the pot!
-    const isOpponentsConfirmedVoid = (suit: Suit) => {
-      let voidCount = 0;
-      knownVoids.forEach((suits) => {
-        if (suits.has(suit)) voidCount++;
-      });
-      return voidCount >= Math.max(1, activePlayerCount - 1);
-    };
-
-    const hasSafeKoraThree = hand.some((c) => c.value === 3 && isOpponentsConfirmedVoid(c.suit));
-    const koraChance = estimateKoraChance(hand, cardsPlayedSoFar, knownVoids, activePlayerCount);
-    const isHuntingKora =
-      effectiveDifficulty === 'EXPERT' &&
-      (activeStrategy === 'KORA_HUNTER' || hasSafeKoraThree || koraChance >= EXPERT_CONFIG.KORA_CHANCE_THRESHOLD) &&
-      hand.some((c) => c.value === 3);
-
-    const threesInHand = hand.filter((c) => c.value === 3);
-    const isDoubleKoraPlan =
-      isHuntingKora &&
-      threesInHand.length >= 2 &&
-      estimateKoraChance(hand, cardsPlayedSoFar, knownVoids, activePlayerCount, true) >=
-        EXPERT_CONFIG.DOUBLE_KORA_CHANCE_THRESHOLD;
-
-    if (!leadSuit) {
-      const sortedDesc = [...validCards].sort((a, b) => b.value - a.value);
-      const sortedAsc = [...validCards].sort((a, b) => a.value - b.value);
-
-      if (isHuntingKora) {
-        if (isDoubleKoraPlan) {
-          const validThrees = validCards.filter((c) => c.value === 3);
-          if (validThrees.length > 0) return validThrees[0];
-        }
-        // Conserve the 3 for trick 5! Win trick 4 with highest non-3 card to capture the lead!
+  if (effectiveDifficulty === 'EXPERT' && EXPERT_CONFIG.USE_MONTE_CARLO) {
+    // Only force specific Kora lead at trick 4/5 if bot is explicitly a KORA_HUNTER
+    if (activeStrategy === 'KORA_HUNTER') {
+      if (trickNumber === 5 && !leadSuit) {
+        const threes = validCards.filter((c) => c.value === 3);
+        if (threes.length > 0) return threes[0];
+      } else if (trickNumber === 4 && !leadSuit) {
         const nonThreesDesc = validCards.filter((c) => c.value !== 3).sort((a, b) => b.value - a.value);
-        if (nonThreesDesc.length > 0) {
-          return nonThreesDesc[0];
-        }
+        if (nonThreesDesc.length > 0) return nonThreesDesc[0];
       }
-
-      // TRICK 4 ATTACK RULE FOR EXPERT & NORMAL:
-      // A. VOID EXPLOITATION (Expert): If an opponent is known void in a suit, leading it guarantees winning trick 4!
-      if (effectiveDifficulty === 'EXPERT' && knownVoids.size > 0) {
-        const voidSuitCard = validCards.find((c) => {
-          for (const [_, voids] of knownVoids.entries()) {
-            if (voids.has(c.suit)) return true;
-          }
-          return false;
-        });
-        if (voidSuitCard) {
-          return voidSuitCard;
-        }
-      }
-
-      // Attack trick 4 ONLY if holding at least 2 dynamic bosses!
-      // If holding only 1 boss, keep it imperatively for trick 5 and play the lower non-boss card.
-      if (bossesInHand.length >= 2) {
-        return sortedDesc[0];
-      }
-
-      if (bossesInHand.length === 1) {
-        const nonBossAsc = sortedAsc.filter((c) => !isCardBossForBot(c));
-        if (nonBossAsc.length > 0) {
-          return nonBossAsc[0];
-        }
-      }
-
-      // No bosses in hand: lead lowest card to defend
-      return sortedAsc[0];
     }
 
-    // Following suit on Trick 4
-    const hasLeadSuit = hand.some((c) => c.suit === leadSuit);
-    if (hasLeadSuit) {
-      const { winningValue } = determineTrickWinner(currentPlays, leadSuit);
-      const leadSuitCardsAsc = [...validCards].sort((a, b) => a.value - b.value);
-      const winningCards = leadSuitCardsAsc.filter((c) => c.value > winningValue);
+    const botIndex =
+      myPlayerIndex !== undefined
+        ? myPlayerIndex
+        : players.findIndex((p) => p.hand === hand || !p.isHuman);
 
-      if (isHuntingKora) {
-        const winningNonThrees = winningCards.filter((c) => c.value !== 3);
-        if (winningNonThrees.length > 0) return winningNonThrees[0];
-        if (isDoubleKoraPlan && winningCards.length > 0) return winningCards[0];
-      }
-
-      // If we can win Trick 4, taking it gives us the lead on Trick 5:
-      if (winningCards.length > 0) {
-        // If we have a choice of winning cards, use the lowest winning card
-        return winningCards[0];
-      }
-
-      // Cannot win trick 4 -> duck with lowest card
-      return leadSuitCardsAsc[0];
-    }
-
-    // Discarding on Trick 4 (cannot follow suit): keep the stronger card / boss for trick 5!
-    const sortedByValue = [...validCards].sort((a, b) => a.value - b.value);
-    const nonBossDiscards = sortedByValue.filter((c) => !isCardBossForBot(c));
-    if (nonBossDiscards.length > 0) {
-      return nonBossDiscards[0];
-    }
-    return sortedByValue[0];
+    return chooseMonteCarloAICard(
+      validCards,
+      hand,
+      leadSuit,
+      currentPlays,
+      trickNumber,
+      tricksHistory,
+      activePlayerCount,
+      players,
+      botIndex !== -1 ? botIndex : 0,
+      knownVoids,
+      'EXPERT'
+    );
   }
 
   // =========================================================================

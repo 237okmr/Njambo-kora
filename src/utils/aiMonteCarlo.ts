@@ -1,6 +1,6 @@
 import { Card, PlayedCard, Player, Suit, Trick } from '../types';
 import { build31Deck, determineTrickWinner } from './deck';
-import { GRAND_MASTER_CONFIG } from './aiLevelConfig';
+import { EXPERT_CONFIG, GRAND_MASTER_CONFIG } from './aiLevelConfig';
 import { isDynamicBossCard } from './ai';
 
 /**
@@ -103,16 +103,16 @@ function chooseNormalPolicyRolloutCard(
 }
 
 /**
- * Grand Katika Monte Carlo Determinization (PIMC) Engine:
+ * Shared Monte Carlo Determinization (PIMC) Engine:
+ * Used for both EXPERT (light MC: 8ms, 20-120 samples) and GRAND_MASTER (25ms, 60-400 samples).
  * Evaluates every legal candidate card by sampling plausible assignments
  * of unseen cards across opponents respecting known voids, and playing out
  * the remainder of the deal under the Normal policy.
  *
- * Chooses the card that maximizes the expected pot payoff (with Kora x2 and Double Kora x4).
- * Enforces an adaptive 25ms budget with 60-400 samples.
+ * Chooses the card that maximizes expected pot payoff according to level configuration.
  * NEVER accesses opponent hands: strictly legal public information inference.
  */
-export function chooseGrandMasterMonteCarlo(
+export function chooseMonteCarloAICard(
   validCards: Card[],
   hand: Card[],
   leadSuit: Suit | null,
@@ -122,11 +122,13 @@ export function chooseGrandMasterMonteCarlo(
   activePlayerCount: number,
   players: Player[],
   myPlayerIndex: number,
-  knownVoids: Map<number, Set<Suit>>
+  knownVoids: Map<number, Set<Suit>>,
+  level: 'EXPERT' | 'GRAND_MASTER' = 'GRAND_MASTER'
 ): Card {
   if (validCards.length === 1) return validCards[0];
 
   const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const config = level === 'EXPERT' ? EXPERT_CONFIG : GRAND_MASTER_CONFIG;
   const {
     TIME_BUDGET_MS,
     MIN_SAMPLES,
@@ -134,8 +136,7 @@ export function chooseGrandMasterMonteCarlo(
     BATCH_SIZE,
     STANDARD_PAYOFF_MULTIPLIER,
     KORA_PAYOFF_MULTIPLIER,
-    DOUBLE_KORA_PAYOFF_MULTIPLIER,
-  } = GRAND_MASTER_CONFIG;
+  } = config;
 
   // 1. Gather all public cards played so far
   const cardsPlayedSoFar: Card[] = [];
@@ -416,15 +417,17 @@ export function chooseGrandMasterMonteCarlo(
     }
   }
 
-  // 4. Select candidate maximizing pot win rate, with a gentle Kora bonus that never risks the pot
+  // 4. Select candidate maximizing pot win rate, with a Kora bonus weighted by level configuration
   let bestCard = validCards[0];
   let bestScore = -1;
+
+  // Weight Kora bonus based on level's KORA_PAYOFF_MULTIPLIER relative to standard payoff
+  const koraWeight = (KORA_PAYOFF_MULTIPLIER - STANDARD_PAYOFF_MULTIPLIER) * 0.15;
 
   for (const candidate of validCards) {
     const winRate = wins[candidate.id] / Math.max(1, samplesDone);
     const koraRate = koraWins[candidate.id] / Math.max(1, samplesDone);
-    // Win rate is dominant (1.0). Kora bonus (0.15) only differentiates comparable moves.
-    const score = winRate + koraRate * 0.15;
+    const score = winRate * STANDARD_PAYOFF_MULTIPLIER + koraRate * koraWeight;
 
     if (
       score > bestScore ||
@@ -437,4 +440,32 @@ export function chooseGrandMasterMonteCarlo(
   }
 
   return bestCard;
+}
+
+/** Backward-compatible export wrapper for Grand Katika */
+export function chooseGrandMasterMonteCarlo(
+  validCards: Card[],
+  hand: Card[],
+  leadSuit: Suit | null,
+  currentPlays: PlayedCard[],
+  trickNumber: number,
+  tricksHistory: Trick[],
+  activePlayerCount: number,
+  players: Player[],
+  myPlayerIndex: number,
+  knownVoids: Map<number, Set<Suit>>
+): Card {
+  return chooseMonteCarloAICard(
+    validCards,
+    hand,
+    leadSuit,
+    currentPlays,
+    trickNumber,
+    tricksHistory,
+    activePlayerCount,
+    players,
+    myPlayerIndex,
+    knownVoids,
+    'GRAND_MASTER'
+  );
 }

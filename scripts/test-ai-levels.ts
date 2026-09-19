@@ -157,3 +157,92 @@ console.log(`   Grand Katika: ${(r4.p1Wins / 3).toFixed(1)}% | Expert: ${(r4.p2W
 console.log('5. Grand Katika vs Facile:');
 const r5 = runDuel('GRAND_MASTER', 'EASY', 300);
 console.log(`   Grand Katika: ${(r5.p1Wins / 3).toFixed(1)}% | Facile: ${(r5.p2Wins / 3).toFixed(1)}% | Kora: ${(r5.koraCount / 3).toFixed(1)}%`);
+
+function run4PlayerMatch(targetDiff: AIDifficulty, otherDiff: AIDifficulty, numDeals: number): number {
+  let targetWins = 0;
+  for (let d = 0; d < numDeals; d++) {
+    const deck = shuffleDeck(build31Deck());
+    const { hands } = dealCards(deck, 4, d % 4);
+    const diffs: AIDifficulty[] = [targetDiff, otherDiff, otherDiff, otherDiff];
+    const players: Player[] = hands.map((h, i) => ({
+      id: `p${i}`,
+      name: `Bot_${diffs[i]}_${i}`,
+      avatarSeed: `${i}`,
+      isHuman: false,
+      hand: [...h],
+      tricksWonInRound: 0,
+      score: 0,
+      capital: 10,
+      isEliminated: false,
+    }));
+
+    let currentTurn = d % 4;
+    const tricksHistory: Trick[] = [];
+
+    for (let trickNum = 1; trickNum <= 5; trickNum++) {
+      const currentPlays: PlayedCard[] = [];
+      let leadSuit: Suit | null = null;
+
+      for (let step = 0; step < 4; step++) {
+        const pIdx = currentTurn;
+        const player = players[pIdx];
+        const validCards = getPlayableCards(player.hand, leadSuit);
+        const card = chooseAICard(
+          player.hand,
+          leadSuit,
+          currentPlays,
+          trickNum,
+          'CONSERVATIVE',
+          tricksHistory,
+          4,
+          diffs[pIdx],
+          players,
+          pIdx
+        );
+
+        player.hand = player.hand.filter((c) => c.id !== card.id);
+        if (step === 0) leadSuit = card.suit;
+
+        currentPlays.push({
+          playerIndex: pIdx,
+          playerName: player.name,
+          card,
+          isLeadCard: step === 0,
+          isMatchingSuit: leadSuit ? card.suit === leadSuit : true,
+          isWinningSoFar: false,
+          playedOrder: step + 1,
+        });
+
+        currentTurn = (currentTurn + 1) % 4;
+      }
+
+      const { winnerPlay } = determineTrickWinner(currentPlays, leadSuit);
+      const winnerIdx = winnerPlay.playerIndex;
+      players[winnerIdx].tricksWonInRound++;
+
+      tricksHistory.push({
+        trickNumber: trickNum,
+        leadPlayerIndex: currentPlays[0].playerIndex,
+        leadPlayerName: currentPlays[0].playerName,
+        leadSuit: leadSuit!,
+        plays: currentPlays,
+        winnerIndex: winnerIdx,
+        winnerName: players[winnerIdx].name,
+        winningCard: winnerPlay.card,
+        isComplete: true,
+      });
+
+      currentTurn = winnerIdx;
+
+      if (trickNum === 5 && winnerIdx === 0) {
+        targetWins++;
+      }
+    }
+  }
+  return (targetWins / numDeals) * 100;
+}
+
+console.log('6. 4-Player Match: 1 Expert vs 3 Normal (500 deals):');
+const p4WinRate = run4PlayerMatch('EXPERT', 'NORMAL', 500);
+console.log(`   Expert Win Rate (4 players): ${p4WinRate.toFixed(1)}%`);
+

@@ -37,6 +37,22 @@ export const NORMAL_CONFIG = {
 // 3. NIVEAU EXPERT (EXPERT)
 // ============================================================================
 export const EXPERT_CONFIG = {
+  /** Utilise la simulation Monte Carlo par déterminisation (PIMC) légère */
+  USE_MONTE_CARLO: true,
+  /** Budget de temps maximal par coup en millisecondes */
+  TIME_BUDGET_MS: 8,
+  /** Nombre minimum d'échantillons de donnes plausibles */
+  MIN_SAMPLES: 20,
+  /** Nombre maximum d'échantillons de donnes plausibles */
+  MAX_SAMPLES: 120,
+  /** Taille de lot pour la vérification du temps d'exécution adaptatif */
+  BATCH_SIZE: 10,
+  /** Multiplicateur espéré pour une victoire standard du pot (x1) */
+  STANDARD_PAYOFF_MULTIPLIER: 1.0,
+  /** Multiplicateur espéré pour un Kora (x1.5) */
+  KORA_PAYOFF_MULTIPLIER: 1.5,
+  /** Multiplicateur espéré pour un Double Kora (x2.0) */
+  DOUBLE_KORA_PAYOFF_MULTIPLIER: 2.0,
   /** Aucun coup aléatoire */
   RANDOM_MOVE_RATE: 0.0,
   /** Suivi dynamique complet des cartes maîtresses */
