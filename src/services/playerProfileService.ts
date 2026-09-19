@@ -14,7 +14,9 @@ import {
   query,
   orderBy,
   limit,
+  startAfter,
 } from 'firebase/firestore';
+import { estimateNetFromHistoryRecord } from '../utils/settlement';
 import { auth, db } from '../lib/firebase';
 import {
   PlayerProfile,
@@ -450,6 +452,7 @@ export const playerProfileService = {
             stats: finalStats,
             scoreVersion: parsed.scoreVersion,
             chipsFixVersion: parsed.chipsFixVersion,
+            fortuneFixVersion: parsed.fortuneFixVersion,
             soloDaily: parsed.soloDaily,
             fairPlay: mergedFairPlay,
             honorificTitleId: parsed.honorificTitleId || 'APPRENTI',
@@ -640,8 +643,25 @@ export const playerProfileService = {
     tricksWon?: number;
     roomId?: string;
     difficulty?: 'EASY' | 'NORMAL' | 'EXPERT' | 'GRAND_MASTER' | string;
+    settlement?: { gross: number; net: number };
   }): Promise<PlayerProfile> {
     const profile = this.getLocalProfile();
+    if (params.id) {
+      try {
+        const storedIdsRaw = localStorage.getItem('njambo_recorded_result_ids_v1');
+        let recordedIds: string[] = storedIdsRaw ? JSON.parse(storedIdsRaw) : [];
+        if (!Array.isArray(recordedIds)) {
+          recordedIds = [];
+        }
+        if (recordedIds.includes(params.id)) {
+          console.log(`[PlayerProfileService] Duplicate recordPartieResult detected for ID: ${params.id}. Aborting.`);
+          return profile;
+        }
+      } catch (e) {
+        console.warn('[PlayerProfileService] Error checking duplicate result ID:', e);
+      }
+    }
+
     const history = this.getLocalHistory();
 
     const partieId = params.id || `partie_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -784,11 +804,18 @@ export const playerProfileService = {
       stats.soloFortune = stats.soloGains - stats.soloPertes;
     } else {
       stats.multiplayerGamesPlayed = (stats.multiplayerGamesPlayed || 0) + 1;
-      const gain = params.isWinner ? params.potWon : 0;
-      const loss = params.isWinner ? params.baseBet : Math.abs(params.netChipsDelta);
-      stats.multiplayerGains = (stats.multiplayerGains || 0) + gain;
-      stats.multiplayerPertes = (stats.multiplayerPertes || 0) + loss;
-      stats.fortune = stats.multiplayerGains - stats.multiplayerPertes;
+      if (params.settlement) {
+        const { gross, net } = params.settlement;
+        stats.multiplayerGains = (stats.multiplayerGains || 0) + gross;
+        stats.multiplayerPertes = (stats.multiplayerPertes || 0) + (gross - net);
+        stats.fortune = stats.multiplayerGains - stats.multiplayerPertes;
+      } else {
+        const gain = params.isWinner ? params.potWon : 0;
+        const loss = params.isWinner ? params.baseBet : Math.abs(params.netChipsDelta);
+        stats.multiplayerGains = (stats.multiplayerGains || 0) + gain;
+        stats.multiplayerPertes = (stats.multiplayerPertes || 0) + loss;
+        stats.fortune = stats.multiplayerGains - stats.multiplayerPertes;
+      }
     }
 
     // Calculer les ratios de victoire
@@ -865,6 +892,23 @@ export const playerProfileService = {
 
     this.saveLocalProfile(updatedProfile);
 
+    if (params.id) {
+      try {
+        const storedIdsRaw = localStorage.getItem('njambo_recorded_result_ids_v1');
+        let recordedIds: string[] = storedIdsRaw ? JSON.parse(storedIdsRaw) : [];
+        if (!Array.isArray(recordedIds)) {
+          recordedIds = [];
+        }
+        recordedIds.push(params.id);
+        if (recordedIds.length > 200) {
+          recordedIds = recordedIds.slice(recordedIds.length - 200);
+        }
+        localStorage.setItem('njambo_recorded_result_ids_v1', JSON.stringify(recordedIds));
+      } catch (e) {
+        console.warn('[PlayerProfileService] Error saving duplicate result ID:', e);
+      }
+    }
+
     // Invalidate local leaderboard cache to force fresh fetch on next open
     try {
       localStorage.removeItem('njambo_leaderboard_cache_v2');
@@ -915,7 +959,7 @@ export const playerProfileService = {
    */
   async recordGame(
     item: Omit<PlayerGameHistoryItem, 'id' | 'createdAt'> & { id?: string; createdAt?: number },
-    options?: { skipStatsIncrement?: boolean }
+    options?: { skipStatsIncrement?: boolean; skipGamesPlayedIncrement?: boolean }
   ): Promise<PlayerProfile> {
     const profile = this.getLocalProfile();
     const history = this.getLocalHistory();
@@ -970,11 +1014,13 @@ export const playerProfileService = {
     if (item.recordType === 'MANCHE' || !item.recordType) {
       if (item.status === 'abandoned' || item.winType === 'FORFEIT') {
         // Abandon: count as 1 played game without win (once)
-        stats.gamesPlayed = (stats.gamesPlayed || 0) + 1;
-        if (item.mode === 'SOLO') {
-          stats.soloGamesPlayed = (stats.soloGamesPlayed || 0) + 1;
-        } else {
-          stats.multiplayerGamesPlayed = (stats.multiplayerGamesPlayed || 0) + 1;
+        if (!options?.skipGamesPlayedIncrement) {
+          stats.gamesPlayed = (stats.gamesPlayed || 0) + 1;
+          if (item.mode === 'SOLO') {
+            stats.soloGamesPlayed = (stats.soloGamesPlayed || 0) + 1;
+          } else {
+            stats.multiplayerGamesPlayed = (stats.multiplayerGamesPlayed || 0) + 1;
+          }
         }
         stats.gamesLost = Math.max(0, stats.gamesPlayed - stats.gamesWon);
         stats.winRate = stats.gamesPlayed > 0 ? Math.round((stats.gamesWon / stats.gamesPlayed) * 100) : 0;
@@ -1291,62 +1337,105 @@ export const playerProfileService = {
       const histSnap = await getDocs(histQuery);
       const historyItems: PlayerGameHistoryItem[] = histSnap.docs.map((d) => d.data() as PlayerGameHistoryItem);
 
-      // Consolidate real-time stats from the 15 game records
+      // Consolidate real-time stats using the maximum between the cloud profile and local profile
+      const cloudStats: Partial<PlayerStats> = profileData.stats || {};
+      const localProfile = this.getLocalProfile();
+      const localStats = localProfile.stats || {};
+
+      // Les compteurs cumulés numériques
+      const cumulativeFields: Array<keyof PlayerStats> = [
+        'partiesPlayed',
+        'partiesWon',
+        'soloGamesWon',
+        'multiplayerGamesWon',
+        'soloGamesPlayed',
+        'multiplayerGamesPlayed',
+        'soloKoraCount',
+        'multiplayerKoraCount',
+        'soloDoubleKoraCount',
+        'multiplayerDoubleKoraCount',
+        'soloGains',
+        'soloPertes',
+        'multiplayerGains',
+        'multiplayerPertes',
+        'gamesPlayed',
+        'gamesWon',
+      ];
+
       const consolidatedStats: PlayerStats = {
         ...DEFAULT_PLAYER_STATS,
-        ...(profileData.stats || {}),
+        ...localStats,
+        ...cloudStats,
       };
 
+      // Étape 1 : Diagnostic - Calculer à titre de diagnostic ce qu'aurait été la valeur avec l'ancien algorithme basé sur l'historique des 15 derniers items.
       const parties = historyItems.filter((h) => h.recordType === 'PARTIE');
       const manches = historyItems.filter((h) => h.recordType === 'MANCHE' || !h.recordType);
-
-      consolidatedStats.partiesPlayed = parties.length > 0 ? parties.length : consolidatedStats.partiesPlayed;
-      consolidatedStats.partiesWon = parties.filter((p) => p.isWinner).length;
-      consolidatedStats.soloGamesWon = parties.filter((p) => p.isWinner && p.mode === 'SOLO').length;
-      consolidatedStats.multiplayerGamesWon = parties.filter((p) => p.isWinner && p.mode === 'MULTIPLAYER').length;
-
-      // Extract details from history if available
       const soloParties = parties.filter((p) => p.mode === 'SOLO');
       const multiParties = parties.filter((p) => p.mode === 'MULTIPLAYER');
 
-      consolidatedStats.soloGamesPlayed = soloParties.length;
-      consolidatedStats.multiplayerGamesPlayed = multiParties.length;
+      const diagRecalc: Partial<PlayerStats> = {
+        partiesPlayed: parties.length > 0 ? parties.length : cloudStats.partiesPlayed || 0,
+        partiesWon: parties.filter((p) => p.isWinner).length,
+        soloGamesWon: parties.filter((p) => p.isWinner && p.mode === 'SOLO').length,
+        multiplayerGamesWon: parties.filter((p) => p.isWinner && p.mode === 'MULTIPLAYER').length,
+        soloGamesPlayed: soloParties.length,
+        multiplayerGamesPlayed: multiParties.length,
+        soloKoraCount: soloParties.filter((p) => p.winType === 'KORA' || p.winType === 'DOUBLE_KORA').length,
+        multiplayerKoraCount: multiParties.filter((p) => p.winType === 'KORA' || p.winType === 'DOUBLE_KORA').length,
+        soloDoubleKoraCount: soloParties.filter((p) => p.winType === 'DOUBLE_KORA').length,
+        multiplayerDoubleKoraCount: multiParties.filter((p) => p.winType === 'DOUBLE_KORA').length,
+      };
 
-      consolidatedStats.soloKoraCount = soloParties.filter((p) => p.winType === 'KORA' || p.winType === 'DOUBLE_KORA').length;
-      consolidatedStats.multiplayerKoraCount = multiParties.filter((p) => p.winType === 'KORA' || p.winType === 'DOUBLE_KORA').length;
-      consolidatedStats.soloDoubleKoraCount = soloParties.filter((p) => p.winType === 'DOUBLE_KORA').length;
-      consolidatedStats.multiplayerDoubleKoraCount = multiParties.filter((p) => p.winType === 'DOUBLE_KORA').length;
-
-      let soloGains = 0;
-      let soloPertes = 0;
+      let diagSoloGains = 0;
+      let diagSoloPertes = 0;
       soloParties.forEach((p) => {
         const gain = p.isWinner ? (p.potWon || 0) : 0;
         const loss = p.isWinner ? (p.baseBet || 0) : Math.abs(p.netChipsDelta || 0);
-        soloGains += gain;
-        soloPertes += loss;
+        diagSoloGains += gain;
+        diagSoloPertes += loss;
       });
-      consolidatedStats.soloGains = soloGains;
-      consolidatedStats.soloPertes = soloPertes;
-      consolidatedStats.soloFortune = soloGains - soloPertes;
+      diagRecalc.soloGains = diagSoloGains;
+      diagRecalc.soloPertes = diagSoloPertes;
 
-      let multiGains = 0;
-      let multiPertes = 0;
+      let diagMultiGains = 0;
+      let diagMultiPertes = 0;
       multiParties.forEach((p) => {
         const gain = p.isWinner ? (p.potWon || 0) : 0;
         const loss = p.isWinner ? (p.baseBet || 0) : Math.abs(p.netChipsDelta || 0);
-        multiGains += gain;
-        multiPertes += loss;
+        diagMultiGains += gain;
+        diagMultiPertes += loss;
       });
-      consolidatedStats.multiplayerGains = multiGains;
-      consolidatedStats.multiplayerPertes = multiPertes;
-      consolidatedStats.fortune = multiGains - multiPertes;
+      diagRecalc.multiplayerGains = diagMultiGains;
+      diagRecalc.multiplayerPertes = diagMultiPertes;
+      diagRecalc.gamesPlayed = manches.length > 0 ? manches.length : cloudStats.gamesPlayed || 0;
+      diagRecalc.gamesWon = manches.filter((m) => m.isWinner).length;
 
-      consolidatedStats.gamesPlayed = manches.length > 0 ? manches.length : consolidatedStats.gamesPlayed;
-      consolidatedStats.gamesWon = manches.filter((m) => m.isWinner).length;
-      consolidatedStats.gamesLost = Math.max(0, consolidatedStats.gamesPlayed - consolidatedStats.gamesWon);
+      // Afficher le diagnostic si une valeur recalculée à partir des 15 derniers items est inférieure à la valeur du profil cloud
+      Object.entries(diagRecalc).forEach(([field, val]) => {
+        const cloudVal = (cloudStats as any)[field] || 0;
+        const recalcVal = (val as number) || 0;
+        if (recalcVal < cloudVal) {
+          console.warn(
+            `[PlayerProfileService] [LOT 5 DIAGNOSTIC] Le champ '${field}' recalculé à partir des 15 dernières donnes (${recalcVal}) est inférieur à la valeur du profil cloud (${cloudVal}).`
+          );
+        }
+      });
+
+      // Étape 2 : Correction - Prendre le maximum pour chaque compteur cumulé numérique entre le profil cloud et local
+      cumulativeFields.forEach((field) => {
+        const cloudVal = typeof cloudStats[field] === 'number' ? (cloudStats[field] as number) : 0;
+        const localVal = typeof localStats[field] === 'number' ? (localStats[field] as number) : 0;
+        (consolidatedStats as any)[field] = Math.max(cloudVal, localVal);
+      });
+
+      // Recalculer les valeurs dérivées
+      consolidatedStats.fortune = (consolidatedStats.multiplayerGains || 0) - (consolidatedStats.multiplayerPertes || 0);
+      consolidatedStats.soloFortune = (consolidatedStats.soloGains || 0) - (consolidatedStats.soloPertes || 0);
+      consolidatedStats.gamesLost = Math.max(0, (consolidatedStats.gamesPlayed || 0) - (consolidatedStats.gamesWon || 0));
       consolidatedStats.winRate =
-        consolidatedStats.gamesPlayed > 0
-          ? Math.round((consolidatedStats.gamesWon / consolidatedStats.gamesPlayed) * 100)
+        (consolidatedStats.gamesPlayed || 0) > 0
+          ? Math.round(((consolidatedStats.gamesWon || 0) / (consolidatedStats.gamesPlayed || 0)) * 100)
           : 0;
 
       // Apply fallback rule for older users who have victories but no detail set
@@ -1360,7 +1449,6 @@ export const playerProfileService = {
       }
 
       // Reconcile chips: protect against browser cache wipe by prioritizing cloud balance
-      const localProfile = this.getLocalProfile();
       const serverChips = typeof profileData.chips === 'number' && !isNaN(profileData.chips) ? profileData.chips : 1000;
       const localChips = typeof localProfile.chips === 'number' && !isNaN(localProfile.chips) ? localProfile.chips : 1000;
       const resolvedChips = Math.max(serverChips, localChips);
@@ -1377,15 +1465,49 @@ export const playerProfileService = {
       };
       this.saveLocalProfile(updatedProfile);
 
-      // Trigger retroactive solo fortune migration if not yet executed for this profile
-      if (profileData && profileData.chipsFixVersion !== 1) {
-        this.migrateSoloFortuneHistory(updatedProfile, userId).catch((err) => {
-          console.warn('[PlayerProfileService] migrateSoloFortuneHistory error:', err);
-        });
+      // Trigger retroactive migrations sequentially to avoid concurrent state overwriting (protected by isChipsFixRunning)
+      if (profileData) {
+        if (profileData.chipsFixVersion !== 1) {
+          this.migrateSoloFortuneHistory(updatedProfile, userId)
+            .then(() => {
+              if (profileData.fortuneFixVersion !== 2) {
+                const latestProfile = this.getLocalProfile();
+                return this.migrateMultiplayerFortuneHistory(latestProfile, userId);
+              }
+            })
+            .catch((err) => {
+              console.warn('[PlayerProfileService] Error during sequenced migrations:', err);
+            });
+        } else if (profileData.fortuneFixVersion !== 2) {
+          this.migrateMultiplayerFortuneHistory(updatedProfile, userId).catch((err) => {
+            console.warn('[PlayerProfileService] migrateMultiplayerFortuneHistory error:', err);
+          });
+        }
+      }
+
+      // Déterminer s'il y a des différences par rapport au cloud pour éviter des écritures inutiles
+      let hasChanges = resolvedChips !== serverChips;
+      if (!hasChanges) {
+        const cloudStatsKeys = Object.keys(cloudStats) as Array<keyof PlayerStats>;
+        for (const key of cloudStatsKeys) {
+          if (finalConsolidatedStats[key] !== cloudStats[key]) {
+            hasChanges = true;
+            break;
+          }
+        }
+        if (!hasChanges) {
+          const finalStatsKeys = Object.keys(finalConsolidatedStats) as Array<keyof PlayerStats>;
+          for (const key of finalStatsKeys) {
+            if (finalConsolidatedStats[key] !== cloudStats[key]) {
+              hasChanges = true;
+              break;
+            }
+          }
+        }
       }
 
       // Save consolidated stats back to Firestore for authenticated users to ensure permanent server-side correctness
-      if (profileData.isGuest === false) {
+      if (profileData.isGuest === false && hasChanges) {
         try {
           const userRef = doc(db, 'users', userId);
           const statsToSave = { ...finalConsolidatedStats };
@@ -1393,12 +1515,24 @@ export const playerProfileService = {
             // Pour scoreVersion >= 2, ne JAMAIS réécrire masteryScore
             statsToSave.masteryScore = profileData.stats?.masteryScore ?? 0;
           }
+
+          // Double garde-fou : s'assurer qu'aucun compteur cumulé numérique n'est inférieur au cloud
+          cumulativeFields.forEach((field) => {
+            const cloudVal = typeof cloudStats[field] === 'number' ? (cloudStats[field] as number) : 0;
+            const currentVal = typeof statsToSave[field] === 'number' ? (statsToSave[field] as number) : 0;
+            if (currentVal < cloudVal) {
+              (statsToSave as any)[field] = cloudVal;
+            }
+          });
+
           await setDoc(userRef, { chips: resolvedChips, stats: statsToSave, updatedAt: Date.now() }, { merge: true });
           console.log('[PlayerProfileService] Successfully consolidated and synced stats & chips to Firestore in background.');
           await this.flushOfflineSyncQueue();
         } catch (err) {
           console.warn('[PlayerProfileService] Failed syncing consolidated stats to Firestore:', err);
         }
+      } else if (profileData.isGuest === false) {
+        console.log('[PlayerProfileService] Stats consolidated. No changes compared to Firestore profile. Sync skipped.');
       }
 
       return {
@@ -1708,6 +1842,7 @@ export const playerProfileService = {
       honorificTitleId: currentTitle.id,
       scoreVersion: targetScoreVersion,
       chipsFixVersion: cloudProfile?.chipsFixVersion || guestProfile?.chipsFixVersion,
+      fortuneFixVersion: cloudProfile?.fortuneFixVersion || guestProfile?.fortuneFixVersion,
       soloDaily: mergeSoloDaily(cloudProfile?.soloDaily, guestProfile?.soloDaily),
       guestMergedAt,
       createdAt: cloudProfile?.createdAt || guestProfile.createdAt || Date.now(),
@@ -2180,6 +2315,314 @@ export const playerProfileService = {
       console.log(
         `[PlayerProfileService] Solo fortune migration completed: ${itemsCorrectedCount} items corrected, adjustment C = ${C}.`
       );
+      return true;
+    } finally {
+      this.isChipsFixRunning = false;
+    }
+  },
+
+  /**
+   * Lot 6 — Recalcul rétroactif approximatif de la Fortune multijoueur.
+   * Exécutée une seule fois par profil (fortuneFixVersion = 2), protégée par le même verrou isChipsFixRunning.
+   */
+  async migrateMultiplayerFortuneHistory(profileParam?: PlayerProfile, targetUserId?: string): Promise<boolean> {
+    if (this.isChipsFixRunning) return false;
+
+    const profile = profileParam || this.getLocalProfile();
+    const uid = targetUserId || (auth?.currentUser ? auth.currentUser.uid : (profile.isGuest ? undefined : profile.uid));
+
+    // La migration ne s'exécute que si fortuneFixVersion !== 2, uniquement pour les comptes authentifiés.
+    if (profile.isGuest || !uid || !db) return false;
+    if (profile.fortuneFixVersion === 2) return false;
+
+    this.isChipsFixRunning = true;
+    try {
+      console.log('[PlayerProfileService] [LOT 6] Starting multiplayer fortune migration for user:', uid);
+      const historyItems: PlayerGameHistoryItem[] = [];
+
+      // 3. Lecture par pages de 500 triées par createdAt desc
+      try {
+        let lastDoc = null;
+        let hasMore = true;
+        while (hasMore) {
+          let q = query(
+            collection(db, 'users', uid, 'history'),
+            orderBy('createdAt', 'desc'),
+            limit(500)
+          );
+          if (lastDoc) {
+            q = query(
+              collection(db, 'users', uid, 'history'),
+              orderBy('createdAt', 'desc'),
+              startAfter(lastDoc),
+              limit(500)
+            );
+          }
+          const snap = await getDocs(q);
+          if (snap.empty) {
+            hasMore = false;
+          } else {
+            const pageDocs = snap.docs;
+            const items = pageDocs.map((d) => d.data() as PlayerGameHistoryItem);
+            historyItems.push(...items);
+            lastDoc = pageDocs[pageDocs.length - 1];
+            if (pageDocs.length < 500) {
+              hasMore = false;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[PlayerProfileService] Error reading history collection for multiplayer migration:', err);
+      }
+
+      // Si l'historique cloud est vide, essayer de lire l'historique local en dernier recours
+      let itemsToProcess = historyItems;
+      if (itemsToProcess.length === 0) {
+        itemsToProcess = this.getLocalHistory();
+      }
+
+      // Ne garder que recordType === 'PARTIE' et mode === 'MULTIPLAYER'.
+      // Ignorer les enregistrements déjà fixés et ceux commençant par res_ (Lot 4, déjà corrects).
+      const candidateItems = itemsToProcess.filter((h) => {
+        return (
+          h.recordType === 'PARTIE' &&
+          h.mode === 'MULTIPLAYER' &&
+          h.fortuneFix !== 2 &&
+          !h.id.startsWith('res_')
+        );
+      });
+
+      // --- SEQUENCE SYNCHRONE ET ATOMIQUE POUR RELIRE ET METTRE A JOUR LE PROFIL LOCAL ---
+      // Relis le profil local juste avant d'appliquer la correction, et fais la lecture, la modification et la sauvegarde locale dans une même séquence synchrone, sans await entre elles.
+      const latestProfile = this.getLocalProfile();
+      if (latestProfile.fortuneFixVersion === 2) return false;
+
+      // 4. Doublons. Grouper par roomId, roundsCount et isWinner
+      const groups = new Map<string, PlayerGameHistoryItem[]>();
+      candidateItems.forEach((item) => {
+        const rId = item.roomId || 'unknown_room';
+        const rounds = typeof item.roundsCount === 'number' ? item.roundsCount : (item.partieNumber || 1);
+        const win = Boolean(item.isWinner);
+        const key = `${rId}_${rounds}_${win}`;
+        if (!groups.has(key)) {
+          groups.set(key, []);
+        }
+        groups.get(key)!.push(item);
+      });
+
+      const duplicateItemIds = new Set<string>();
+      const keptItems: PlayerGameHistoryItem[] = [];
+
+      groups.forEach((items) => {
+        // Trier par createdAt ascendant (plus ancien d'abord)
+        const sorted = [...items].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+        let lastKept: PlayerGameHistoryItem | null = null;
+        for (const item of sorted) {
+          if (!lastKept) {
+            lastKept = item;
+            keptItems.push(item);
+          } else {
+            const diffSec = Math.abs((item.createdAt || 0) - (lastKept.createdAt || 0)) / 1000;
+            if (diffSec < 300) {
+              duplicateItemIds.add(item.id);
+            } else {
+              lastKept = item;
+              keptItems.push(item);
+            }
+          }
+        }
+      });
+
+      // 5 et 6. Calcul correct et cumul de l'écart total C
+      let totalC = 0;
+      const modifiedItems: PlayerGameHistoryItem[] = [];
+
+      for (const item of candidateItems) {
+        const isDup = duplicateItemIds.has(item.id);
+        const correctValue = isDup ? 0 : estimateNetFromHistoryRecord({
+          isWinner: Boolean(item.isWinner),
+          winType: item.winType || 'STANDARD',
+          baseBet: item.baseBet || 50,
+          playerCount: item.playerCount || 2,
+        });
+
+        let recordedNet = 0;
+        if (typeof item.netChipsDelta === 'number') {
+          recordedNet = item.netChipsDelta;
+        } else {
+          recordedNet = item.isWinner
+            ? (item.potWon || 0) - (item.baseBet || 50)
+            : -(item.baseBet || 50);
+        }
+
+        const ecart = correctValue - recordedNet;
+        totalC += ecart;
+
+        const updatedItem: PlayerGameHistoryItem = {
+          ...item,
+          netChipsDelta: correctValue,
+          fortuneFix: 2,
+        };
+        if (isDup) {
+          updatedItem.isDuplicate = true;
+        }
+        modifiedItems.push(updatedItem);
+      }
+
+      // LIMITES DE LA MIGRATION :
+      // - Les départs et déconnexions passés ne peuvent pas être récupérés (aucune trace de la perte).
+      // - Les plafonds de pénalité au capital, les joueurs exemptés et la mise escaladée sont ignorés : le résultat est une estimation.
+
+      // 7. Découpe de l'application en tranches d'au plus 20 000
+      const steps: number[] = [];
+      let remaining = Math.abs(totalC);
+      const CHUNK_LIMIT = 20000;
+      while (remaining > 0) {
+        const chunk = Math.min(remaining, CHUNK_LIMIT);
+        steps.push(chunk);
+        remaining -= chunk;
+      }
+
+      const cloudStats = latestProfile.stats || {};
+      let currentGains = typeof latestProfile.stats?.multiplayerGains === 'number' ? latestProfile.stats.multiplayerGains : 0;
+      let currentPertes = typeof latestProfile.stats?.multiplayerPertes === 'number' ? latestProfile.stats.multiplayerPertes : 0;
+      let currentStats = {
+        ...DEFAULT_PLAYER_STATS,
+        ...cloudStats,
+        multiplayerGains: currentGains,
+        multiplayerPertes: currentPertes,
+      };
+
+      let currentProfileState = { ...latestProfile };
+
+      if (totalC !== 0) {
+        for (const chunk of steps) {
+          if (totalC > 0) {
+            currentGains += chunk;
+          } else {
+            currentPertes += chunk;
+          }
+
+          currentStats = {
+            ...currentStats,
+            multiplayerGains: currentGains,
+            multiplayerPertes: currentPertes,
+            fortune: currentGains - currentPertes,
+          };
+
+          currentProfileState = {
+            ...currentProfileState,
+            stats: currentStats,
+            updatedAt: Date.now(),
+          };
+
+          this.saveLocalProfile(currentProfileState);
+        }
+      }
+
+      const finalProfile: PlayerProfile = {
+        ...currentProfileState,
+        fortuneFixVersion: 2,
+        updatedAt: Date.now(),
+      };
+
+      // Sauvegarde du profil local final
+      this.saveLocalProfile(finalProfile);
+
+      // Enregistrer l'historique mis à jour localement
+      if (modifiedItems.length > 0) {
+        const localHist = this.getLocalHistory();
+        const localMap = new Map<string, PlayerGameHistoryItem>();
+        localHist.forEach((item) => localMap.set(item.id, item));
+        modifiedItems.forEach((item) => localMap.set(item.id, item));
+        this.saveLocalHistory(Array.from(localMap.values()).slice(0, 100));
+      }
+      // --- FIN DE LA SEQUENCE SYNCHRONE ET ATOMIQUE ---
+
+      // --- DEBUT DES OPERATIONS ASYNCHRONES DE SYNC FIRESTORE ---
+      if (uid && db && !profile.isGuest) {
+        try {
+          // Sync des tranches d'écriture de stats vers Firestore
+          let firestoreGains = typeof cloudStats.multiplayerGains === 'number' ? cloudStats.multiplayerGains : 0;
+          let firestorePertes = typeof cloudStats.multiplayerPertes === 'number' ? cloudStats.multiplayerPertes : 0;
+
+          if (totalC !== 0) {
+            for (const chunk of steps) {
+              if (totalC > 0) {
+                firestoreGains += chunk;
+              } else {
+                firestorePertes += chunk;
+              }
+              const tempStats = {
+                ...currentStats,
+                multiplayerGains: firestoreGains,
+                multiplayerPertes: firestorePertes,
+                fortune: firestoreGains - firestorePertes,
+              };
+              await setDoc(
+                doc(db, 'users', uid),
+                {
+                  stats: tempStats,
+                  updatedAt: Date.now(),
+                },
+                { merge: true }
+              );
+            }
+          }
+
+          // Écriture de fortuneFixVersion: 2 finale
+          await setDoc(
+            doc(db, 'users', uid),
+            {
+              fortuneFixVersion: 2,
+              updatedAt: Date.now(),
+            },
+            { merge: true }
+          );
+
+          // Batch update history items vers Firestore (max 400 par lot)
+          if (modifiedItems.length > 0) {
+            for (let i = 0; i < modifiedItems.length; i += 400) {
+              const batchChunk = modifiedItems.slice(i, i + 400);
+              for (const item of batchChunk) {
+                const itemRef = doc(db, 'users', uid, 'history', item.id);
+                const payload: any = {
+                  netChipsDelta: item.netChipsDelta,
+                  fortuneFix: 2,
+                };
+                if (item.isDuplicate) {
+                  payload.isDuplicate = true;
+                }
+                await setDoc(itemRef, payload, { merge: true });
+              }
+            }
+          }
+        } catch (err) {
+          console.warn('[PlayerProfileService] Error syncing progressive multiplayer fortune to Firestore:', err);
+        }
+      }
+
+      // Invalider les caches du classement
+      try {
+        const { LeaderboardService } = await import('./leaderboardService');
+        LeaderboardService.clearCache();
+      } catch (err) {
+        console.warn('[PlayerProfileService] Error clearing leaderboard cache:', err);
+      }
+
+      // Rapport final
+      const report = {
+        timestamp: Date.now(),
+        userId: uid,
+        totalHistoryItemsFetched: historyItems.length,
+        candidateItemsCount: candidateItems.length,
+        duplicatesCount: duplicateItemIds.size,
+        adjustedValue: totalC,
+      };
+
+      localStorage.setItem('njambo_fortune_fix_report', JSON.stringify(report));
+      console.log('[PlayerProfileService] [LOT 6] Multiplayer fortune migration completed successfully.', report);
+
       return true;
     } finally {
       this.isChipsFixRunning = false;

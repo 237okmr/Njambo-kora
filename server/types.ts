@@ -1,4 +1,4 @@
-import { Card, GameState, MultiplayerRoom, Player, RoomPlayer, RoomStatus, EmoteMessage, Suit, PartieWinType, PublicRoomSummary, GameInvitation, UserPresence } from '../src/types';
+import { Card, GameState, MultiplayerRoom, Player, RoomPlayer, RoomStatus, EmoteMessage, Suit, PartieWinType, PublicRoomSummary, GameInvitation, UserPresence, PartieResult } from '../src/types';
 
 export interface ClientMessage {
   type:
@@ -36,8 +36,10 @@ export interface ClientMessage {
     | 'RESPOND_CAPACITY_EXTENSION'
     | 'PROPOSE_EARLY_CLOSE'
     | 'RESPOND_EARLY_CLOSE'
-    | 'GET_FRIENDS_PRESENCE';
+    | 'GET_FRIENDS_PRESENCE'
+    | 'ACK_PARTIE_RESULTS';
   roomCode?: string;
+  resultIds?: string[];
   playerId: string;
   playerName?: string;
   idToken?: string;
@@ -107,7 +109,8 @@ export interface ServerMessage {
     | 'PRESENCE_STATUS_CHANGED'
     | 'FRIENDS_PRESENCE_UPDATE'
     | 'QUICK_MATCH_RESULT'
-    | 'VERSION_HANDSHAKE';
+    | 'VERSION_HANDSHAKE'
+    | 'PARTIE_RESULTS';
   errorCode?: ServerErrorCode;
   room?: MultiplayerRoom;
   playerId?: string;
@@ -131,6 +134,7 @@ export interface ServerMessage {
   };
   presence?: UserPresence;
   presences?: UserPresence[];
+  partieResults?: PartieResult[];
   matchedRoomCode?: string;
   activeGameRoomCode?: string;
   protocolVersion?: number;

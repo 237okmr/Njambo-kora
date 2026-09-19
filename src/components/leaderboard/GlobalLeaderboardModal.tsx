@@ -67,6 +67,30 @@ export const GlobalLeaderboardModal: React.FC<GlobalLeaderboardModalProps> = ({
   const [selectedTimeframe, setSelectedTimeframe] = useState<LeaderboardTimeframe>('ALL');
   const [showMasteryHelp, setShowMasteryHelp] = useState<boolean>(false);
 
+  // Mémorisation des filtres pour l'onglet Fortune (CHIPS)
+  const savedTimeframeRef = React.useRef<LeaderboardTimeframe>('ALL');
+  const savedModeFilterRef = React.useRef<'ALL' | 'MULTIPLAYER' | 'SOLO'>('ALL');
+  const lastCategoryRef = React.useRef<LeaderboardCategory>('WINS');
+
+  useEffect(() => {
+    if (activeCategory === 'CHIPS') {
+      if (lastCategoryRef.current !== 'CHIPS') {
+        savedTimeframeRef.current = selectedTimeframe;
+        savedModeFilterRef.current = selectedModeFilter;
+        setSelectedTimeframe('ALL');
+        if (selectedModeFilter === 'SOLO') {
+          setSelectedModeFilter('ALL');
+        }
+      }
+    } else {
+      if (lastCategoryRef.current === 'CHIPS') {
+        setSelectedTimeframe(savedTimeframeRef.current);
+        setSelectedModeFilter(savedModeFilterRef.current);
+      }
+    }
+    lastCategoryRef.current = activeCategory;
+  }, [activeCategory, selectedTimeframe, selectedModeFilter]);
+
   const fetchLeaderboard = async (forceRefresh: boolean = false) => {
     setLoading(true);
     try {
@@ -131,6 +155,10 @@ export const GlobalLeaderboardModal: React.FC<GlobalLeaderboardModalProps> = ({
     // Apply 10 games threshold for WIN_RATE
     if (activeCategory === 'WIN_RATE') {
       result = result.filter((e) => e.gamesPlayed >= 10);
+    }
+    // Only show players with multiplayerGamesPlayed > 0 for CHIPS (Fortune)
+    if (activeCategory === 'CHIPS') {
+      result = result.filter((e) => (e.multiplayerGamesPlayed ?? 0) > 0);
     }
     return result;
   }, [entries, activeCategory]);
@@ -614,30 +642,37 @@ export const GlobalLeaderboardModal: React.FC<GlobalLeaderboardModalProps> = ({
             <div className="flex items-center gap-1 bg-slate-950/80 p-1 rounded-xl border border-slate-800 shrink-0">
               <button
                 onClick={() => setSelectedTimeframe('ALL')}
-                className={`px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all duration-200 cursor-pointer ${
+                disabled={activeCategory === 'CHIPS'}
+                className={`px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all duration-200 ${
                   selectedTimeframe === 'ALL'
                     ? 'bg-amber-500 text-slate-950 shadow-sm shadow-amber-500/20'
                     : 'text-slate-400 hover:text-slate-200'
-                }`}
+                } ${activeCategory === 'CHIPS' ? 'cursor-not-allowed' : 'cursor-pointer'}`}
               >
                 Tout temps
               </button>
               <button
                 onClick={() => setSelectedTimeframe('WEEK')}
-                className={`px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all duration-200 cursor-pointer ${
-                  selectedTimeframe === 'WEEK'
-                    ? 'bg-amber-500 text-slate-950 shadow-sm shadow-amber-500/20'
-                    : 'text-slate-400 hover:text-slate-200'
+                disabled={activeCategory === 'CHIPS'}
+                className={`px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all duration-200 ${
+                  activeCategory === 'CHIPS'
+                    ? 'opacity-30 text-slate-500 cursor-not-allowed'
+                    : selectedTimeframe === 'WEEK'
+                      ? 'bg-amber-500 text-slate-950 shadow-sm shadow-amber-500/20 cursor-pointer'
+                      : 'text-slate-400 hover:text-slate-200 cursor-pointer'
                 }`}
               >
                 Cette semaine
               </button>
               <button
                 onClick={() => setSelectedTimeframe('MONTH')}
-                className={`px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all duration-200 cursor-pointer ${
-                  selectedTimeframe === 'MONTH'
-                    ? 'bg-amber-500 text-slate-950 shadow-sm shadow-amber-500/20'
-                    : 'text-slate-400 hover:text-slate-200'
+                disabled={activeCategory === 'CHIPS'}
+                className={`px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all duration-200 ${
+                  activeCategory === 'CHIPS'
+                    ? 'opacity-30 text-slate-500 cursor-not-allowed'
+                    : selectedTimeframe === 'MONTH'
+                      ? 'bg-amber-500 text-slate-950 shadow-sm shadow-amber-500/20 cursor-pointer'
+                      : 'text-slate-400 hover:text-slate-200 cursor-pointer'
                 }`}
               >
                 Ce mois
@@ -666,16 +701,18 @@ export const GlobalLeaderboardModal: React.FC<GlobalLeaderboardModalProps> = ({
               >
                 <span>🌐 Multi</span>
               </button>
-              <button
-                onClick={() => setSelectedModeFilter('SOLO')}
-                className={`px-2.5 py-1 rounded-full text-[10px] font-bold border transition-all duration-200 shrink-0 flex items-center gap-1 cursor-pointer ${
-                  selectedModeFilter === 'SOLO'
-                    ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 shadow-sm shadow-amber-500/5'
-                    : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:text-slate-300 hover:border-slate-700'
-                }`}
-              >
-                <span>👤 Solo</span>
-              </button>
+              {activeCategory !== 'CHIPS' && (
+                <button
+                  onClick={() => setSelectedModeFilter('SOLO')}
+                  className={`px-2.5 py-1 rounded-full text-[10px] font-bold border transition-all duration-200 shrink-0 flex items-center gap-1 cursor-pointer ${
+                    selectedModeFilter === 'SOLO'
+                      ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 shadow-sm shadow-amber-500/5'
+                      : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:text-slate-300 hover:border-slate-700'
+                  }`}
+                >
+                  <span>👤 Solo</span>
+                </button>
+              )}
 
               {/* Reset button if any filter is active */}
               {(selectedModeFilter !== 'ALL' || selectedTimeframe !== 'ALL' || searchQuery.trim() !== '') && (
@@ -693,6 +730,14 @@ export const GlobalLeaderboardModal: React.FC<GlobalLeaderboardModalProps> = ({
               )}
             </div>
           </div>
+
+          {/* Short info note for Fortune (CHIPS category) */}
+          {activeCategory === 'CHIPS' && (
+            <div className="flex items-center gap-1.5 text-[10px] text-amber-400 bg-amber-500/5 px-2.5 py-1.5 rounded-lg border border-amber-500/10 mt-1 w-full">
+              <Info className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+              <span>Fortune : cumul multijoueur depuis le début</span>
+            </div>
+          )}
         </div>
 
         {/* Info banner for Score de Maîtrise (Classement tab) - Ultra-compact & Collapsible */}

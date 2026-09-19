@@ -216,6 +216,8 @@ export interface Player {
   prorataCapital?: number;
   consecutiveMissedTurns?: number;
   aiRelayPlaysCount?: number;
+  forfeitedForManche?: boolean; // siège gelé jusqu'à la fin de la manche
+  leftRoom?: boolean; // le joueur a quitté volontairement la salle
 }
 
 export interface PlayedCard {
@@ -299,6 +301,8 @@ export interface GameState {
   phase: GamePhase;
   players: Player[];
   pot: number;
+  dealParticipantIds?: string[]; // joueurs ayant payé leur mise à cette donne
+  forfeitPenaltyPaid?: Record<string, number>; // pénalités de forfait payées à cette donne
   baseBet: number;
   initialBaseBet?: number;
   initialCapital: number;
@@ -373,6 +377,8 @@ export interface RoomPlayer {
   prorataCapital?: number;
   consecutiveMissedTurns?: number;
   aiRelayPlaysCount?: number;
+  forfeitedForManche?: boolean; // siège gelé jusqu'à la fin de la manche
+  leftRoom?: boolean; // le joueur a quitté volontairement la salle
 }
 
 export interface PreviousPartieSummary {
@@ -387,6 +393,49 @@ export interface PreviousPartieSummary {
     deltaCapital: number;
     finalCapital: number;
   }[];
+}
+
+export interface PartieParticipantResult {
+  playerId: string;
+  name: string;
+  isHuman: boolean;
+  ante: number; // mise payée à cette donne
+  penaltyPaid: number; // pénalités payées (Kora de fin de donne + forfait)
+  gross: number; // montant reçu du pot (0 pour un perdant)
+  net: number; // gross - ante - penaltyPaid
+  tricksWon?: number;
+}
+
+export type PartieResultWinType = PartieWinType | 'EARLY_CLOSE';
+
+export type PartieEndReason =
+  | 'NORMAL'
+  | 'INSTANT_WIN'
+  | 'FOLD'
+  | 'FORFEIT'
+  | 'EARLY_CLOSE'
+  | 'CLAIM'
+  | 'THREE_SEVENS'
+  | 'UNDER_21'
+  | 'KORA'
+  | 'DOUBLE_KORA'
+  | 'TRICKS_COMPLETED'
+  | 'FORFEIT_VICTORY'
+  | 'FOLD_VICTORY';
+
+export interface PartieResult {
+  id: string; // `${roomId}_m${mancheNumber}_p${partieCount}`
+  roomId: string;
+  mancheNumber: number;
+  partieCount: number;
+  baseBet: number;
+  winnerId: string | null;
+  winType: PartieResultWinType;
+  endReason: PartieEndReason;
+  participants: PartieParticipantResult[];
+  burned: number; // jetons détruits (0 dans le cas normal)
+  mancheOver: boolean;
+  createdAt: number;
 }
 
 export interface BetIncreaseProposal {

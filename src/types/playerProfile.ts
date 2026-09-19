@@ -189,6 +189,7 @@ export interface PlayerProfile {
   stats: PlayerStats;
   scoreVersion?: number;
   chipsFixVersion?: number;
+  fortuneFixVersion?: number;
   soloDaily?: { day: number; points: number };
   statsLegacyBackup?: PlayerStats;
   fairPlay?: PlayerFairPlay;
@@ -219,6 +220,8 @@ export interface PlayerGameHistoryItem {
   potWon: number;
   netChipsDelta?: number; // Net positive or negative change in chips for this player
   chipsFix?: number;
+  fortuneFix?: number;
+  isDuplicate?: boolean;
   baseBet: number;
   roundsCount: number;
   partieNumber?: number;

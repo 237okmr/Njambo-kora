@@ -205,6 +205,80 @@ function GameApp() {
     setTimeout(() => setToastNotification(null), 3500);
   }, []);
 
+  // Lot 4 - Multiplayer accounting through onPartieResults
+  useEffect(() => {
+    const unsub = wsService.onPartieResults(async (results) => {
+      console.log('[App] Received partie results:', results);
+      const ackedIds: string[] = [];
+      const localPlayerId = wsService.getLocalPlayerId();
+      const currentUserUid = auth.currentUser?.uid;
+
+      for (const result of results) {
+        const localParticipant = result.participants.find(
+          (p) => p.playerId === localPlayerId || (currentUserUid && p.playerId === currentUserUid)
+        );
+
+        if (!localParticipant) {
+          console.log(`[App] Local player not found in participants for result ${result.id}. Skipping and acking.`);
+          ackedIds.push(result.id);
+          continue;
+        }
+
+        const isWinner = result.winnerId === localParticipant.playerId;
+        const winnerPart = result.winnerId ? result.participants.find((p) => p.playerId === result.winnerId) : null;
+        const winnerName = winnerPart ? winnerPart.name : 'Table Katika';
+
+        const passWinType = result.winType === 'EARLY_CLOSE' ? 'STANDARD' : result.winType;
+
+        const opponents = result.participants
+          .filter((p) => p.playerId !== localParticipant.playerId)
+          .map((p) => ({
+            id: p.playerId,
+            name: p.name,
+            isHuman: p.isHuman,
+            delta: p.net,
+          }));
+
+        // Track last received gross for current room to pass to recordGameResult (MANCHE record)
+        if (result.roomId) {
+          lastReceivedMultiplayerPotGrossRef.current = localParticipant.gross;
+        }
+
+        try {
+          await recordPartieResult({
+            id: 'res_' + result.id,
+            mode: 'MULTIPLAYER',
+            partieNumber: result.partieCount,
+            playerCount: result.participants.length,
+            winType: passWinType as any,
+            isWinner,
+            winnerId: result.winnerId || undefined,
+            winnerName,
+            potWon: localParticipant.gross,
+            netChipsDelta: localParticipant.net,
+            baseBet: result.baseBet,
+            roomId: result.roomId,
+            tricksWon: localParticipant.tricksWon || 0,
+            opponents,
+            settlement: { gross: localParticipant.gross, net: localParticipant.net },
+          });
+          ackedIds.push(result.id);
+        } catch (err) {
+          console.error('[App] Failed to record partie result', result.id, err);
+          // Stop processing further results, do not ack the current or subsequent ones.
+          break;
+        }
+      }
+
+      if (ackedIds.length > 0) {
+        console.log('[App] Acking partie results:', ackedIds);
+        wsService.ackPartieResults(ackedIds);
+      }
+    });
+
+    return () => unsub();
+  }, [recordPartieResult]);
+
   // PWA Install Hook
   const {
     showInstallModal,
@@ -948,6 +1022,8 @@ function GameApp() {
   const humanCapitalAtDealStartRef = useRef<number | null>(null);
   const betAtDealStartRef = useRef<number | null>(null);
   const prevPhaseRef = useRef<string | null>(null);
+  const lastReceivedMultiplayerPotGrossRef = useRef<number>(0);
+  const recordedManchesRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const phase = activeGameState.phase;
@@ -1103,15 +1179,7 @@ function GameApp() {
         let netDelta = 0;
 
         if (isOnlineActive) {
-          // Multijoueur inchangé
-          let winMultiplier = 1;
-          if (winType === 'DOUBLE_KORA') winMultiplier = 4;
-          else if (winType === 'KORA') winMultiplier = 2;
-
-          totalPotAttributed = effectivePot * winMultiplier;
-          netDelta = isLocalWinner
-            ? totalPotAttributed - effectiveBaseBet
-            : -effectiveBaseBet;
+          // Multijoueur : plus d'appel à recordPartieResult ni de calcul de gain de jetons ici
         } else {
           // Lot 4 - A: Jetons exacts en solo
           const finalHumanCapital = humanPlayerRecord?.capital ?? 0;
@@ -1159,7 +1227,7 @@ function GameApp() {
 
         // Lot 4 - B: Ne pas rappeler recordPartieResult si la donne a déjà été enregistrée à PARTIE_OVER
         const isSolo = !isOnlineActive;
-        const shouldRecordPartie = !isSolo || (prevPhase === 'DEALING' || prevPhase === 'PLAYING' || prevPhase === null);
+        const shouldRecordPartie = isSolo && (prevPhase === 'DEALING' || prevPhase === 'PLAYING' || prevPhase === null);
 
         if (shouldRecordPartie) {
           recordPartieResult({
@@ -1176,14 +1244,24 @@ function GameApp() {
             durationSeconds,
             opponents: opponentsList,
             tricksWon: localTricks,
-            roomId: isOnlineActive ? roomId : undefined,
+            roomId: undefined,
             difficulty: mode === 'SOLO' ? (activeGameState.aiDifficulty || gameState.aiDifficulty) : undefined,
           }).catch((err) => {
             console.warn('[App] recordPartieResult warning:', err);
           });
         }
 
-        if (isCompleted) {
+        const mancheRecordKey = isOnlineActive ? `${effectiveRoomId}_${effectiveMancheNumber}` : null;
+        let shouldRecordManche = isCompleted;
+        if (isCompleted && mancheRecordKey) {
+          if (recordedManchesRef.current.has(mancheRecordKey)) {
+            shouldRecordManche = false;
+          } else {
+            recordedManchesRef.current.add(mancheRecordKey);
+          }
+        }
+
+        if (shouldRecordManche) {
           recordGameResult({
             recordType: 'MANCHE',
             mode,
@@ -1192,8 +1270,8 @@ function GameApp() {
             isWinner: isLocalWinner,
             winnerName,
             winnerId,
-            potWon: totalPotAttributed,
-            netChipsDelta: netDelta,
+            potWon: isOnlineActive ? (lastReceivedMultiplayerPotGrossRef.current || 0) : totalPotAttributed,
+            netChipsDelta: isOnlineActive ? 0 : netDelta,
             baseBet: effectiveBaseBet,
             roundsCount: partieCount,
             durationSeconds,
@@ -1642,7 +1720,7 @@ function GameApp() {
       roundsCount: gameState.partieCount || 1,
       status: 'abandoned',
       difficulty: mode === 'SOLO' ? (activeGameState.aiDifficulty || gameState.aiDifficulty) : undefined,
-    }).catch(console.warn);
+    }, { skipGamesPlayedIncrement: true }).catch(console.warn);
 
     activeMancheSessionIdRef.current = null;
 
@@ -2501,7 +2579,7 @@ function GameApp() {
             baseBet: activeGameState.baseBet || 50,
             roundsCount: activeGameState.partieCount || 1,
             status: 'abandoned',
-          }).catch(console.warn);
+          }, { skipGamesPlayedIncrement: true }).catch(console.warn);
           if (isOnlineActive) {
             registerFairPlayIncident({
               type: 'FORFEIT',

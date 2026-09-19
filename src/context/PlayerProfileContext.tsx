@@ -65,10 +65,11 @@ interface PlayerProfileContextValue {
     tricksWon?: number;
     roomId?: string;
     difficulty?: 'EASY' | 'NORMAL' | 'EXPERT' | 'GRAND_MASTER' | string;
+    settlement?: { gross: number; net: number };
   }) => Promise<void>;
   recordGameResult: (
     item: Omit<PlayerGameHistoryItem, 'id' | 'createdAt'> & { id?: string; createdAt?: number },
-    options?: { skipStatsIncrement?: boolean }
+    options?: { skipStatsIncrement?: boolean; skipGamesPlayedIncrement?: boolean }
   ) => Promise<void>;
   registerFairPlayIncident: (params: {
     type: 'FORFEIT' | 'FOLD_ROUND' | 'PROLONGED_DISCONNECT';
@@ -251,6 +252,7 @@ export const PlayerProfileProvider: React.FC<{ children: ReactNode }> = ({ child
       tricksWon?: number;
       roomId?: string;
       difficulty?: 'EASY' | 'NORMAL' | 'EXPERT' | 'GRAND_MASTER' | string;
+      settlement?: { gross: number; net: number };
     }) => {
       const updatedProfile = await playerProfileService.recordPartieResult(params);
       setProfile(updatedProfile);
@@ -263,7 +265,7 @@ export const PlayerProfileProvider: React.FC<{ children: ReactNode }> = ({ child
   const recordGameResult = useCallback(
     async (
       item: Omit<PlayerGameHistoryItem, 'id' | 'createdAt'> & { id?: string; createdAt?: number },
-      options?: { skipStatsIncrement?: boolean }
+      options?: { skipStatsIncrement?: boolean; skipGamesPlayedIncrement?: boolean }
     ) => {
       const updatedProfile = await playerProfileService.recordGame(item, options);
       setProfile(updatedProfile);

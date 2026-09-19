@@ -12,6 +12,10 @@ import {
   EmoteMessage,
   PreviousPartieSummary,
   Suit,
+  PartieResult,
+  PartieParticipantResult,
+  PartieResultWinType,
+  PartieEndReason,
 } from '../../src/types';
 import { build31Deck, dealCards, determineTrickWinner, getPlayableCards, isCardPlayable, shuffleDeck } from '../../src/utils/deck';
 import {
@@ -26,6 +30,7 @@ import {
 } from '../../src/utils/ai';
 import { getEngineConfig, KatikaEngineConfig } from './engineConfig';
 import { computePartieOutcome, applyPartiePayout, detectInstantWin } from '../../src/utils/gameRules';
+import { buildPartieResult, computeForfeitPenalty, FORFAIT_PENALITE_DES_PLI, FORFAIT_INACTIVITE_GELE_LE_SIEGE } from '../../src/utils/settlement';
 
 export interface ActiveRoomState {
   room: MultiplayerRoom;
@@ -44,6 +49,8 @@ export interface ActiveRoomState {
   emergencyTrickPlayed?: Map<string, number>;
   onPlayerForfeit?: (playerId: string, room: MultiplayerRoom, isExplicit?: boolean) => void;
   onPartieCompleted?: (room: MultiplayerRoom) => void;
+  partieResults?: PartieResult[];
+  onPartieResult?: (result: PartieResult, room: MultiplayerRoom) => void;
 }
 
 export function maskOpponentCards(room: MultiplayerRoom, viewerPlayerId: string): MultiplayerRoom {
@@ -209,7 +216,11 @@ export class ServerGameEngine {
     onStateChange: (room: MultiplayerRoom) => void,
     activeRoomState: ActiveRoomState
   ): void {
+    if (room.players) {
+      room.players = room.players.filter((p) => !p.leftRoom);
+    }
     this.clearAllTimers(activeRoomState);
+    activeRoomState.partieResults = [];
 
     const maxCapacity = Math.min(4, Math.max(2, room.maxPlayers || 4));
     // Keep only human players initially to reset bot roster cleanly (connected humans prioritized)
@@ -329,6 +340,8 @@ export class ServerGameEngine {
       partieCount: 1,
       roundCount: 1,
       turnStartedAt: Date.now(),
+      dealParticipantIds: gamePlayers.map((p) => p.id),
+      forfeitPenaltyPaid: {},
     };
 
     room.status = 'PLAYING';
@@ -477,6 +490,11 @@ export class ServerGameEngine {
     gs.roundWinnerIndex = winnerIndex;
     gs.roundWinnerName = winner.name;
 
+    const capitalsBefore: Record<string, number> = {};
+    (gs.players || []).forEach((p) => {
+      capitalsBefore[p.id] = p.capital;
+    });
+
     const cfg = this.getConfig(activeRoomState);
     const payout = applyPartiePayout({
       capitals: (gs.players || []).map((p) => p.capital),
@@ -524,18 +542,13 @@ export class ServerGameEngine {
       return rp;
     });
 
-    room.previousPartieSummary = {
-      partieCount: gs.partieCount,
-      winnerName: winner.name,
-      winType,
-      potWon: netPot,
-      playersSummary: (gs.players || []).map((p) => ({
-        id: p.id,
-        name: p.name,
-        deltaCapital: p.id === winner.id ? netPot - gs.baseBet : -gs.baseBet,
-        finalCapital: p.capital,
-      })),
-    };
+    this.emitPartieResult(room, activeRoomState, {
+      winnerId: winner.id,
+      winType: winType as PartieResultWinType,
+      endReason: winType === 'THREE_SEVENS' ? 'THREE_SEVENS' : 'UNDER_21',
+      capitalsBefore,
+      grossByPlayerId: { [winner.id]: netPot },
+    });
 
     const transitionDelay = cfg.transitionDelayMs;
     room.roundEndAutoAdvanceAt = Date.now() + transitionDelay;
@@ -760,6 +773,112 @@ export class ServerGameEngine {
     }
   }
 
+  private static emitPartieResult(
+    room: MultiplayerRoom,
+    activeRoomState: ActiveRoomState,
+    params: {
+      winnerId: string | null;
+      winType: PartieResultWinType;
+      endReason: PartieEndReason;
+      capitalsBefore: Record<string, number>;
+      grossByPlayerId?: Record<string, number>;
+      allowBurned?: boolean;
+    }
+  ): PartieResult | null {
+    const gs = room.gameState;
+    if (!gs) return null;
+
+    const resultId = `${room.id}_m${room.mancheNumber ?? 1}_p${gs.partieCount}`;
+    if (!activeRoomState.partieResults) {
+      activeRoomState.partieResults = [];
+    }
+
+    const existing = activeRoomState.partieResults.find((r) => r.id === resultId);
+    if (existing) {
+      return existing;
+    }
+
+    const participantIds =
+      gs.dealParticipantIds && gs.dealParticipantIds.length > 0
+        ? gs.dealParticipantIds
+        : (gs.players || []).map((p) => p.id);
+
+    const participants: Omit<PartieParticipantResult, 'net'>[] = participantIds.map((pid) => {
+      const gp = (gs.players || []).find((p) => p.id === pid);
+      const rp = (room.players || []).find((p) => p.id === pid);
+      const name = gp?.name || rp?.name || pid;
+      const isHuman = gp ? gp.isHuman : rp ? rp.isHuman : true;
+      const ante = gs.baseBet;
+      const tricksWon = gp?.tricksWonInRound ?? rp?.tricksWonInRound ?? 0;
+
+      let gross = 0;
+      if (params.grossByPlayerId && pid in params.grossByPlayerId) {
+        gross = params.grossByPlayerId[pid];
+      } else if (params.winnerId && pid === params.winnerId) {
+        gross = gs.pot;
+      }
+
+      const capBefore = params.capitalsBefore[pid] ?? (gp?.capital ?? rp?.capital ?? 0);
+      const capAfter = gp?.capital ?? rp?.capital ?? 0;
+      const endPenalty = pid === params.winnerId ? 0 : Math.max(0, capBefore - capAfter);
+      const forfeitPenalty = gs.forfeitPenaltyPaid?.[pid] || 0;
+      const penaltyPaid = endPenalty + forfeitPenalty;
+
+      return {
+        playerId: pid,
+        name,
+        isHuman,
+        ante,
+        penaltyPaid,
+        gross,
+        tricksWon,
+      };
+    });
+
+    const isMancheOver = gs.phase === 'MANCHE_OVER' || room.status === 'MANCHE_OVER';
+
+    const { result, invariantOk, invariantError } = buildPartieResult({
+      id: resultId,
+      roomId: room.id,
+      mancheNumber: room.mancheNumber ?? 1,
+      partieCount: gs.partieCount,
+      baseBet: gs.baseBet,
+      winnerId: params.winnerId,
+      winType: params.winType,
+      endReason: params.endReason,
+      participants,
+      mancheOver: isMancheOver,
+      allowBurned: params.allowBurned,
+    });
+
+    if (!invariantOk && invariantError) {
+      console.warn(`[PartieResult Warning] Invariant error for ${resultId}: ${invariantError}`);
+    }
+
+    activeRoomState.partieResults.push(result);
+    if (activeRoomState.partieResults.length > 30) {
+      activeRoomState.partieResults.shift();
+    }
+
+    const winnerParticipant = result.participants.find((p) => p.playerId === params.winnerId);
+    room.previousPartieSummary = {
+      partieCount: gs.partieCount,
+      winnerName: winnerParticipant?.name || gs.partieWinnerName || '',
+      winType: params.winType === 'EARLY_CLOSE' ? 'STANDARD' : (params.winType as PartieWinType),
+      potWon: winnerParticipant?.gross || 0,
+      winningCard: gs.currentTrick?.winningCard || undefined,
+      playersSummary: result.participants.map((p) => ({
+        id: p.playerId,
+        name: p.name,
+        deltaCapital: p.net,
+        finalCapital: gs.players.find((gp) => gp.id === p.playerId)?.capital ?? 0,
+      })),
+    };
+
+    activeRoomState.onPartieResult?.(result, room);
+    return result;
+  }
+
   private static resolvePartieOver(
     room: MultiplayerRoom,
     onStateChange: (room: MultiplayerRoom) => void,
@@ -887,26 +1006,13 @@ export class ServerGameEngine {
       return rp;
     });
 
-    // Create summary with true net delta (including the initial baseBet ante paid at start)
-    room.previousPartieSummary = {
-      partieCount: gs.partieCount,
-      winnerName: winner.name,
-      winType,
-      potWon: netWon,
-      winningCard: lastTrick.winningCard || undefined,
-      playersSummary: (gs.players || []).map((p) => {
-        const participated = gs.tricksHistory.some((t) => t.plays.some((play) => play.playerId === p.id));
-        const delta = p.id === winner.id
-          ? netWon - gs.baseBet
-          : (p.capital - (capitalsBefore[p.id] || p.capital)) - (participated ? gs.baseBet : 0);
-        return {
-          id: p.id,
-          name: p.name,
-          deltaCapital: delta,
-          finalCapital: p.capital,
-        };
-      }),
-    };
+    this.emitPartieResult(room, activeRoomState, {
+      winnerId: winner.id,
+      winType: winType as PartieResultWinType,
+      endReason: winType === 'DOUBLE_KORA' ? 'DOUBLE_KORA' : winType === 'KORA' ? 'KORA' : 'TRICKS_COMPLETED',
+      capitalsBefore,
+      grossByPlayerId: { [winner.id]: netWon },
+    });
 
     // Auto-advance timestamp only for next partie if manche is still ongoing
     if (gs.phase !== 'MANCHE_OVER') {
@@ -1023,7 +1129,7 @@ export class ServerGameEngine {
     (room.players || []).forEach((rp) => {
       if (rp.isHuman && rp.connected) {
         const gp = (gs.players || []).find((g) => g.id === rp.id);
-        if (gp && gp.isForfeit && rp.capital >= gs.baseBet) {
+        if (gp && gp.isForfeit && rp.capital >= gs.baseBet && !rp.forfeitedForManche) {
           rp.isForfeit = false;
           rp.isEliminated = false;
           rp.isSpectator = false;
@@ -1214,10 +1320,12 @@ export class ServerGameEngine {
 
     let pot = 0;
     let handIdx = 0;
+    const dealParticipantIds: string[] = [];
     (gs.players || []).forEach((p) => {
       p.tricksWonInRound = 0;
       p.isFoldedInRound = false;
       if (!p.isEliminated && !p.isForfeit && p.capital >= gs.baseBet) {
+        dealParticipantIds.push(p.id);
         p.hand = hands[handIdx++] || [];
         p.capital = Math.max(0, p.capital - gs.baseBet);
         p.score = p.capital;
@@ -1229,6 +1337,8 @@ export class ServerGameEngine {
         }
       }
     });
+    gs.dealParticipantIds = dealParticipantIds;
+    gs.forfeitPenaltyPaid = {};
 
     // Strictly sync room.players hands and state with gs.players
     (room.players || []).forEach((rp) => {
@@ -1432,7 +1542,7 @@ export class ServerGameEngine {
           this.replacePlayerWithBot(room, currentPlayer.id, onStateChange, activeRoomState, 'AFK');
         } else {
           console.log(`[Timer Expired] Player ${currentPlayer.name} reached 3 consecutive timeouts. Declaring player FORFEIT.`);
-          this.forfeitPlayer(room, currentPlayer.id, onStateChange, activeRoomState);
+          this.forfeitPlayer(room, currentPlayer.id, onStateChange, activeRoomState, false, { freezeSeat: FORFAIT_INACTIVITE_GELE_LE_SIEGE });
         }
       } else {
         console.log(`[Timer Expired] Player ${currentPlayer.name} timed out (${count}/3). Auto-playing valid card on their behalf.`);
@@ -1580,6 +1690,30 @@ export class ServerGameEngine {
 
     const rp = (room.players || []).find((p) => p.id === playerId);
     const gs = room.gameState;
+
+    if (rp && rp.forfeitedForManche) {
+      rp.connected = true;
+      rp.lastSeen = Date.now();
+      rp.isSpectator = true;
+      rp.hand = [];
+      rp.isForfeit = true;
+      rp.isEliminated = true;
+      
+      const emote: EmoteMessage = {
+        id: 'em_' + Math.random().toString(36).substring(2, 9),
+        playerId: 'system',
+        playerName: 'Table',
+        text: `👀 ${rp.name} est revenu en tant que spectateur (forfait pour le reste de la manche).`,
+        emoji: '👀',
+        timestamp: Date.now(),
+        isBot: true,
+      };
+      room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
+      room.updatedAt = Date.now();
+      onStateChange(room);
+      return;
+    }
+
     const relayCount = rp?.aiRelayPlaysCount || (gs?.players.find((p) => p.id === playerId)?.aiRelayPlaysCount) || 0;
     const hadAiRelayStarted = (rp?.isAiRelay || (gs?.players.find((p) => p.id === playerId)?.isAiRelay) || relayCount > 0);
 
@@ -1702,8 +1836,17 @@ export class ServerGameEngine {
     playerId: string,
     onStateChange: (room: MultiplayerRoom) => void,
     activeRoomState: ActiveRoomState,
-    isExplicit: boolean = false
+    isExplicit: boolean = false,
+    options?: { notify?: boolean; freezeSeat?: boolean }
   ): void {
+    const rp = (room.players || []).find((p) => p.id === playerId);
+    if (rp && rp.forfeitedForManche) {
+      return;
+    }
+
+    const notify = options?.notify ?? true;
+    const freezeSeat = options?.freezeSeat ?? true;
+
     if (activeRoomState.aiRelayTimers && activeRoomState.aiRelayTimers.has(playerId)) {
       clearTimeout(activeRoomState.aiRelayTimers.get(playerId)!);
       activeRoomState.aiRelayTimers.delete(playerId);
@@ -1713,13 +1856,15 @@ export class ServerGameEngine {
       activeRoomState.disconnectTimers.delete(playerId);
     }
 
-    const rp = (room.players || []).find((p) => p.id === playerId);
     if (rp) {
       rp.isForfeit = true;
       rp.isEliminated = true;
       rp.disconnectGraceExpiresAt = null;
       rp.hand = []; // Burning remaining cards
-      if (rp.isHuman) {
+      if (freezeSeat) {
+        rp.forfeitedForManche = true;
+      }
+      if (rp.isHuman && notify) {
         activeRoomState.onPlayerForfeit?.(playerId, room, isExplicit);
       }
     }
@@ -1738,6 +1883,9 @@ export class ServerGameEngine {
       gp.isEliminated = true;
       gp.disconnectGraceExpiresAt = null;
       gp.hand = []; // Burning remaining cards
+      if (freezeSeat) {
+        gp.forfeitedForManche = true;
+      }
     }
 
     // Migrate host role if the forfeiting player was the host
@@ -1753,23 +1901,17 @@ export class ServerGameEngine {
       }
     }
 
-    // Anti-fuite Kora / Double Kora check:
-    // If an active opponent won trick 4 with a 3 -> Double Kora multiplier (x4)
-    // If an active opponent is in Kora trajectory in trick 4/5 -> Kora multiplier (x2)
-    let antiFuiteMultiplier = 1;
-    if (gs.phase === 'PLAYING' && gs.currentTrickNumber >= 4) {
-      const trick4 = gs.tricksHistory.find((t) => t.trickNumber === 4);
-      const isTrick4WonWith3 = trick4 && trick4.winnerIndex !== null && gs.players[trick4.winnerIndex]?.id !== playerId && trick4.winningCard?.value === 3;
-      if (isTrick4WonWith3 && gs.enableDoubleKora) {
-        antiFuiteMultiplier = 4;
-      } else {
-        antiFuiteMultiplier = 2;
-      }
+    // Pénalité de forfait
+    let penalty = 0;
+    if (gs.phase === 'PLAYING' || gs.phase === 'TRICK_RESOLVED') {
+      penalty = computeForfeitPenalty({
+        baseBet: gs.baseBet,
+        capital: rp ? rp.capital : 0,
+        currentTrickNumber: gs.currentTrickNumber,
+      });
     }
 
-    if (antiFuiteMultiplier > 1 && gs.phase === 'PLAYING') {
-      const extraCost = (antiFuiteMultiplier - 1) * gs.baseBet;
-      const penalty = Math.min(rp ? rp.capital : 0, extraCost);
+    if (penalty > 0) {
       if (rp) {
         rp.capital = Math.max(0, rp.capital - penalty);
         rp.score = rp.capital;
@@ -1779,12 +1921,16 @@ export class ServerGameEngine {
         gs.players[gpIdx].score = gs.players[gpIdx].capital;
       }
       gs.pot += penalty;
+      gs.forfeitPenaltyPaid = {
+        ...(gs.forfeitPenaltyPaid || {}),
+        [playerId]: ((gs.forfeitPenaltyPaid?.[playerId] || 0) + penalty),
+      };
 
       const emote: EmoteMessage = {
         id: 'em_' + Math.random().toString(36).substring(2, 9),
         playerId: 'system',
         playerName: 'Table',
-        text: `⚖️ Règle anti-fuite (${antiFuiteMultiplier === 4 ? 'Double Kora x4' : 'Kora x2'}) : pénalité de ${penalty} 🪙 prélevée sur ${rp?.name}.`,
+        text: `⚖️ Pénalité de forfait : ${penalty} 🪙 prélevée sur ${rp?.name || 'le joueur'}.`,
         emoji: '🛡️',
         timestamp: Date.now(),
         isBot: true,
@@ -1814,6 +1960,11 @@ export class ServerGameEngine {
       this.clearAllTimers(activeRoomState);
       const lastWinner = remainingActiveInPartie[0] || (gs.players || []).find((p) => !p.isEliminated) || gs.players[0];
       const winnerIndex = (gs.players || []).findIndex((p) => p.id === lastWinner.id);
+
+      const capitalsBefore: Record<string, number> = {};
+      (gs.players || []).forEach((p) => {
+        capitalsBefore[p.id] = p.capital;
+      });
 
       const cfg = this.getConfig(activeRoomState);
       const rawPot = gs.pot;
@@ -1866,18 +2017,13 @@ export class ServerGameEngine {
           : p;
       });
 
-      room.previousPartieSummary = {
-        partieCount: gs.partieCount,
-        winnerName: lastWinner.name,
-        winType,
-        potWon,
-        playersSummary: (gs.players || []).map((p) => ({
-          id: p.id,
-          name: p.name,
-          deltaCapital: p.id === lastWinner.id ? potWon - gs.baseBet : -gs.baseBet,
-          finalCapital: p.capital,
-        })),
-      };
+      this.emitPartieResult(room, activeRoomState, {
+        winnerId: lastWinner.id,
+        winType: winType as PartieResultWinType,
+        endReason: 'FORFEIT_VICTORY',
+        capitalsBefore,
+        grossByPlayerId: { [lastWinner.id]: potWon },
+      });
 
       const emote: EmoteMessage = {
         id: 'em_' + Math.random().toString(36).substring(2, 9),
@@ -2005,6 +2151,11 @@ export class ServerGameEngine {
       const partieWinType: PartieWinType = 'STANDARD';
       const cfg = this.getConfig(activeRoomState);
 
+      const capitalsBefore: Record<string, number> = {};
+      (gs.players || []).forEach((p) => {
+        capitalsBefore[p.id] = p.capital;
+      });
+
       const payout = applyPartiePayout({
         capitals: (gs.players || []).map((p) => p.capital),
         isEliminated: (gs.players || []).map((p) => p.isEliminated || p.isForfeit),
@@ -2058,18 +2209,13 @@ export class ServerGameEngine {
           : p;
       });
 
-      room.previousPartieSummary = {
-        partieCount: gs.partieCount,
-        winnerName: soleWinner.name,
-        winType: partieWinType,
-        potWon,
-        playersSummary: (gs.players || []).map((p) => ({
-          id: p.id,
-          name: p.name,
-          deltaCapital: p.id === soleWinner.id ? potWon - gs.baseBet : -gs.baseBet,
-          finalCapital: p.capital,
-        })),
-      };
+      this.emitPartieResult(room, activeRoomState, {
+        winnerId: soleWinner.id,
+        winType: 'STANDARD',
+        endReason: 'FOLD_VICTORY',
+        capitalsBefore,
+        grossByPlayerId: { [soleWinner.id]: potWon },
+      });
 
       this.clearAllTimers(activeRoomState);
       const transitionDelay = cfg.transitionDelayMs;
@@ -2233,6 +2379,11 @@ export class ServerGameEngine {
 
     this.clearAllTimers(activeRoomState);
 
+    const capitalsBefore: Record<string, number> = {};
+    (gs.players || []).forEach((p) => {
+      capitalsBefore[p.id] = p.capital;
+    });
+
     // Award human share of pot to claiming player, returning bots' share to bots
     const activeBots = (gs.players || []).filter((p) => !p.isHuman && !p.isEliminated);
     const activeHumansInPot = (gs.players || []).filter((p) => p.isHuman);
@@ -2293,18 +2444,13 @@ export class ServerGameEngine {
     };
     room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
 
-    room.previousPartieSummary = {
-      partieCount: gs.partieCount,
-      winnerName: claimingPlayer.name,
+    this.emitPartieResult(room, activeRoomState, {
+      winnerId: claimingPlayer.id,
       winType: 'FORFEIT',
-      potWon: humanPotShare,
-      playersSummary: (gs.players || []).map((p) => ({
-        id: p.id,
-        name: p.name,
-        deltaCapital: p.id === claimingPlayer.id ? humanPotShare : 0,
-        finalCapital: p.capital,
-      })),
-    };
+      endReason: 'FORFEIT_VICTORY',
+      capitalsBefore,
+      grossByPlayerId: { [claimingPlayer.id]: humanPotShare },
+    });
 
     room.updatedAt = Date.now();
     onStateChange(room);
@@ -2321,8 +2467,14 @@ export class ServerGameEngine {
 
     this.clearAllTimers(activeRoomState);
 
+    const capitalsBefore: Record<string, number> = {};
+    (gs.players || []).forEach((p) => {
+      capitalsBefore[p.id] = p.capital;
+    });
+
     // Share pot amongst active non-eliminated players according to tricks won in round
     const activePlayers = (gs.players || []).filter((p) => !p.isEliminated && !p.isForfeit);
+    const grossByPlayerId: Record<string, number> = {};
     if (activePlayers.length > 0 && gs.pot > 0) {
       const totalTricksWon = activePlayers.reduce((sum, p) => sum + (p.tricksWonInRound || 0), 0);
       if (totalTricksWon > 0) {
@@ -2332,11 +2484,13 @@ export class ServerGameEngine {
             const share = gs.pot - potDistributed;
             p.capital += share;
             p.score = p.capital;
+            grossByPlayerId[p.id] = share;
           } else {
             const share = Math.floor((gs.pot * (p.tricksWonInRound || 0)) / totalTricksWon);
             p.capital += share;
             p.score = p.capital;
             potDistributed += share;
+            grossByPlayerId[p.id] = share;
           }
         });
       } else {
@@ -2345,6 +2499,7 @@ export class ServerGameEngine {
         activePlayers.forEach((p) => {
           p.capital += share;
           p.score = p.capital;
+          grossByPlayerId[p.id] = share;
         });
       }
     }
@@ -2387,18 +2542,13 @@ export class ServerGameEngine {
     };
     room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
 
-    room.previousPartieSummary = {
-      partieCount: gs.partieCount,
-      winnerName: topPlayer.name,
-      winType: 'STANDARD',
-      potWon: 0,
-      playersSummary: (gs.players || []).map((p) => ({
-        id: p.id,
-        name: p.name,
-        deltaCapital: 0,
-        finalCapital: p.capital,
-      })),
-    };
+    this.emitPartieResult(room, activeRoomState, {
+      winnerId: topPlayer.id,
+      winType: 'EARLY_CLOSE',
+      endReason: 'EARLY_CLOSE',
+      capitalsBefore,
+      grossByPlayerId,
+    });
 
     room.updatedAt = Date.now();
     onStateChange(room);

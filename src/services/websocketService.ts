@@ -1,4 +1,4 @@
-import { MultiplayerRoom, EmoteMessage, PublicRoomSummary, GameInvitation, UserPresence } from '../types';
+import { MultiplayerRoom, EmoteMessage, PublicRoomSummary, GameInvitation, UserPresence, PartieResult } from '../types';
 import { ClientMessage, ServerMessage } from '../../server/types';
 import { auth } from '../lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
@@ -18,6 +18,7 @@ export type DirectInviteListener = (invitation: GameInvitation) => void;
 export type InviteFeedbackListener = (data: { inviteId: string; agree: boolean; responderName: string; roomCode: string }) => void;
 export type FriendsPresenceListener = (presences: UserPresence[]) => void;
 export type QuickMatchResultListener = (roomCode: string) => void;
+export type PartieResultsListener = (results: PartieResult[]) => void;
 export type VersionStatusListener = (data: {
   isProtocolCompatible: boolean;
   updateRecommended: boolean;
@@ -57,6 +58,7 @@ class WebSocketService {
   private quickMatchResultListeners: Set<QuickMatchResultListener> = new Set();
   private versionStatusListeners: Set<VersionStatusListener> = new Set();
   private offlineQueueListeners: Set<OfflineQueueListener> = new Set();
+  private partieResultsListeners: Set<PartieResultsListener> = new Set();
   private currentRoom: MultiplayerRoom | null = null;
   private lastAcceptedState: { roomId: string; epoch: number; rev: number } | null = null;
   private isConnecting: boolean = false;
@@ -684,6 +686,12 @@ class WebSocketService {
         }
         break;
 
+      case 'PARTIE_RESULTS':
+        if (msg.partieResults) {
+          this.partieResultsListeners.forEach((l) => l(msg.partieResults!));
+        }
+        break;
+
       case 'LOBBY_ALERT':
         if (msg.alertMessage) {
           this.notifyLobbyAlert(msg.alertMessage);
@@ -1090,12 +1098,21 @@ class WebSocketService {
     }
   }
 
+  public ackPartieResults(resultIds: string[]): void {
+    const playerId = this.getLocalPlayerId();
+    this.send({
+      type: 'ACK_PARTIE_RESULTS',
+      playerId,
+      resultIds,
+    } as any);
+  }
+
   private send(msg: ClientMessage): void {
     if (msg.clientVersion === undefined) {
       msg.clientVersion = APP_VERSION;
     }
     if (msg.protocolVersion === undefined) {
-      msg.protocolVersion = 2;
+      msg.protocolVersion = 3;
     }
     if (!msg.reconnectToken) {
       const token = this.getReconnectToken();
@@ -1281,6 +1298,13 @@ class WebSocketService {
     this.emoteListeners.add(listener);
     return () => {
       this.emoteListeners.delete(listener);
+    };
+  }
+
+  public onPartieResults(listener: PartieResultsListener): () => void {
+    this.partieResultsListeners.add(listener);
+    return () => {
+      this.partieResultsListeners.delete(listener);
     };
   }
 

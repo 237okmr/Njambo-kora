@@ -1,5 +1,5 @@
 import { WebSocket } from 'ws';
-import { MultiplayerRoom, RoomPlayer, EmoteMessage, PublicRoomSummary, GameInvitation, UserPresence, IntegrationProposal, CapacityExtensionProposal } from '../../src/types';
+import { MultiplayerRoom, RoomPlayer, EmoteMessage, PublicRoomSummary, GameInvitation, UserPresence, IntegrationProposal, CapacityExtensionProposal, PartieResult } from '../../src/types';
 import { ClientMessage, ServerMessage } from '../types';
 import { ActiveRoomState, ServerGameEngine, maskOpponentCards, selectBotToReplace, syncRoomPlayersWithGameState } from '../engine/serverGameEngine';
 import { getEngineConfig, updateEngineConfig as applyEngineConfigUpdate, KatikaEngineConfig, DEFAULT_ENGINE_CONFIG } from '../engine/engineConfig';
@@ -37,6 +37,7 @@ export class RoomManager {
   private static isTickingRooms = new Set<string>();
   private static lastTurnAlerts = new Map<string, string>(); // roomCode -> "playerId_trickNumber_tricksCount"
   private static lastGameStartAlerts = new Set<string>(); // roomCode
+  private static pendingPartieResults = new Map<string, PartieResult[]>(); // playerId -> PartieResult[]
 
   public static setRoomPlayerToken(roomCode: string, playerId: string, token: string): void {
     let tokens = this.roomPlayerTokens.get(roomCode);
@@ -342,7 +343,7 @@ export class RoomManager {
     return [...this.matchHistory];
   }
 
-  public static readonly CURRENT_PROTOCOL_VERSION = 2;
+  public static readonly CURRENT_PROTOCOL_VERSION = 3;
   public static readonly SERVER_VERSION = APP_VERSION;
 
   private static failedJoinAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -417,10 +418,48 @@ export class RoomManager {
             }
           });
         },
+        onPartieResult: (result: PartieResult, r: MultiplayerRoom) => {
+          this.handleNewPartieResult(result, r);
+        },
       };
       this.roomStates.set(roomCode, state);
     }
     return state;
+  }
+
+  private static handleNewPartieResult(result: PartieResult, room: MultiplayerRoom): void {
+    result.participants.forEach((p) => {
+      if (!p.isHuman) return;
+      const pid = p.playerId;
+      let pending = this.pendingPartieResults.get(pid);
+      if (!pending) {
+        pending = [];
+        this.pendingPartieResults.set(pid, pending);
+      }
+      if (!pending.some((r) => r.id === result.id)) {
+        pending.push(result);
+      }
+      if (pending.length > 50) {
+        pending.shift();
+      }
+
+      const client = this.clients.get(pid);
+      if (client && client.socket.readyState === WebSocket.OPEN) {
+        this.deliverPartieResults(client.socket, pid);
+      }
+    });
+  }
+
+  public static deliverPartieResults(socket: WebSocket, playerId: string): void {
+    const pending = this.pendingPartieResults.get(playerId);
+    if (!pending || pending.length === 0) return;
+
+    if (socket.readyState === WebSocket.OPEN) {
+      this.sendMessage(socket, {
+        type: 'PARTIE_RESULTS',
+        partieResults: [...pending],
+      });
+    }
   }
 
   public static registerClient(socket: WebSocket, reconnectToken?: string, requestedPlayerId?: string, sessionId?: string): ConnectedClient {
@@ -510,6 +549,7 @@ export class RoomManager {
     };
 
     this.clients.set(playerId, client);
+    this.deliverPartieResults(socket, playerId);
     return client;
   }
 
@@ -723,6 +763,7 @@ export class RoomManager {
         client.reconnectToken = userToken;
 
         console.log(`[Auth] Authenticated Google player: ${verifiedUid} (email: ${result.email || 'n/a'})`);
+        this.deliverPartieResults(client.socket, verifiedUid);
 
         // If client was previously associated with an active room and is a non-spectator non-forfeit member, resume seat
         if (client.roomCode && this.rooms.has(client.roomCode)) {
@@ -830,6 +871,20 @@ export class RoomManager {
             timestamp: Date.now(),
           });
           break;
+
+        case 'ACK_PARTIE_RESULTS': {
+          const ackedIds = new Set(msg.resultIds || []);
+          const pending = this.pendingPartieResults.get(client.playerId);
+          if (pending && ackedIds.size > 0) {
+            const remaining = pending.filter((r) => !ackedIds.has(r.id));
+            if (remaining.length > 0) {
+              this.pendingPartieResults.set(client.playerId, remaining);
+            } else {
+              this.pendingPartieResults.delete(client.playerId);
+            }
+          }
+          break;
+        }
 
         case 'CREATE_ROOM':
           this.handleCreateRoom(client, msg);
@@ -1726,6 +1781,8 @@ export class RoomManager {
         existingPlayer.isEliminated = false;
         existingPlayer.isForfeit = false;
         existingPlayer.isReady = true;
+        existingPlayer.forfeitedForManche = false;
+        existingPlayer.leftRoom = false;
         if (room.status === 'LOBBY') {
           existingPlayer.capital = room.initialCapital;
           existingPlayer.score = room.initialCapital;
@@ -1766,6 +1823,7 @@ export class RoomManager {
       isProtocolCompatible,
       updateRecommended,
     });
+    this.deliverPartieResults(client.socket, client.playerId);
 
     this.broadcastRoomState(roomCode);
     this.evaluateAutoStart(roomCode);
@@ -2027,6 +2085,8 @@ export class RoomManager {
           player.isSpectator = false;
           player.isEliminated = false;
           player.isForfeit = false;
+          player.forfeitedForManche = false;
+          player.leftRoom = false;
           player.capital = room.initialCapital;
           player.score = room.initialCapital;
         }
@@ -2119,6 +2179,8 @@ export class RoomManager {
         p.isForfeit = false;
         p.isAiRelay = false;
         p.readyForNextPartie = false;
+        p.forfeitedForManche = false;
+        p.leftRoom = false;
         p.capital = room.initialCapital;
         p.score = room.initialCapital;
         p.tricksWonInRound = 0;
@@ -2565,18 +2627,45 @@ export class RoomManager {
     if (room.status === 'PLAYING') {
       const state = this.getOrCreateActiveState(roomCode, room);
       
-      // When a player leaves, hot-swap their seat with an AI bot so the table stays at 4 players,
-      // no ghost player with an empty hand is left, and the game never hangs at 0s.
-      ServerGameEngine.replacePlayerWithBot(
-        room,
-        playerId,
-        (updatedRoom) => {
-          this.broadcastRoomState(updatedRoom.id);
-          this.evaluateAutoStart(updatedRoom.id);
-        },
-        state,
-        isExplicit ? 'Départ volontaire' : 'Déconnexion'
-      );
+      const rp = (room.players || []).find((p) => p.id === playerId);
+      const gs = room.gameState;
+      const gp = gs ? (gs.players || []).find((p) => p.id === playerId) : null;
+      const isActif = rp && rp.isHuman && !rp.isSpectator && !rp.isEliminated && !rp.isForfeit && !rp.forfeitedForManche;
+
+      if (isActif) {
+        ServerGameEngine.forfeitPlayer(
+          room,
+          playerId,
+          (updatedRoom) => {
+            this.broadcastRoomState(updatedRoom.id);
+            this.evaluateAutoStart(updatedRoom.id);
+          },
+          state,
+          false,
+          { notify: false }
+        );
+        if (rp) {
+          rp.leftRoom = true;
+          rp.connected = false;
+        }
+        if (gp) {
+          gp.leftRoom = true;
+          gp.connected = false;
+        }
+      } else {
+        // When a player leaves, hot-swap their seat with an AI bot so the table stays at 4 players,
+        // no ghost player with an empty hand is left, and the game never hangs at 0s.
+        ServerGameEngine.replacePlayerWithBot(
+          room,
+          playerId,
+          (updatedRoom) => {
+            this.broadcastRoomState(updatedRoom.id);
+            this.evaluateAutoStart(updatedRoom.id);
+          },
+          state,
+          isExplicit ? 'Départ volontaire' : 'Déconnexion'
+        );
+      }
 
       if (room.hostId === playerId) {
         const nextHost = (room.players || []).find((p) => p.isHuman && p.connected && !p.isEliminated && !p.isForfeit && p.id !== playerId) ||
@@ -2598,6 +2687,48 @@ export class RoomManager {
         room.updatedAt = Date.now();
         console.log(`[Room Cleanup] All human players left room ${roomCode}. Inactive countdown started.`);
       }
+      return;
+    }
+
+    if (room.status === 'PARTIE_OVER') {
+      const rp = (room.players || []).find((p) => p.id === playerId);
+      if (rp) {
+        rp.isForfeit = true;
+        rp.isEliminated = true;
+        rp.forfeitedForManche = true;
+        rp.leftRoom = true;
+        rp.connected = false;
+        rp.hand = [];
+      }
+      const gs = room.gameState;
+      const gp = gs ? (gs.players || []).find((p) => p.id === playerId) : null;
+      if (gp) {
+        gp.isForfeit = true;
+        gp.isEliminated = true;
+        gp.forfeitedForManche = true;
+        gp.leftRoom = true;
+        gp.connected = false;
+        gp.hand = [];
+      }
+
+      if (room.hostId === playerId) {
+        const nextHost = (room.players || []).find((p) => p.isHuman && p.connected && !p.isEliminated && !p.isForfeit && p.id !== playerId) ||
+                         (room.players || []).find((p) => p.isHuman && !p.isEliminated && !p.isForfeit && p.id !== playerId) ||
+                         (room.players || []).find((p) => !p.isEliminated && !p.isForfeit && p.id !== playerId);
+        if (nextHost) {
+          room.hostId = nextHost.id;
+          room.hostName = nextHost.name;
+          nextHost.isHost = true;
+        } else {
+          room.hostName = 'Table Katika (Bots en relais)';
+        }
+      }
+
+      this.resetHostActivityTimer(roomCode);
+      room.updatedAt = Date.now();
+      this.broadcastRoomState(roomCode);
+      this.evaluateAutoStart(roomCode);
+      this.evaluateLobbyHostInactivity(roomCode);
       return;
     }
 
@@ -3903,6 +4034,8 @@ export class RoomManager {
       p.isSpectator = idx >= maxCapacity;
       p.isEliminated = false;
       p.isForfeit = false;
+      p.forfeitedForManche = false;
+      p.leftRoom = false;
       p.score = room.initialCapital;
       p.capital = room.initialCapital;
       p.readyForNextPartie = false;
