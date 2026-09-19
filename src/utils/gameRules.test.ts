@@ -151,6 +151,55 @@ describe('gameRules - applyPartiePayout', () => {
 
     assert.deepEqual(payout.eliminated, [false, true, false]); // 49 < 50 eliminated, 50 >= 50 not eliminated
   });
+
+  it('Le gagnant n’est jamais marqué éliminé même en Kora', () => {
+    const capitals = [100, 100, 100];
+    const payout = applyPartiePayout({
+      capitals,
+      isEliminated: [false, false, false],
+      winnerIndex: 0,
+      pot: 150,
+      baseBet: 50,
+      multiplier: 2,
+    });
+    assert.equal(payout.eliminated[0], false);
+    assert.deepEqual(payout.capitals, [350, 50, 50]);
+  });
+
+  it('Joueur exempté de pénalité ne paie pas et n’est pas éliminé si capital >= baseBet', () => {
+    const capitals = [500, 100, 100];
+    const payout = applyPartiePayout({
+      capitals,
+      isEliminated: [false, false, false],
+      exemptFromPenalty: [false, true, false], // player 1 exempt
+      winnerIndex: 0,
+      pot: 150,
+      baseBet: 50,
+      multiplier: 2, // Kora x2
+    });
+    // Player 1 exempt: pays 0 penalty, cap remains 100
+    // Player 2 not exempt: pays 50 penalty, cap becomes 50
+    assert.deepEqual(payout.capitals, [700, 100, 50]);
+    assert.deepEqual(payout.eliminated, [false, false, false]);
+  });
+
+  it('Joueur déjà éliminé reste éliminé et capital sum est conservée avec exemption', () => {
+    const initialCapitals = [500, 100, 0];
+    const pot = 150;
+    const payout = applyPartiePayout({
+      capitals: initialCapitals,
+      isEliminated: [false, false, true],
+      exemptFromPenalty: [false, true, false],
+      winnerIndex: 0,
+      pot,
+      baseBet: 50,
+      multiplier: 4,
+    });
+    assert.deepEqual(payout.eliminated, [false, false, true]);
+    const initialSum = initialCapitals.reduce((a, b) => a + b, 0) + pot;
+    const finalSum = payout.capitals.reduce((a, b) => a + b, 0);
+    assert.equal(finalSum, initialSum);
+  });
 });
 
 describe('gameRules - detectInstantWin', () => {

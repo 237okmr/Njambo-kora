@@ -814,15 +814,16 @@ export class ServerGameEngine {
 
     // Determine who participated or folded (non-participants shouldn't pay extra penalty)
     const nonParticipatingMask = (gs.players || []).map((p, idx) => {
-      if (idx === partieWinnerIndex || p.isEliminated || p.isForfeit) return true; // not a loser
+      if (idx === partieWinnerIndex || p.isEliminated || p.isForfeit) return false;
       const participated = gs.tricksHistory.some((t) => t.plays.some((play) => play.playerIndex === idx)) || p.isFoldedInRound;
-      return !participated; // if did not participate, treat as "eliminated/exempt" from penalty in applyPartiePayout
+      return !participated; // if did not participate, treat as exempt from penalty in applyPartiePayout
     });
 
     const cfg = this.getConfig(activeRoomState);
     const payout = applyPartiePayout({
       capitals: (gs.players || []).map((p) => p.capital),
-      isEliminated: nonParticipatingMask,
+      isEliminated: (gs.players || []).map((p) => p.isEliminated || p.isForfeit),
+      exemptFromPenalty: nonParticipatingMask,
       winnerIndex: partieWinnerIndex,
       pot: gs.pot,
       baseBet: gs.baseBet,

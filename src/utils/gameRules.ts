@@ -60,6 +60,7 @@ export interface ApplyPartiePayoutParams {
   baseBet: number;
   multiplier: number;
   rakePct?: number;
+  exemptFromPenalty?: boolean[];
 }
 
 export interface ApplyPartiePayoutResult {
@@ -81,6 +82,7 @@ export function applyPartiePayout(params: ApplyPartiePayoutParams): ApplyPartieP
     baseBet,
     multiplier,
     rakePct = 0,
+    exemptFromPenalty,
   } = params;
 
   const newCapitals = [...capitals];
@@ -88,7 +90,8 @@ export function applyPartiePayout(params: ApplyPartiePayoutParams): ApplyPartieP
   const penaltyPerLoser = (multiplier - 1) * baseBet;
 
   for (let i = 0; i < newCapitals.length; i++) {
-    if (i !== winnerIndex && !isEliminated[i]) {
+    const isExempt = exemptFromPenalty ? Boolean(exemptFromPenalty[i]) : false;
+    if (i !== winnerIndex && !isEliminated[i] && !isExempt) {
       const penalty = Math.min(newCapitals[i], penaltyPerLoser);
       newCapitals[i] -= penalty;
       extraCollected += penalty;

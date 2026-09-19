@@ -76,19 +76,21 @@ service cloud.firestore {
     // Structure et bornes du champ soloDaily lorsqu'il est présent
     function validSoloDaily(existing, incoming) {
       let hasIn = 'soloDaily' in incoming && incoming.soloDaily != null;
-      let inSD = hasIn ? incoming.soloDaily : null;
       let hasEx = 'soloDaily' in existing && existing.soloDaily != null;
+      let inSD = hasIn ? incoming.soloDaily : null;
       let exSD = hasEx ? existing.soloDaily : null;
       let oDay = (hasEx && 'day' in exSD) ? exSD.day : null;
       let oPts = (hasEx && 'points' in exSD) ? exSD.points : 0;
-      return !hasIn || (
-        inSD is map
-        && 'day' in inSD && inSD.day is int
-        && inSD.day <= dayIdx(request.time)
-        && (oDay == null || inSD.day >= oDay)
-        && 'points' in inSD && (inSD.points is int || inSD.points is float)
-        && inSD.points >= 0 && inSD.points <= 30
-        && (oDay == null || inSD.day > oDay || inSD.points >= oPts)
+      return (!hasEx || hasIn) && (
+        !hasIn || (
+          inSD is map
+          && 'day' in inSD && inSD.day is int
+          && inSD.day <= dayIdx(request.time) + 1
+          && (oDay == null || inSD.day >= oDay)
+          && 'points' in inSD && (inSD.points is int || inSD.points is float)
+          && inSD.points >= 0 && inSD.points <= 30.01
+          && (oDay == null || inSD.day > oDay || inSD.points >= oPts)
+        )
       );
     }
 
@@ -119,7 +121,16 @@ service cloud.firestore {
       let dKoraCount = nS.get('multiplayerKoraCount', 0) - oS.get('multiplayerKoraCount', 0);
       let allocHorsSolo = 20 * (dGamesWon + dManchesWon + dKoraCount) + 5;
       let deltaSolo = getDeltaSolo(existing, incoming);
-      return one || isScoreMigration || (scoreIncrease <= deltaSolo + allocHorsSolo);
+      let hasIn = 'soloDaily' in incoming && incoming.soloDaily != null;
+      let hasEx = 'soloDaily' in existing && existing.soloDaily != null;
+      let inSD = hasIn ? incoming.soloDaily : null;
+      let exSD = hasEx ? existing.soloDaily : null;
+      let oDay = (hasEx && 'day' in exSD) ? exSD.day : null;
+      let nDay = (hasIn && 'day' in inSD) ? inSD.day : null;
+      let g = (oDay != null && nDay != null && nDay > oDay) ? (nDay - oDay) : 0;
+      let multiDayCap = g >= 7 ? 7 : g;
+      let allocMultiDay = 30 * multiDayCap;
+      return one || isScoreMigration || (scoreIncrease <= deltaSolo + allocHorsSolo + allocMultiDay);
     }
 
     // ===== Création d'un profil (compte neuf ou première fusion invité) =====
@@ -149,9 +160,9 @@ service cloud.firestore {
         && (!('soloDaily' in data) || (
               data.soloDaily is map
               && 'day' in data.soloDaily && data.soloDaily.day is int
-              && data.soloDaily.day <= dayIdx(request.time)
+              && data.soloDaily.day <= dayIdx(request.time) + 1
               && 'points' in data.soloDaily && (data.soloDaily.points is int || data.soloDaily.points is float)
-              && data.soloDaily.points >= 0 && data.soloDaily.points <= 30
+              && data.soloDaily.points >= 0 && data.soloDaily.points <= 30.01
             ))
         && capAtCreate(stats, 'masteryScore', merge ? 300 : 0)
         && capAtCreate(stats, 'partiesPlayed', g)

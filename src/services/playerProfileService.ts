@@ -62,7 +62,7 @@ function computeAwardedSoloMastery(
   profile: PlayerProfile,
   history: PlayerGameHistoryItem[]
 ): { awarded: number; soloDaily: { day: number; points: number } } {
-  const today = getDoualaDayIndex(Date.now());
+  const today = Math.max(getDoualaDayIndex(Date.now()), profile.soloDaily?.day ?? 0);
   let alreadyAwarded = 0;
 
   if (profile.soloDaily && typeof profile.soloDaily.day === 'number') {
@@ -81,9 +81,13 @@ function computeAwardedSoloMastery(
     awarded = Math.min(potentialMastery, Math.max(0, cap - alreadyAwarded));
   }
 
+  const rawPoints = alreadyAwarded + awarded;
+  const roundedPoints = Math.round(rawPoints * 100) / 100;
+  const points = Math.min(cap, roundedPoints);
+
   return {
     awarded,
-    soloDaily: { day: today, points: alreadyAwarded + awarded },
+    soloDaily: { day: today, points },
   };
 }
 
