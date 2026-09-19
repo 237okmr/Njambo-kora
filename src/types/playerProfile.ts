@@ -47,6 +47,7 @@ export interface PlayerStats {
   soloFortune: number;
   soloWinRate: number;
   multiplayerWinRate: number;
+  scoreVersion?: number;
 }
 
 export const DEFAULT_PLAYER_STATS: PlayerStats = {

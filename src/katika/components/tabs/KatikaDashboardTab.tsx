@@ -1145,7 +1145,7 @@ export const KatikaDashboardTab: React.FC<KatikaDashboardTabProps> = ({ onNaviga
                   <div className="text-base font-bold text-amber-300 font-mono mt-0.5">
                     {(kpis.playerBehavior?.audacityBarometer?.koraRate || 0) + (kpis.playerBehavior?.audacityBarometer?.doubleKoraRate || 0)}%
                   </div>
-                  <div className="text-[10px] text-slate-500">Tentatives de grand chelem</div>
+                  <div className="text-[10px] text-slate-500">Victoires Kora & Double Kora</div>
                 </div>
                 <div className="p-3 rounded-lg bg-slate-800/80 border border-slate-750">
                   <span className="text-[10px] text-slate-400 font-mono">Victoires Standard / Points</span>

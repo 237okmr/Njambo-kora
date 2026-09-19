@@ -64,10 +64,12 @@ export function setPwaIdentity(mode: 'GAME' | 'COPILOT') {
   if (manifestLink) {
     if (manifestLink.getAttribute('href') !== manifestHref) {
       manifestLink.setAttribute('href', manifestHref);
+      manifestLink.href = manifestHref;
     }
   } else {
     manifestLink = document.createElement('link');
     manifestLink.rel = 'manifest';
+    manifestLink.setAttribute('href', manifestHref);
     manifestLink.href = manifestHref;
     document.head.appendChild(manifestLink);
   }

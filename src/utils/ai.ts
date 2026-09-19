@@ -1,5 +1,19 @@
 import { AIDifficulty, AIStrategy, Card, PlayedCard, Player, Suit, Trick } from '../types';
-import { determineTrickWinner, getPlayableCards } from './deck';
+import { determineTrickWinner, getPlayableCards, build31Deck } from './deck';
+import {
+  EASY_CONFIG,
+  NORMAL_CONFIG,
+  EXPERT_CONFIG,
+  GRAND_MASTER_CONFIG,
+} from './aiLevelConfig';
+import { chooseGrandMasterMonteCarlo } from './aiMonteCarlo';
+
+export {
+  EASY_CONFIG,
+  NORMAL_CONFIG,
+  EXPERT_CONFIG,
+  GRAND_MASTER_CONFIG,
+};
 
 export interface BotProfile {
   name: string;
@@ -207,22 +221,187 @@ export function updateHumanProfileFromGame(
 }
 
 /**
- * Checks if a hand has high potential to win all 5 tricks (Kora or Double Kora).
+ * Thresholds for Kora Hunter strategy activation and Double Kora evaluation.
  */
-export function hasKoraPotential(hand: Card[]): boolean {
+export const KORA_CHANCE_THRESHOLD = EXPERT_CONFIG.KORA_CHANCE_THRESHOLD;
+export const DOUBLE_KORA_CHANCE_THRESHOLD = EXPERT_CONFIG.DOUBLE_KORA_CHANCE_THRESHOLD;
+
+/**
+ * Pure exported function estimating the probability that a card of value 3 wins trick 5 (Kora),
+ * and for Double Kora, also trick 4.
+ *
+ * STRICT PRIVACY GUARANTEE:
+ * ONLY uses:
+ * - The bot's own hand (`hand`)
+ * - Cards already played publicly (`playedCards`)
+ * - Known player voids deduced from public play (`knownVoids`)
+ * - Number of active players (`activePlayerCount`)
+ *
+ * It NEVER reads the contents of other players' hands (`players[i].hand`).
+ */
+export function estimateKoraChance(
+  hand: Card[],
+  playedCards: Card[] = [],
+  knownVoids: Map<number, Set<Suit>> = new Map(),
+  activePlayerCount: number = 4,
+  checkDoubleKora: boolean = false
+): number {
+  if (!hand || hand.length === 0) return 0;
+
+  const threesInHand = hand.filter((c) => c.value === 3);
+  if (threesInHand.length === 0) return 0;
+  if (checkDoubleKora && threesInHand.length < 2) return 0;
+
+  // Build the 31-card deck (10♠ excluded)
+  // Suits: COEUR, CARREAU, TREFLE have 8 cards (3..10); PIQUE has 7 cards (3..9)
+  const allSuits: Suit[] = ['COEUR', 'CARREAU', 'TREFLE', 'PIQUE'];
+  const playedKeys = new Set(playedCards.map((c) => `${c.suit}_${c.value}`));
+  const handKeys = new Set(hand.map((c) => `${c.suit}_${c.value}`));
+
+  // Unseen cards: 31 cards minus played cards minus bot hand
+  const unseenCardsBySuit: Record<Suit, number> = {
+    COEUR: 0,
+    CARREAU: 0,
+    TREFLE: 0,
+    PIQUE: 0,
+  };
+  let totalUnseen = 0;
+
+  allSuits.forEach((suit) => {
+    const maxVal = suit === 'PIQUE' ? 9 : 10;
+    for (let val = 3; val <= maxVal; val++) {
+      const key = `${suit}_${val}`;
+      if (!playedKeys.has(key) && !handKeys.has(key)) {
+        unseenCardsBySuit[suit]++;
+        totalUnseen++;
+      }
+    }
+  });
+
+  const activeOpponents = Math.max(1, activePlayerCount - 1);
+
+  // Helper to compute probability that active opponents hold 0 cards of a given suit
+  const getProbabilityOpponentsVoidInSuit = (suit: Suit): number => {
+    const unseenInSuit = unseenCardsBySuit[suit];
+    if (unseenInSuit === 0) {
+      // No unseen cards of this suit exist in deck or opponent hands: 100% void!
+      return 1.0;
+    }
+
+    // Check how many active opponents have known voids in this suit
+    let knownVoidOpponents = 0;
+    knownVoids.forEach((voidSuits) => {
+      if (voidSuits.has(suit)) {
+        knownVoidOpponents++;
+      }
+    });
+
+    const effectiveOpponents = Math.max(0, activeOpponents - knownVoidOpponents);
+    if (effectiveOpponents === 0) {
+      // All opponents are confirmed void from public inference!
+      return 1.0;
+    }
+
+    // Number of cards held by non-void opponents (each player holds hand.length cards)
+    const opponentCardsToFill = effectiveOpponents * hand.length;
+    if (totalUnseen <= 0) return 0;
+    if (totalUnseen - unseenInSuit < opponentCardsToFill) {
+      // Impossible for opponents not to hold at least one card of this suit
+      return 0;
+    }
+
+    // Hypergeometric calculation: P(X = 0) = choose(totalUnseen - unseenInSuit, n) / choose(totalUnseen, n)
+    let prob = 1.0;
+    for (let i = 0; i < opponentCardsToFill; i++) {
+      prob *= (totalUnseen - unseenInSuit - i) / (totalUnseen - i);
+    }
+    return Math.max(0, Math.min(1, prob));
+  };
+
+  // Helper to estimate probability of bot having the lead on trick 5 (by winning trick 4)
+  const getProbabilityWinTrick4ToLeadTrick5 = (): number => {
+    if (hand.length === 1) {
+      return 1.0; // Already trick 5
+    }
+
+    const nonThrees = hand.filter((c) => c.value !== 3);
+    if (nonThrees.length === 0) return 0.1;
+
+    const dynamicBosses = nonThrees.filter((c) => isDynamicBossCard(c, playedCards));
+    if (dynamicBosses.length > 0) return 0.85;
+
+    const maxVal = Math.max(...nonThrees.map((c) => c.value));
+    if (maxVal >= 9) return 0.65;
+    if (maxVal >= 8) return 0.45;
+    if (maxVal >= 7) return 0.30;
+    return 0.15;
+  };
+
+  if (!checkDoubleKora) {
+    // Single Kora: calculate chance for the best 3 in hand
+    const pLead5 = getProbabilityWinTrick4ToLeadTrick5();
+    let bestKoraChance = 0;
+
+    threesInHand.forEach((threeCard) => {
+      const pVoid = getProbabilityOpponentsVoidInSuit(threeCard.suit);
+      const chance = pVoid * pLead5;
+      if (chance > bestKoraChance) {
+        bestKoraChance = chance;
+      }
+    });
+
+    return Math.round(bestKoraChance * 100) / 100;
+  } else {
+    // Double Kora: requires winning trick 4 with a 3 and trick 5 with a 3
+    if (threesInHand.length < 2) return 0;
+
+    let pLead4 = 0.5;
+    if (hand.length === 2) {
+      pLead4 = 0.7;
+    } else {
+      const nonThrees = hand.filter((c) => c.value !== 3);
+      if (nonThrees.some((c) => isDynamicBossCard(c, playedCards))) {
+        pLead4 = 0.75;
+      }
+    }
+
+    let bestDoubleChance = 0;
+    for (let i = 0; i < threesInHand.length; i++) {
+      for (let j = i + 1; j < threesInHand.length; j++) {
+        const cardA = threesInHand[i];
+        const cardB = threesInHand[j];
+        const pVoidA = getProbabilityOpponentsVoidInSuit(cardA.suit);
+        const pVoidB = getProbabilityOpponentsVoidInSuit(cardB.suit);
+        const chance = pLead4 * pVoidA * pVoidB;
+        if (chance > bestDoubleChance) {
+          bestDoubleChance = chance;
+        }
+      }
+    }
+
+    return Math.round(bestDoubleChance * 100) / 100;
+  }
+}
+
+/**
+ * Checks if a hand has real potential to achieve a Kora (winning trick 5 with a 3).
+ * Based on the reference rule:
+ * - Must hold at least one 3
+ * - Must have potential for opponents to be void in that suit
+ * - Must have a path to winning trick 4 to gain lead for trick 5
+ */
+export function hasKoraPotential(
+  hand: Card[],
+  playedCards: Card[] = [],
+  knownVoids: Map<number, Set<Suit>> = new Map(),
+  activePlayerCount: number = 4
+): boolean {
   if (!hand || hand.length === 0) return false;
+  const hasThree = hand.some((c) => c.value === 3);
+  if (!hasThree) return false;
 
-  const topCardsCount = hand.filter(
-    (c) => c.value === 10 || (c.suit === 'PIQUE' && c.value === 9)
-  ).length;
-
-  const avgValue = hand.reduce((sum, c) => sum + c.value, 0) / hand.length;
-
-  // 3+ top cards (10s or 9♠) OR 2 top cards with overall very strong hand (avg >= 8.2)
-  if (topCardsCount >= 3) return true;
-  if (topCardsCount >= 2 && avgValue >= 8.2) return true;
-
-  return false;
+  const chance = estimateKoraChance(hand, playedCards, knownVoids, activePlayerCount);
+  return chance >= KORA_CHANCE_THRESHOLD;
 }
 
 /**
@@ -297,29 +476,34 @@ export function getRandomBotStrategy(allowKoraHunter: boolean = false): AIStrate
 
 /**
  * Checks if a bot can mathematically and tactically still make a Kora / Double Kora in this round.
+ * Under the true Kora rule, a bot can achieve Kora even if it lost previous tricks,
+ * as long as it still holds a 3 in hand and has a viable path to winning trick 5 with that 3.
  */
 export function canBotAchieveKora(
   player: Player,
-  trickNumber: number
+  trickNumber: number,
+  playedCards: Card[] = [],
+  knownVoids: Map<number, Set<Suit>> = new Map(),
+  activePlayerCount: number = 4
 ): boolean {
   if (player.isHuman || player.isEliminated || !player.hand || player.hand.length === 0) {
     return false;
   }
 
-  // If the bot lost any previous trick in this round, Kora is strictly impossible
-  const hasWonAllPreviousTricks = player.tricksWonInRound === (trickNumber - 1);
-  if (!hasWonAllPreviousTricks) {
+  // Must possess at least one 3 in hand
+  const hasThree = player.hand.some((c) => c.value === 3);
+  if (!hasThree) {
     return false;
   }
 
-  // At trick 1, needs strong initial Kora potential hand
-  if (trickNumber === 1) {
-    return hasKoraPotential(player.hand);
+  // At trick 5: has a 3 in hand
+  if (trickNumber === 5) {
+    return true;
   }
 
-  // Mid-round (trick 2 to 5): Has won all previous tricks AND has high-value cards remaining
-  const hasHighCard = player.hand.some((c) => c.value >= 9);
-  return hasHighCard || hasKoraPotential(player.hand);
+  // At tricks 1 to 4: estimate viability
+  const chance = estimateKoraChance(player.hand, playedCards, knownVoids, activePlayerCount);
+  return chance >= KORA_CHANCE_THRESHOLD;
 }
 
 /**
@@ -358,6 +542,7 @@ export function resolveDynamicStrategy(hand: Card[]): AIStrategy {
 
   const avgValue =
     hand.reduce((sum, c) => sum + c.value, 0) / (hand.length || 1);
+
   if (avgValue >= 7.5) {
     return 'AGGRESSIVE_LEADER';
   }
@@ -377,14 +562,21 @@ export function evaluateAndShiftBotStrategy(
   currentPlays: PlayedCard[] = []
 ): AIStrategy {
   const currentStrategy = player.aiStrategy || player.basePersonality || 'CONSERVATIVE';
-  const isKoraPossible = canBotAchieveKora(player, trickNumber);
+  const playedCards = getPlayedCardsInRound(tricksHistory, currentPlays);
+  const knownVoids = getKnownPlayerVoids(tricksHistory, currentPlays);
+  const activeCount = allPlayers.filter((p) => !p.isEliminated && !p.isFoldedInRound).length || 4;
+
+  const isKoraPossible = canBotAchieveKora(player, trickNumber, playedCards, knownVoids, activeCount);
 
   // 1. KORA_HUNTER Activation:
   if (isKoraPossible) {
     if (currentStrategy === 'KORA_HUNTER') {
       return 'KORA_HUNTER';
     }
-    if (hasKoraPotential(player.hand)) {
+    if (player.basePersonality === 'KORA_HUNTER') {
+      return 'KORA_HUNTER';
+    }
+    if (hasKoraPotential(player.hand || [], playedCards, knownVoids, activeCount)) {
       return 'KORA_HUNTER';
     }
   }
@@ -421,24 +613,28 @@ export function evaluateAndShiftBotStrategy(
 
 /**
  * Determines if a bot should trigger the Kora Hunter alert banner.
+ * The banner is only triggered if the bot has a genuine Kora plan (estimateKoraChance >= threshold).
+ * The bluff of a BLUFFER archetype remains possible.
  */
 export function shouldBotTriggerKoraAlert(
   player: Player,
   activeStrategy: AIStrategy,
-  isMidRoundCheck: boolean = false
+  isMidRoundCheck: boolean = false,
+  koraChance?: number
 ): boolean {
   if (player.isHuman || player.isEliminated) return false;
 
-  const koraChance = isMidRoundCheck ? 0.4 : 0.5;
-  const bluffChance = isMidRoundCheck ? 0.1 : 0.15;
-
-  if (activeStrategy === 'KORA_HUNTER') {
-    return Math.random() < koraChance;
-  }
-
   const basePersonality = player.basePersonality || player.aiStrategy;
   if (basePersonality === 'BLUFFER') {
+    const bluffChance = isMidRoundCheck ? 0.1 : 0.15;
     return Math.random() < bluffChance;
+  }
+
+  if (activeStrategy === 'KORA_HUNTER') {
+    const chance = typeof koraChance === 'number'
+      ? koraChance
+      : estimateKoraChance(player.hand || [], [], new Map(), 4);
+    return chance >= KORA_CHANCE_THRESHOLD;
   }
 
   return false;
@@ -527,10 +723,10 @@ export function evaluateCardStrength(
 
 /**
  * -------------------------------------------------------------
- * 4. ANTI-KORA DEFENSE DETECTOR (Chacun pour soi)
+ * 4. POT PROTECTION & SÉRIE DE PLIS DEFENSE (Chacun pour soi)
  * -------------------------------------------------------------
- * Detects if another player (human or other bot) is on a Kora streak (won all tricks so far)
- * and is currently winning or threatening to win the current trick.
+ * Detects if another player (human or other bot) is on a trick streak (« série de plis » : won all tricks so far)
+ * and is currently winning or threatening to win the current trick, in order to protect the pot.
  */
 export function findThreateningKoraLeader(
   players: Player[],
@@ -539,7 +735,7 @@ export function findThreateningKoraLeader(
   currentTrickNumber: number,
   myPlayerIndex?: number
 ): { playerIndex: number; playerName: string; winningCard: Card } | null {
-  if (currentTrickNumber < 2) return null; // Kora threat becomes critical from trick 2+
+  if (currentTrickNumber < 2) return null; // Streak threat becomes critical from trick 2+
 
   const requiredTricksWon = currentTrickNumber - 1;
 
@@ -574,8 +770,10 @@ export function findThreateningKoraLeader(
  * -------------------------------------------------------------
  * When the bot cannot follow suit, selects the smartest card to throw away:
  * 1. Never throw away Dynamic Bosses (10s, 9♠, or current boss) if possible.
- * 2. Prioritize dead/weak singletons (3-6 in suits without boss).
- * 3. Preserve cards with high future winning potential.
+ * 2. Protect cards of value 3 for Kora potential.
+ * 3. At trick 4, never empty a suit where an opponent could hold a winning 3 (anti-Kora prudence).
+ * 4. Prioritize dead/weak singletons (4-6 in suits without boss).
+ * 5. Preserve cards with high future winning potential.
  */
 /**
  * Tracks which suits players failed to follow, meaning they have a VOID (0 cards) in that suit.
@@ -619,7 +817,7 @@ export function getKnownPlayerVoids(
 /**
  * Super-human discard calculator for Grand Katika:
  * Mathematically scores each candidate card based on dynamic boss status,
- * singleton void creation potential, and opponent void distribution.
+ * singleton void creation potential, opponent void distribution, and anti-Kora prudence.
  */
 export function chooseGrandMasterDiscard(
   validCards: Card[],
@@ -639,6 +837,11 @@ export function chooseGrandMasterDiscard(
     suitCounts[c.suit] = (suitCounts[c.suit] || 0) + 1;
   });
 
+  const allSuits: Suit[] = ['COEUR', 'CARREAU', 'TREFLE', 'PIQUE'];
+  const suitsWithOpponentThree = allSuits.filter(
+    (s) => !playedCards.some((c) => c.suit === s && c.value === 3) && !hand.some((c) => c.suit === s && c.value === 3)
+  );
+
   const scoredDiscards = validCards.map((card) => {
     const isBoss = isDynamicBossCard(card, playedCards);
     const suitCount = suitCounts[card.suit];
@@ -646,24 +849,24 @@ export function chooseGrandMasterDiscard(
 
     let discardScore = 100;
 
-    // 1. Dynamic bosses are strictly preserved
-    if (isBoss) {
-      discardScore -= 140;
+    // 1. Dynamic bosses & 10s are strictly preserved
+    if (isBoss || rawVal === 10 || (card.suit === 'PIQUE' && rawVal === 9)) {
+      discardScore -= 200;
+    } else if (rawVal === 9) {
+      discardScore -= 80;
+    } else if (rawVal === 8) {
+      discardScore -= 40;
     }
 
-    // 2. High cards protection
-    if (rawVal === 10 || (card.suit === 'PIQUE' && rawVal === 9)) {
-      discardScore -= 160;
-    } else if (rawVal === 9) {
-      discardScore -= 60;
-    } else if (rawVal === 8) {
-      discardScore -= 30;
+    // 2. Trash candidate (3s and low cards are prime trash to dump early)
+    if (rawVal === 3) {
+      discardScore += 75; // Prime trash, avoid hoarding 3s to trick 5 accidentally
     } else if (rawVal <= 5) {
       discardScore += 45; // Prime trash candidate
     }
 
     // 3. Void creation: dumping a weak singleton opens up 100% cutting freedom in future tricks!
-    if (suitCount === 1 && !isBoss && rawVal <= 6) {
+    if (suitCount === 1 && !isBoss && rawVal <= 6 && rawVal !== 3) {
       discardScore += 65;
     }
 
@@ -681,74 +884,6 @@ export function chooseGrandMasterDiscard(
 
   scoredDiscards.sort((a, b) => b.score - a.score);
   return scoredDiscards[0].card;
-}
-
-/**
- * Minimax Endgame Solver for Trick 4:
- * Evaluates the impact of playing card A vs card B on both Trick 4 and Trick 5,
- * maximizing the probability of winning the crucial final pot.
- */
-export function solveGrandMasterEndgame(
-  validCards: Card[],
-  hand: Card[],
-  leadSuit: Suit | null,
-  currentPlays: PlayedCard[],
-  cardsPlayedSoFar: Card[],
-  isLastPlayerInTrick: boolean,
-  currentWinningValue: number
-): Card {
-  if (validCards.length === 1) return validCards[0];
-
-  const candidateScores = validCards.map((candidate) => {
-    const remainingCards = hand.filter((c) => c.id !== candidate.id);
-    const remainingCard = remainingCards[0] || candidate;
-    const cardsPlayedAfterCandidate = [...cardsPlayedSoFar, candidate];
-
-    let score = 0;
-
-    // Trick 4 simulation:
-    let winsTrick4 = false;
-    if (!leadSuit) {
-      if (isDynamicBossCard(candidate, cardsPlayedSoFar)) {
-        winsTrick4 = true;
-        score += 350;
-      } else {
-        score += candidate.value * 12;
-      }
-    } else {
-      if (candidate.value > currentWinningValue) {
-        if (isLastPlayerInTrick) {
-          winsTrick4 = true;
-          score += 350;
-        } else {
-          score += (candidate.value - currentWinningValue) * 20;
-        }
-      } else {
-        score -= 60;
-      }
-    }
-
-    // Trick 5 simulation with remainingCard:
-    const remainingIsBoss = isDynamicBossCard(remainingCard, cardsPlayedAfterCandidate);
-    if (remainingIsBoss) {
-      score += 550;
-      if (winsTrick4) {
-        // Winning Trick 4 AND holding an unbeatable boss for Trick 5 -> 100% sweep of both tricks!
-        score += 900;
-      }
-    } else {
-      score += remainingCard.value * 15;
-      if (winsTrick4 && remainingCard.value <= 6) {
-        // Warning: winning Trick 4 forces bot to lead a weak card on Trick 5, risking surrender of the pot
-        score -= 280;
-      }
-    }
-
-    return { card: candidate, score };
-  });
-
-  candidateScores.sort((a, b) => b.score - a.score);
-  return candidateScores[0].card;
 }
 
 export function chooseSmartDiscard(
@@ -775,28 +910,40 @@ export function chooseSmartDiscard(
     suitCounts[c.suit] = (suitCounts[c.suit] || 0) + 1;
   });
 
+  // Normal: Pas de vision dynamique des maîtresses (considère les 10 comme forts, ignore si un 9 ou 8 est devenu maître)
+  // Expert: Suivi exact des cartes sorties et déduction des maîtresses dynamiques
+  const isExpert = difficulty === 'EXPERT' || difficulty === 'GRAND_MASTER';
+
   // Score each card for discard desirability (higher score = better to discard)
   const scoredDiscards = validCards.map((card) => {
-    const isBoss = isDynamicBossCard(card, playedCards);
+    const isBoss = isExpert
+      ? isDynamicBossCard(card, playedCards)
+      : card.value === 10 || (card.suit === 'PIQUE' && card.value === 9);
     const suitCount = suitCounts[card.suit];
     const rawVal = card.value;
 
     let discardScore = 100;
 
     if (isBoss) {
-      discardScore -= 80; // Highly protect boss cards!
+      discardScore -= 120; // Highly protect boss cards!
     }
 
     if (rawVal === 10 || (card.suit === 'PIQUE' && rawVal === 9)) {
-      discardScore -= 90; // Never throw absolute top cards
+      discardScore -= 120; // Never throw absolute top cards
     } else if (rawVal === 9) {
-      discardScore -= 40;
+      discardScore -= isExpert && isBoss ? 120 : 30;
+    } else if (rawVal === 8) {
+      discardScore -= isExpert && isBoss ? 120 : 10;
+    }
+
+    if (rawVal === 3) {
+      discardScore += 70; // 3s are the lowest cards, prime trash to dump early!
     } else if (rawVal <= 5) {
-      discardScore += 30; // Great candidate for trash
+      discardScore += 40; // Great candidate for trash
     }
 
     // Discarding a singleton helps empty that suit completely for future discards
-    if (suitCount === 1 && !isBoss && rawVal <= 7) {
+    if (suitCount === 1 && !isBoss && rawVal <= 7 && rawVal !== 3) {
       discardScore += 25;
     }
 
@@ -862,7 +1009,7 @@ export function chooseAICard(
   players: Player[] = [],
   myPlayerIndex?: number
 ): Card {
-  const validCards = getPlayableCards(hand, leadSuit);
+  let validCards = getPlayableCards(hand, leadSuit);
 
   if (validCards.length === 0) {
     return hand[0];
@@ -882,34 +1029,83 @@ export function chooseAICard(
   // Force EXPERT difficulty for Robam Hokuto, unless table difficulty is GRAND_MASTER
   const effectiveDifficulty: AIDifficulty =
     difficulty === 'GRAND_MASTER' ? 'GRAND_MASTER' : isRobamHokuto ? 'EXPERT' : difficulty;
-  const isGrandMaster = effectiveDifficulty === 'GRAND_MASTER';
+
+  // EASY DIFFICULTY: 22% random blunder rate (15-25% range)
+  if (effectiveDifficulty === 'EASY' && Math.random() < EASY_CONFIG.RANDOM_MOVE_RATE) {
+    const randomIndex = Math.floor(Math.random() * validCards.length);
+    return validCards[randomIndex];
+  }
+
+  // NORMAL DIFFICULTY: 6% casual sub-optimal moves for average human player
+  if (effectiveDifficulty === 'NORMAL' && Math.random() < NORMAL_CONFIG.RANDOM_MOVE_RATE) {
+    const randomIndex = Math.floor(Math.random() * validCards.length);
+    return validCards[randomIndex];
+  }
 
   // Extract known voids per player (legal, public inference)
   const knownVoids = getKnownPlayerVoids(tricksHistory, currentPlays, leadSuit);
 
+  // GRAND MASTER (GRAND KATIKA): Monte Carlo Determinization Engine (PIMC)
+  // Runs 60 to 400 rollouts within a strict 25ms budget, maximizing expected pot payoff without cheating.
+  if (effectiveDifficulty === 'GRAND_MASTER') {
+    const botIndex =
+      myPlayerIndex !== undefined
+        ? myPlayerIndex
+        : players.findIndex((p) => p.hand === hand || p.name.includes('Katika') || !p.isHuman);
+    return chooseGrandMasterMonteCarlo(
+      validCards,
+      hand,
+      leadSuit,
+      currentPlays,
+      trickNumber,
+      tricksHistory,
+      activePlayerCount,
+      players,
+      botIndex !== -1 ? botIndex : 0,
+      knownVoids
+    );
+  }
+
   // Track & update human profile across manches/rounds
   const humanProfile = updateHumanProfileFromGame(tricksHistory, currentPlays, players);
 
-  const activeStrategy =
+  const activeStrategy: AIStrategy =
     strategy === 'DYNAMIC' ? resolveDynamicStrategy(hand) : strategy;
 
   // Gather all public cards played this round
   const cardsPlayedSoFar = getPlayedCardsInRound(tricksHistory, currentPlays);
 
-  // Identify bosses in current hand
-  const bossesInHand = getDynamicBossesInHand(hand, cardsPlayedSoFar);
+  // Normal does not track dynamic bosses (considers only natural 10s and 9♠ as bosses)
+  // Expert and Grand Katika track dynamic bosses (if a 10 was played, 9 becomes boss)
+  const canTrackDynamicBosses = effectiveDifficulty === 'EXPERT' || difficulty === 'GRAND_MASTER';
+  const isCardBossForBot = (c: Card): boolean => {
+    if (canTrackDynamicBosses) {
+      return isDynamicBossCard(c, cardsPlayedSoFar);
+    }
+    return c.value === 10 || (c.suit === 'PIQUE' && c.value === 9);
+  };
+
+  // Identify bosses in current hand according to bot's level
+  const bossesInHand = hand.filter(isCardBossForBot);
 
   // Position in current trick (1st, 2nd, 3rd, 4th)
   const playerPositionInTrick = currentPlays.length + 1;
   const isLastPlayerInTrick = playerPositionInTrick === activePlayerCount;
 
   // =========================================================================
-  // --- TRICK 5 : THE DECISIVE POT TRICK ---
+  // --- TRICK 5 : THE DECISIVE POT TRICK (NORMAL & EXPERT) ---
   // =========================================================================
   if (trickNumber === 5) {
     const sortedDesc = [...validCards].sort((a, b) => b.value - a.value);
 
     if (!leadSuit) {
+      // If Kora hunter has a 3 and seeks Kora: lead the 3 only if koraChance was high
+      if (activeStrategy === 'KORA_HUNTER') {
+        const validThrees = validCards.filter((c) => c.value === 3);
+        if (validThrees.length > 0) {
+          return validThrees[0];
+        }
+      }
       // Lead with the absolute highest/boss card to capture the pot
       return sortedDesc[0];
     }
@@ -921,8 +1117,8 @@ export function chooseAICard(
       const winningCards = leadSuitCardsAsc.filter((c) => c.value > winningValue);
 
       if (winningCards.length > 0) {
-        // Grand Master plays the lowest winning card to win at minimal risk; others play highest
-        return isGrandMaster ? winningCards[0] : winningCards[winningCards.length - 1];
+        // Play highest winning card to secure the pot!
+        return winningCards[winningCards.length - 1];
       } else {
         // Cannot win -> discard lowest card of suit
         return leadSuitCardsAsc[0];
@@ -934,10 +1130,10 @@ export function chooseAICard(
   }
 
   // =========================================================================
-  // --- 4. ANTI-KORA EMERGENCY DEFENSE (All tricks 1 to 4) ---
+  // --- SÉRIE DE PLIS EMERGENCY DEFENSE (Tricks 1 to 4) ---
   // =========================================================================
-  if (difficulty !== 'EASY' && players.length > 0) {
-    const koraThreat = findThreateningKoraLeader(
+  if (effectiveDifficulty !== 'EASY' && players.length > 0) {
+    const streakThreat = findThreateningKoraLeader(
       players,
       tricksHistory,
       currentPlays,
@@ -945,7 +1141,7 @@ export function chooseAICard(
       myPlayerIndex
     );
 
-    if (koraThreat && leadSuit) {
+    if (streakThreat && leadSuit) {
       const hasLeadSuit = hand.some((c) => c.suit === leadSuit);
       if (hasLeadSuit) {
         const { winningValue } = determineTrickWinner(currentPlays, leadSuit);
@@ -953,7 +1149,7 @@ export function chooseAICard(
         const beatingCards = leadSuitCardsAsc.filter((c) => c.value > winningValue);
 
         if (beatingCards.length > 0) {
-          // Play the lowest card that beats the Kora leader to break the streak!
+          // Play the lowest card that beats the streak leader to break the streak and protect the pot!
           return beatingCards[0];
         }
       }
@@ -961,56 +1157,79 @@ export function chooseAICard(
   }
 
   // =========================================================================
-  // --- 3. TRICK 4 : TACTICAL SETUP FOR TRICK 5 ---
+  // --- TRICK 4 : SEQUENTIAL SETUP FOR TRICK 5 (EXPERT ONLY) ---
   // =========================================================================
-  if (trickNumber === 4 && difficulty !== 'EASY') {
-    // Grand Master Minimax Endgame solver
-    if (isGrandMaster) {
-      const { winningValue } = leadSuit ? determineTrickWinner(currentPlays, leadSuit) : { winningValue: 0 };
-      return solveGrandMasterEndgame(
-        validCards,
-        hand,
-        leadSuit,
-        currentPlays,
-        cardsPlayedSoFar,
-        isLastPlayerInTrick,
-        winningValue
-      );
-    }
+  if (trickNumber === 4 && effectiveDifficulty === 'EXPERT') {
+    // KORA_HUNTER tactical setup at trick 4:
+    // Only hunt Kora if opponents are confirmed void in that suit or probability is near-certain (>= 0.90).
+    // Otherwise, play the standard winning line for the pot!
+    const isOpponentsConfirmedVoid = (suit: Suit) => {
+      let voidCount = 0;
+      knownVoids.forEach((suits) => {
+        if (suits.has(suit)) voidCount++;
+      });
+      return voidCount >= Math.max(1, activePlayerCount - 1);
+    };
 
-    // Remaining cards that will be left for trick 5 (cards in hand minus the one we play)
-    const hasBossForTrick5 = bossesInHand.length >= 2 || (bossesInHand.length === 1 && hand.length === 2);
+    const hasSafeKoraThree = hand.some((c) => c.value === 3 && isOpponentsConfirmedVoid(c.suit));
+    const koraChance = estimateKoraChance(hand, cardsPlayedSoFar, knownVoids, activePlayerCount);
+    const isHuntingKora =
+      effectiveDifficulty === 'EXPERT' &&
+      (activeStrategy === 'KORA_HUNTER' || hasSafeKoraThree || koraChance >= EXPERT_CONFIG.KORA_CHANCE_THRESHOLD) &&
+      hand.some((c) => c.value === 3);
+
+    const threesInHand = hand.filter((c) => c.value === 3);
+    const isDoubleKoraPlan =
+      isHuntingKora &&
+      threesInHand.length >= 2 &&
+      estimateKoraChance(hand, cardsPlayedSoFar, knownVoids, activePlayerCount, true) >=
+        EXPERT_CONFIG.DOUBLE_KORA_CHANCE_THRESHOLD;
 
     if (!leadSuit) {
       const sortedDesc = [...validCards].sort((a, b) => b.value - a.value);
       const sortedAsc = [...validCards].sort((a, b) => a.value - b.value);
 
-      // TRICK_4_CONTROL or GATEKEEPER attacks to seize Trick 4
-      if (activeStrategy === 'TRICK_4_CONTROL' || activeStrategy === 'GATEKEEPER') {
-        return sortedDesc[0];
+      if (isHuntingKora) {
+        if (isDoubleKoraPlan) {
+          const validThrees = validCards.filter((c) => c.value === 3);
+          if (validThrees.length > 0) return validThrees[0];
+        }
+        // Conserve the 3 for trick 5! Win trick 4 with highest non-3 card to capture the lead!
+        const nonThreesDesc = validCards.filter((c) => c.value !== 3).sort((a, b) => b.value - a.value);
+        if (nonThreesDesc.length > 0) {
+          return nonThreesDesc[0];
+        }
       }
 
-      // If CONSERVATIVE, save the only boss for Trick 5 and lead low
-      if (activeStrategy === 'CONSERVATIVE' && bossesInHand.length === 1 && hand.length === 2) {
-        return sortedAsc[0];
+      // TRICK 4 ATTACK RULE FOR EXPERT & NORMAL:
+      // A. VOID EXPLOITATION (Expert): If an opponent is known void in a suit, leading it guarantees winning trick 4!
+      if (effectiveDifficulty === 'EXPERT' && knownVoids.size > 0) {
+        const voidSuitCard = validCards.find((c) => {
+          for (const [_, voids] of knownVoids.entries()) {
+            if (voids.has(c.suit)) return true;
+          }
+          return false;
+        });
+        if (voidSuitCard) {
+          return voidSuitCard;
+        }
       }
 
-      // If we have 2+ bosses, lead one to win Trick 4 and keep the other for Trick 5
+      // Attack trick 4 ONLY if holding at least 2 dynamic bosses!
+      // If holding only 1 boss, keep it imperatively for trick 5 and play the lower non-boss card.
       if (bossesInHand.length >= 2) {
         return sortedDesc[0];
       }
 
-      // If holding a non-boss high card and a boss, play non-boss high card to win trick 4
-      const nonBossDesc = sortedDesc.filter((c) => !isDynamicBossCard(c, cardsPlayedSoFar));
-      if (nonBossDesc.length > 0 && bossesInHand.length >= 1) {
-        return nonBossDesc[0];
+      if (bossesInHand.length === 1) {
+        const nonBossAsc = sortedAsc.filter((c) => !isCardBossForBot(c));
+        if (nonBossAsc.length > 0) {
+          return nonBossAsc[0];
+        }
       }
 
-      if (hasBossForTrick5 || difficulty === 'EXPERT') {
-        return sortedDesc[0];
-      } else {
-        return sortedAsc[0];
-      }
+      // No bosses in hand: lead lowest card to defend
+      return sortedAsc[0];
     }
 
     // Following suit on Trick 4
@@ -1020,13 +1239,29 @@ export function chooseAICard(
       const leadSuitCardsAsc = [...validCards].sort((a, b) => a.value - b.value);
       const winningCards = leadSuitCardsAsc.filter((c) => c.value > winningValue);
 
-      if (hasBossForTrick5 || activeStrategy === 'TRICK_4_CONTROL' || activeStrategy === 'GATEKEEPER') {
-        if (winningCards.length > 0) {
-          // Win trick 4 with lowest winning card to gain entame for Trick 5!
-          return winningCards[0];
-        }
+      if (isHuntingKora) {
+        const winningNonThrees = winningCards.filter((c) => c.value !== 3);
+        if (winningNonThrees.length > 0) return winningNonThrees[0];
+        if (isDoubleKoraPlan && winningCards.length > 0) return winningCards[0];
       }
+
+      // If we can win Trick 4, taking it gives us the lead on Trick 5:
+      if (winningCards.length > 0) {
+        // If we have a choice of winning cards, use the lowest winning card
+        return winningCards[0];
+      }
+
+      // Cannot win trick 4 -> duck with lowest card
+      return leadSuitCardsAsc[0];
     }
+
+    // Discarding on Trick 4 (cannot follow suit): keep the stronger card / boss for trick 5!
+    const sortedByValue = [...validCards].sort((a, b) => a.value - b.value);
+    const nonBossDiscards = sortedByValue.filter((c) => !isCardBossForBot(c));
+    if (nonBossDiscards.length > 0) {
+      return nonBossDiscards[0];
+    }
+    return sortedByValue[0];
   }
 
   // =========================================================================
@@ -1047,68 +1282,11 @@ export function chooseAICard(
       suitCounts[c.suit] = (suitCounts[c.suit] || 0) + 1;
     });
 
-    // GRAND MASTER ADVANCED LEAD ENGINE (Tricks 1 to 3)
-    if (isGrandMaster) {
-      // 1. Anti-Kora lead exploitation:
-      // If an opponent is threatening Kora, check if they have known voids to exploit
-      if (trickNumber >= 2 && players.length > 0) {
-        const requiredTricksWon = trickNumber - 1;
-        const koraLeader = players.find(
-          (p, idx) => idx !== myPlayerIndex && !p.isEliminated && p.tricksWonInRound === requiredTricksWon
-        );
-        if (koraLeader) {
-          const leaderIdx = players.indexOf(koraLeader);
-          const leaderVoids = knownVoids.get(leaderIdx);
-          if (leaderVoids && leaderVoids.size > 0) {
-            // Lead a suit where the Kora leader is void! They cannot follow suit and therefore cannot win!
-            const voidLead = sortedAsc.find((c) => leaderVoids.has(c.suit));
-            if (voidLead) return voidLead;
-          }
-        }
-      }
-
-      // 2. High Forcing / Bleeding lead:
-      // If Grand Master holds both dynamic boss and sub-boss (e.g. 10 & 9, or 9 & 8) in the same suit,
-      // lead the sub-boss to force out opponent 10s while retaining absolute control!
-      const suitsToCheck: Suit[] = ['COEUR', 'CARREAU', 'TREFLE', 'PIQUE'];
-      for (const suit of suitsToCheck) {
-        const cardsInSuit = hand.filter((c) => c.suit === suit).sort((a, b) => b.value - a.value);
-        if (cardsInSuit.length >= 2) {
-          const top = cardsInSuit[0];
-          const second = cardsInSuit[1];
-          if (isDynamicBossCard(top, cardsPlayedSoFar) && second.value >= 7) {
-            const subBossLead = validCards.find((c) => c.id === second.id);
-            if (subBossLead && trickNumber <= 3) return subBossLead;
-          }
-        }
-      }
-
-      // 3. Purge weak singletons early (Tricks 1-2) to open up cutting freedom
-      if (trickNumber <= 2) {
-        const weakSingleton = sortedAsc.find(
-          (c) => suitCounts[c.suit] === 1 && c.value <= 6 && !isDynamicBossCard(c, cardsPlayedSoFar)
-        );
-        if (weakSingleton) return weakSingleton;
-      }
-
-      // 4. On Trick 3: If holding multiple dynamic bosses, cash one in safely
-      if (trickNumber === 3 && bossesInHand.length >= 2) {
-        return bossesInHand[0];
-      }
-
-      // 5. Default safe lead: lowest non-boss card
-      const nonBossCards = sortedAsc.filter((c) => !isDynamicBossCard(c, cardsPlayedSoFar));
-      if (nonBossCards.length > 0) {
-        return nonBossCards[0];
-      }
-      return sortedAsc[0];
-    }
-
     // ROBAM HOKUTO ADAPTIVE LEAD:
     if (isRobamHokuto) {
       if (humanProfile.style === 'EARLY_AGGRESSIVE' && trickNumber <= 2) {
         // Human dumps early 10s -> Robam leads low non-boss cards to absorb early human attacks
-        const lowNonBoss = sortedAsc.filter((c) => !isDynamicBossCard(c, cardsPlayedSoFar) && c.value <= 6);
+        const lowNonBoss = sortedAsc.filter((c) => !isCardBossForBot(c) && c.value <= 6);
         if (lowNonBoss.length > 0) return lowNonBoss[0];
       } else if (humanProfile.style === 'LATE_HOARDER' && trickNumber <= 3) {
         // Human hoards 10s for late game -> Robam attacks early with forcing 8/9s or dynamic bosses
@@ -1117,13 +1295,15 @@ export function chooseAICard(
       }
     }
 
-    // KORA_HUNTER: Play boss card to take trick and keep momentum
+    // KORA_HUNTER: Play boss card to take trick and keep momentum, but NEVER lead a 3!
     if (activeStrategy === 'KORA_HUNTER') {
+      const nonThrees = sortedDesc.filter((c) => c.value !== 3);
+      if (nonThrees.length > 0) return nonThrees[0];
       return sortedDesc[0];
     }
 
-    // EASY DIFFICULTY: Simple low lead
-    if (difficulty === 'EASY') {
+    // EASY DIFFICULTY: Simple low lead without card counting or boss tracking
+    if (effectiveDifficulty === 'EASY') {
       const nonTens = sortedAsc.filter((c) => c.value < 10);
       return nonTens.length > 0 ? nonTens[0] : sortedAsc[0];
     }
@@ -1132,35 +1312,25 @@ export function chooseAICard(
     // A. Purge weak singletons early (Tricks 1-2) to enable discards later
     if (trickNumber <= 2) {
       const weakSingleton = sortedAsc.find(
-        (c) => suitCounts[c.suit] === 1 && c.value <= 6 && !isDynamicBossCard(c, cardsPlayedSoFar)
+        (c) => suitCounts[c.suit] === 1 && c.value <= 6 && !isCardBossForBot(c)
       );
       if (weakSingleton) {
         return weakSingleton;
       }
     }
 
-    // B. Pressure/Extraction: Lead medium/high card (8 or 9) to force out opponent 10s
-    if (difficulty === 'EXPERT' || activeStrategy === 'AGGRESSIVE_LEADER') {
-      const forcingCards = sortedDesc.filter((c) => {
-        const isBoss = isDynamicBossCard(c, cardsPlayedSoFar);
-        return !isBoss && c.value >= 7 && c.value <= 9;
-      });
-
-      if (forcingCards.length > 0 && trickNumber <= 3) {
-        return forcingCards[0]; // Attack with an 8 or 9 to bleed enemy 10s!
-      }
-    }
-
-    // C. CARD_COUNTER: If holding a verified boss and it's trick 3+, cash it in
+    // CARD_COUNTER: If holding a verified boss and it's trick 3+, cash it in
     if (activeStrategy === 'CARD_COUNTER' && trickNumber >= 3 && bossesInHand.length > 0) {
       return bossesInHand[0];
     }
 
     // Default safe lead: lowest non-boss card
-    const nonBossCards = sortedAsc.filter((c) => !isDynamicBossCard(c, cardsPlayedSoFar));
+    const nonBossCards = sortedAsc.filter((c) => !isCardBossForBot(c));
     if (nonBossCards.length > 0) {
       return nonBossCards[0];
     }
+
+    return sortedAsc[0];
 
     return sortedAsc[0];
   }
@@ -1174,45 +1344,6 @@ export function chooseAICard(
     const { winningValue } = determineTrickWinner(currentPlays, leadSuit);
     const winningCards = leadSuitCardsAsc.filter((c) => c.value > winningValue);
 
-    // GRAND MASTER SURGICAL FOLLOW SUIT:
-    if (isGrandMaster) {
-      // Check if current winner is an unbeatable card (unbeatable 10 or current Boss)
-      const currentBossVal = getDynamicBossValue(leadSuit, cardsPlayedSoFar);
-      const isWinnerUnbeatable = winningValue >= currentBossVal;
-
-      if (isWinnerUnbeatable) {
-        // Unbeatable winner -> dump absolute lowest card
-        return leadSuitCardsAsc[0];
-      }
-
-      // If last player to act in the trick:
-      if (isLastPlayerInTrick) {
-        if (winningCards.length > 0) {
-          // Play lowest card that wins the trick!
-          return winningCards[0];
-        }
-        return leadSuitCardsAsc[0];
-      }
-
-      // If 2nd or 3rd player to act:
-      if (winningCards.length > 0) {
-        // If the winning card is a dynamic boss or if higher cards are already dead, take control
-        const lowestWinner = winningCards[0];
-        const isLowestWinnerBoss = isDynamicBossCard(lowestWinner, cardsPlayedSoFar);
-        if (isLowestWinnerBoss) {
-          return lowestWinner;
-        }
-
-        // If current winner is weak (<= 6) and lowestWinner >= 8, take the trick
-        if (winningValue <= 6 && lowestWinner.value >= 8 && playerPositionInTrick >= 3) {
-          return lowestWinner;
-        }
-      }
-
-      // Default safe follow: duck with lowest
-      return leadSuitCardsAsc[0];
-    }
-
     // ROBAM HOKUTO ADAPTIVE FOLLOW:
     if (isRobamHokuto) {
       if (humanProfile.style === 'EARLY_AGGRESSIVE' && trickNumber <= 2) {
@@ -1221,16 +1352,21 @@ export function chooseAICard(
       }
     }
 
-    // KORA_HUNTER: Win trick with lowest sufficient card
+    // KORA_HUNTER: Win trick with lowest sufficient card, but preserve 3s for endgame!
     if (activeStrategy === 'KORA_HUNTER') {
+      const nonThreesWinning = winningCards.filter((c) => c.value !== 3);
+      if (nonThreesWinning.length > 0) {
+        return nonThreesWinning[0];
+      }
       if (winningCards.length > 0) {
         return winningCards[0];
       }
-      return leadSuitCardsAsc[0];
+      const nonThreesAsc = leadSuitCardsAsc.filter((c) => c.value !== 3);
+      return nonThreesAsc.length > 0 ? nonThreesAsc[0] : leadSuitCardsAsc[0];
     }
 
     // EASY: Always play lowest card
-    if (difficulty === 'EASY') {
+    if (effectiveDifficulty === 'EASY') {
       return leadSuitCardsAsc[0];
     }
 
@@ -1246,24 +1382,19 @@ export function chooseAICard(
     }
 
     // 2. CONTESTING & TAKING CONTROL (Late Position / In-Main Contestation):
-    // If in 3rd or 4th position and winning card is weak (<= 7 or 8), take the trick!
+    // Only takes very cheap tricks (<= 6) or takes trick 3 if holding multiple bosses
     if ((isLastPlayerInTrick || playerPositionInTrick >= 3) && winningCards.length > 0) {
       const cheapWinningCard = winningCards.find(
-        (c) => c.value <= 9 && !isDynamicBossCard(c, cardsPlayedSoFar)
+        (c) => c.value <= 6 && !isCardBossForBot(c)
       );
 
       if (cheapWinningCard) {
-        // Seize the trick cheaply without burning a final Boss!
         return cheapWinningCard;
       }
 
-      if (isLastPlayerInTrick && winningCards.length > 0) {
-        // Last player: we know 100% we win the trick if we play winningCards[0]
-        const lowestWinner = winningCards[0];
-        // If it's not our only boss, take the trick
-        if (!isDynamicBossCard(lowestWinner, cardsPlayedSoFar) || bossesInHand.length >= 2) {
-          return lowestWinner;
-        }
+      if (isLastPlayerInTrick && bossesInHand.length >= 2 && trickNumber >= 3) {
+        // Last player on trick 3 with 2+ bosses: take the trick safely to prepare trick 4/5
+        return winningCards[0];
       }
     }
 
@@ -1274,10 +1405,7 @@ export function chooseAICard(
   // =========================================================================
   // --- CASE 3: DISCARDING (AI DOES NOT HAVE LEAD SUIT) ---
   // =========================================================================
-  if (isGrandMaster) {
-    return chooseGrandMasterDiscard(validCards, hand, cardsPlayedSoFar, knownVoids);
-  }
-  return chooseSmartDiscard(validCards, hand, cardsPlayedSoFar, difficulty);
+  return chooseSmartDiscard(validCards, hand, cardsPlayedSoFar, effectiveDifficulty);
 }
 
 export interface BotCommentResult {
@@ -1327,8 +1455,8 @@ export function getBotPlayReaction(params: {
   if (difficulty === 'GRAND_MASTER' && Math.random() < Math.max(0.05, hokutoRate * 0.9)) {
     if (brokeKoraStreak && isWinningSoFar) {
       const grandKatikaBreak = [
-        { text: 'Pas de chelem devant les anciens. Kora gâté.', emoji: '🛑' },
-        { text: 'Chaque carte a été lue depuis la donne. Pas de Kora ici.', emoji: '⚔️' },
+        { text: 'Pas de série de plis devant les anciens.', emoji: '🛑' },
+        { text: 'Chaque carte a été lue depuis la donne. Pas de série ici.', emoji: '⚔️' },
         { text: 'Tu as voulu forcer, mais la table a de la mémoire.', emoji: '⚡' },
       ];
       return grandKatikaBreak[Math.floor(Math.random() * grandKatikaBreak.length)];
@@ -1377,8 +1505,8 @@ export function getBotPlayReaction(params: {
 
     if (brokeKoraStreak && isWinningSoFar) {
       const hokutoKoraEmotes = [
-        { text: 'Tu voulais faire Kora devant Robam Hokuto ? Jamais !', emoji: '🔒' },
-        { text: 'Kora verrouillé ! Respecte un peu le maître du jeu !', emoji: '🛑' },
+        { text: 'Tu voulais enchaîner les plis devant Robam Hokuto ? Jamais !', emoji: '🔒' },
+        { text: 'Série de plis verrouillée ! Respecte un peu le maître du jeu !', emoji: '🛑' },
       ];
       return hokutoKoraEmotes[Math.floor(Math.random() * hokutoKoraEmotes.length)];
     }
@@ -1393,14 +1521,14 @@ export function getBotPlayReaction(params: {
     }
   }
 
-  // 1. HIGHEST PRIORITY: Breaking an opponent's Kora streak (Tricks 2-4)
+  // 1. HIGHEST PRIORITY: Breaking an opponent's trick streak (Tricks 2-4)
   if (brokeKoraStreak && isWinningSoFar) {
     if (Math.random() < Math.min(0.85, Math.max(0.2, mbapRate * 2.4))) {
       const koraBreakerEmotes = [
-        { text: 'Ton Kora est gâté aujourd’hui !', emoji: '🛑' },
-        { text: 'Pas de Kora sur cette table avec moi !', emoji: '⛔' },
-        { text: 'Le grand chelem est mort, assieds-toi !', emoji: '✋' },
-        { text: 'Tu croyais que tu allais faire Kora ? Tu rêves !', emoji: '🛡️' },
+        { text: 'Ta série de plis est rompue aujourd’hui !', emoji: '🛑' },
+        { text: 'Pas de série de plis sur cette table avec moi !', emoji: '⛔' },
+        { text: 'La série de plis est morte, assieds-toi !', emoji: '✋' },
+        { text: 'Tu croyais enchaîner tous les plis ? Tu rêves !', emoji: '🛡️' },
       ];
       return koraBreakerEmotes[Math.floor(Math.random() * koraBreakerEmotes.length)];
     }

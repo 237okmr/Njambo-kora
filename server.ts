@@ -139,6 +139,38 @@ async function startServer() {
     });
   });
 
+  // Manifests serving with strict JSON and no-cache headers to prevent HTML fallback / MIME mismatches
+  const serveManifest = (manifestFileName: string) => (req: express.Request, res: express.Response) => {
+    res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    const primaryPath = process.env.NODE_ENV === 'production'
+      ? path.join(process.cwd(), 'dist', manifestFileName)
+      : path.join(process.cwd(), 'public', manifestFileName);
+    res.sendFile(primaryPath, (err) => {
+      if (err) {
+        res.sendFile(path.join(process.cwd(), 'public', manifestFileName), (fallbackErr) => {
+          if (fallbackErr) {
+            res.status(404).json({ error: 'Manifest not found' });
+          }
+        });
+      }
+    });
+  };
+
+  // Dual PWA Manifest endpoints (root, scoped, and legacy JSON alias)
+  app.get('/manifest.webmanifest', serveManifest('manifest.webmanifest'));
+  app.get('/game/manifest.webmanifest', serveManifest('manifest.webmanifest'));
+  app.get('/manifest.json', serveManifest('manifest.webmanifest'));
+  app.get('/game/manifest.json', serveManifest('manifest.webmanifest'));
+
+  app.get('/manifest-copilot.webmanifest', serveManifest('manifest-copilot.webmanifest'));
+  app.get('/copilot/manifest-copilot.webmanifest', serveManifest('manifest-copilot.webmanifest'));
+  app.get('/copilot/manifest.webmanifest', serveManifest('manifest-copilot.webmanifest'));
+  app.get('/manifest-copilot.json', serveManifest('manifest-copilot.webmanifest'));
+  app.get('/copilot/manifest-copilot.json', serveManifest('manifest-copilot.webmanifest'));
+
   // Push Notifications API
   app.get('/api/push/public-key', (req, res) => {
     res.json({

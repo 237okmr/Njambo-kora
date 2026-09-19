@@ -63,7 +63,7 @@ export const AI_DIFFICULTIES_INFO: Record<AIDifficulty, AIDifficultyInfo> = {
     id: 'EASY',
     name: 'Facile',
     subtitle: 'Initié',
-    description: 'Adversaires virtuels passifs, jouent bas, idéal pour apprendre les règles.',
+    description: 'Adversaires d’initiation : heuristiques simples, sans suivi des cartes ni plan Kora, avec 25 % de coups aléatoires.',
     icon: '🌱',
     badgeBg: 'bg-emerald-900/60 text-emerald-300 border-emerald-700/60',
   },
@@ -71,7 +71,7 @@ export const AI_DIFFICULTIES_INFO: Record<AIDifficulty, AIDifficultyInfo> = {
     id: 'NORMAL',
     name: 'Normal',
     subtitle: 'Stratège',
-    description: 'Adversaires vigilants : suivi des cartes sorties, protection des 10 et réflexe anti-Kora.',
+    description: 'Adversaires vigilants : heuristiques épurées, suivi des cartes maîtresses, protection des 10 sans erreurs volontaires.',
     icon: '⚔️',
     badgeBg: 'bg-amber-900/60 text-amber-300 border-amber-700/60',
   },
@@ -79,7 +79,7 @@ export const AI_DIFFICULTIES_INFO: Record<AIDifficulty, AIDifficultyInfo> = {
     id: 'EXPERT',
     name: 'Expert',
     subtitle: 'Maître',
-    description: 'Adversaires compétitifs : calcul dynamique des boss, pression aux mains 1-3, contrôle de la main 4.',
+    description: 'Adversaires compétitifs : planification Kora mesurée, suivi des coupes et des cartes, jeu équilibré au pli 4 et rupture des séries.',
     icon: '👑',
     badgeBg: 'bg-rose-900/60 text-rose-300 border-rose-700/60',
   },
@@ -87,7 +87,7 @@ export const AI_DIFFICULTIES_INFO: Record<AIDifficulty, AIDifficultyInfo> = {
     id: 'GRAND_MASTER',
     name: 'Grand Katika',
     subtitle: 'Légende Infaillible',
-    description: 'Adversaires d’élite : mémoire absolue des 31 cartes, inférence des vides, anticipation chirurgicale des tours 4 & 5, et contre-attaques anti-Kora impitoyables.',
+    description: 'Adversaires d’élite : simulation Monte Carlo par déterminisation, inférence des vides, anticipation et gain espéré du pot sans triche.',
     icon: '⚡',
     badgeBg: 'bg-purple-900/60 text-purple-300 border-purple-700/60',
   },
@@ -103,7 +103,7 @@ export type AIStrategy =
   | 'BLUFFER' // Caméléon / Masquage des cartes fortes
   | 'GATEKEEPER' // Gardien / Blocage du leader du tapis à la main 4
   | 'POSITIONAL_MASTER' // Maître de Position / Adaptation selon l'ordre de jeu
-  | 'KORA_HUNTER' // Chasseur Kora / Tente le 5/5 pour réussir un Kora ou Double Kora
+  | 'KORA_HUNTER' // Chasseur Kora / Tente de gagner le 5e pli avec un 3 pour réussir un Kora ou Double Kora
   | 'HOKUTO_ADAPTIVE'; // Maître Hokuto / S'adapte au style de jeu de l'adversaire manche après manche
 
 export interface AIStrategyInfo {
@@ -181,7 +181,7 @@ export const AI_STRATEGIES_INFO: Record<AIStrategy, AIStrategyInfo> = {
   KORA_HUNTER: {
     id: 'KORA_HUNTER',
     name: 'Chasseur Kora',
-    description: 'Possède une main maîtresse et tente de remporter toutes les mains (Kora / Double Kora).',
+    description: 'Conserve un 3 pour remporter le 5e pli et cherche l’entame au 4e pli pour réussir un Kora ou Double Kora.',
     icon: '👑',
     badgeBg: 'bg-yellow-900/60 text-yellow-300 border-yellow-700/60',
   },

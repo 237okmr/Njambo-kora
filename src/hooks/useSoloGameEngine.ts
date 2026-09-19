@@ -864,29 +864,9 @@ export function useSoloGameEngine({
       const soleWinner = remainingActivePlayers[0] || updatedPlayers.find((p) => !p.isEliminated) || updatedPlayers[0];
       const winnerIdx = updatedPlayers.findIndex((p) => p.id === soleWinner.id);
 
-      // Evaluate anti-Kora evasion multipliers:
-      // If the sole winner won all previous tricks in this round:
-      let partieWinType: PartieWinType = 'STANDARD';
-      let multiplier = 1;
-
-      const previousTricksCount = current.currentTrickNumber - 1;
-      const soleWinnerWonAllPrevious = previousTricksCount > 0 && (soleWinner.tricksWonInRound || 0) === previousTricksCount;
-
-      if (soleWinnerWonAllPrevious) {
-        const trick4 = current.tricksHistory[3];
-        const isTrick4WonWithThree = Boolean(
-          trick4 &&
-          trick4.winnerIndex === winnerIdx &&
-          trick4.winningCard?.value === 3
-        );
-        if (isTrick4WonWithThree && current.enableDoubleKora) {
-          partieWinType = 'DOUBLE_KORA';
-          multiplier = 4;
-        } else {
-          partieWinType = 'KORA';
-          multiplier = 2;
-        }
-      }
+      // Après forfaits, le joueur restant gagne le pot en victoire STANDARD (multiplicateur 1)
+      const partieWinType: PartieWinType = 'STANDARD';
+      const multiplier = 1;
 
       // Calculate penalties according to multiplier:
       // All losers (including all folded players!) must pay the extra penalty
@@ -920,20 +900,12 @@ export function useSoloGameEngine({
 
       const remainingActive = evaluatedPlayers.filter((p) => !p.isEliminated);
 
-      if (partieWinType === 'DOUBLE_KORA') {
-        sounds.playDoubleKora();
-        setShowKoraVictoryOverlay(true);
-      } else if (partieWinType === 'KORA') {
-        sounds.playKora();
-        setShowKoraVictoryOverlay(true);
-      } else {
-        sounds.playRoundVictory();
-      }
+      sounds.playRoundVictory();
 
       if (soleWinner.isHuman) {
         triggerHaptic('success');
         confetti({
-          particleCount: partieWinType === 'DOUBLE_KORA' ? 180 : partieWinType === 'KORA' ? 140 : 100,
+          particleCount: 100,
           spread: 80,
           origin: { y: 0.6 },
         });
@@ -1744,7 +1716,10 @@ export function useSoloGameEngine({
               state.currentTrickNumber,
               activeStrategyForBot,
               state.tricksHistory,
-              activeCount
+              activeCount,
+              state.aiDifficulty || 'NORMAL',
+              state.players,
+              playerIdx
             );
           }
 

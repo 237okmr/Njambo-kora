@@ -1,6 +1,6 @@
-// Njambo Kora & Njambo Copilote Dual PWA Service Worker - v25170 (Network-First Navigation & Isolated Caches)
-const CACHE_GAME = 'njambo-kora-assets-v25179';
-const CACHE_COPILOT = 'katika-copilot-assets-v25179';
+// Njambo Kora & Njambo Copilote Dual PWA Service Worker - v25200 (Network-First Navigation & Isolated Caches)
+const CACHE_GAME = 'njambo-kora-assets-v25200';
+const CACHE_COPILOT = 'katika-copilot-assets-v25200';
 
 const GAME_ASSETS = [
   '/',
@@ -90,6 +90,9 @@ self.addEventListener('fetch', (event) => {
     url.hostname.includes('identitytoolkit') ||
     url.pathname.startsWith('/api/') ||
     url.pathname.endsWith('version.json') ||
+    url.pathname.endsWith('.webmanifest') ||
+    url.pathname.endsWith('manifest.json') ||
+    url.pathname.includes('manifest') ||
     url.pathname.startsWith('/src/') ||
     url.pathname.startsWith('/@') ||
     url.pathname.startsWith('/node_modules/') ||

@@ -1424,26 +1424,124 @@ export const playerProfileService = {
     // Merge statistics non-destructively
     const cloudStats = cloudProfile?.stats || { ...DEFAULT_PLAYER_STATS };
     const guestStats = guestProfile.isGuest ? guestProfile.stats : { ...DEFAULT_PLAYER_STATS };
+    const isGuestMerge = guestProfile.isGuest;
 
-    const partiesCount = Math.max(
-      mergedHistory.filter((h) => h.recordType === 'PARTIE').length,
-      (cloudStats.partiesPlayed || 0) + (guestStats.partiesPlayed || 0)
-    );
-    const partiesWonCount = Math.max(
-      mergedHistory.filter((h) => h.recordType === 'PARTIE' && h.isWinner).length,
-      (cloudStats.partiesWon || 0) + (guestStats.partiesWon || 0)
-    );
-    const gamesPlayedCount = Math.max(
-      mergedHistory.filter((h) => h.recordType === 'MANCHE' || !h.recordType).length,
-      (cloudStats.gamesPlayed || 0) + (guestStats.gamesPlayed || 0)
-    );
-    const gamesWonCount = Math.max(
-      mergedHistory.filter((h) => (h.recordType === 'MANCHE' || !h.recordType) && h.isWinner).length,
-      (cloudStats.gamesWon || 0) + (guestStats.gamesWon || 0)
-    );
+    // Plafonds stricts de contribution de l'invité selon les limites de firestore.rules
+    const cap100 = (v?: number) => Math.min(100, Math.max(0, v || 0));
+    const cap30 = (v?: number) => Math.min(30, Math.max(0, v || 0));
+    const cap10 = (v?: number) => Math.min(10, Math.max(0, v || 0));
+
+    // Compteurs de parties et de manches (max 100)
+    const gPartiesPlayed = isGuestMerge ? cap100(guestStats.partiesPlayed) : 0;
+    const gPartiesWon = isGuestMerge ? Math.min(gPartiesPlayed, cap100(guestStats.partiesWon)) : 0;
+
+    const gGamesPlayed = isGuestMerge ? cap100(guestStats.gamesPlayed) : 0;
+    const gGamesWon = isGuestMerge ? Math.min(gGamesPlayed, cap100(guestStats.gamesWon)) : 0;
+    const gGamesLost = isGuestMerge ? Math.min(cap100(gGamesPlayed - gGamesWon), cap100(guestStats.gamesLost)) : 0;
+
+    const gManchesPlayed = isGuestMerge ? cap100(guestStats.manchesPlayed || guestStats.gamesPlayed) : 0;
+    const gManchesWon = isGuestMerge ? Math.min(gManchesPlayed, cap100(guestStats.manchesWon)) : 0;
+
+    const gSoloGamesPlayed = isGuestMerge ? cap100(guestStats.soloGamesPlayed) : 0;
+    const gSoloGamesWon = isGuestMerge ? Math.min(gSoloGamesPlayed, cap100(guestStats.soloGamesWon)) : 0;
+    const gMultiGamesPlayed = isGuestMerge ? cap100(guestStats.multiplayerGamesPlayed) : 0;
+    const gMultiGamesWon = isGuestMerge ? Math.min(gMultiGamesPlayed, cap100(guestStats.multiplayerGamesWon)) : 0;
+
+    const gSoloManchesWon = isGuestMerge ? cap100(guestStats.soloManchesWon) : 0;
+    const gMultiManchesWon = isGuestMerge ? cap100(guestStats.multiplayerManchesWon) : 0;
+    const gSoloManchesWonEasy = isGuestMerge ? cap100(guestStats.soloManchesWonEasy) : 0;
+    const gSoloManchesWonNormal = isGuestMerge ? cap100(guestStats.soloManchesWonNormal) : 0;
+    const gSoloManchesWonHard = isGuestMerge ? cap100(guestStats.soloManchesWonHard) : 0;
+
+    const gSoloGamesWonEasy = isGuestMerge ? cap100(guestStats.soloGamesWonEasy) : 0;
+    const gSoloGamesWonNormal = isGuestMerge ? cap100(guestStats.soloGamesWonNormal) : 0;
+    const gSoloGamesWonHard = isGuestMerge ? cap100(guestStats.soloGamesWonHard) : 0;
+
+    // Compteurs de Koras (max 30) et Doubles Koras (max 10)
+    const gKoraCount = isGuestMerge ? cap30(guestStats.koraCount) : 0;
+    const gDoubleKoraCount = isGuestMerge ? Math.min(gKoraCount, cap10(guestStats.doubleKoraCount)) : 0;
+
+    const gSoloKoraCount = isGuestMerge ? cap30(guestStats.soloKoraCount) : 0;
+    const gMultiKoraCount = isGuestMerge ? cap30(guestStats.multiplayerKoraCount) : 0;
+    const gSoloKorasEasy = isGuestMerge ? cap30(guestStats.soloKorasEasy) : 0;
+    const gSoloKorasNormal = isGuestMerge ? cap30(guestStats.soloKorasNormal) : 0;
+    const gSoloKorasHard = isGuestMerge ? cap30(guestStats.soloKorasHard) : 0;
+
+    const gSoloDoubleKoraCount = isGuestMerge ? cap10(guestStats.soloDoubleKoraCount) : 0;
+    const gMultiDoubleKoraCount = isGuestMerge ? cap10(guestStats.multiplayerDoubleKoraCount) : 0;
+    const gSoloDoubleKorasEasy = isGuestMerge ? cap10(guestStats.soloDoubleKorasEasy) : 0;
+    const gSoloDoubleKorasNormal = isGuestMerge ? cap10(guestStats.soloDoubleKorasNormal) : 0;
+    const gSoloDoubleKorasHard = isGuestMerge ? cap10(guestStats.soloDoubleKorasHard) : 0;
+
+    // Recalcul du score de maîtrise de l'invité à partir de son historique local avec plafond quotidien de 30 pts solo
+    let guestMasteryPoints = 0;
+    if (isGuestMerge) {
+      const sortedGuestHistory = [...guestHistory].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+      const dailySoloPointsMap = new Map<string, number>();
+
+      for (const h of sortedGuestHistory) {
+        let eventPotential = 0;
+        if (typeof h.masteryPointsAwarded === 'number' && !isNaN(h.masteryPointsAwarded)) {
+          eventPotential = h.masteryPointsAwarded;
+        } else if (h.isWinner) {
+          if (h.recordType === 'PARTIE') {
+            eventPotential = computeEventMasteryScore({
+              mode: h.mode,
+              difficulty: h.aiDifficulty,
+              partiesWon: 1,
+              koras: h.winType === 'KORA' ? 1 : 0,
+              doubleKoras: h.winType === 'DOUBLE_KORA' ? 1 : 0,
+            });
+          } else if (h.isMancheFinalWin === true || h.isMancheOver || !h.recordType) {
+            eventPotential = computeEventMasteryScore({
+              mode: h.mode,
+              difficulty: h.aiDifficulty,
+              isMancheWinner: true,
+              isForfeitWin: h.winType === 'FORFEIT',
+              koras: h.winType === 'KORA' ? 1 : 0,
+              doubleKoras: h.winType === 'DOUBLE_KORA' ? 1 : 0,
+            });
+          }
+        } else if (h.mode === 'MULTIPLAYER' && (h.status === 'abandoned' || h.winType === 'FORFEIT')) {
+          eventPotential = -MASTERY_CONFIG.rules.forfeitPenaltyMultiplayer; // -5
+        }
+
+        if (h.mode === 'SOLO' && eventPotential > 0) {
+          const dayKey = getDoualaDateKey(h.createdAt || Date.now());
+          const currentDaySolo = dailySoloPointsMap.get(dayKey) || 0;
+          const cap = MASTERY_CONFIG.rules.dailySoloPointsCap; // 30
+          if (currentDaySolo < cap) {
+            const awarded = Math.min(eventPotential, cap - currentDaySolo);
+            dailySoloPointsMap.set(dayKey, currentDaySolo + awarded);
+            guestMasteryPoints += awarded;
+          }
+        } else {
+          guestMasteryPoints = Math.max(0, guestMasteryPoints + eventPotential);
+        }
+      }
+
+      // Plafonner la contribution totale de l'invité à 300 points de maîtrise
+      guestMasteryPoints = Math.min(300, Math.max(0, guestMasteryPoints));
+    }
+
+    const partiesCount = (cloudStats.partiesPlayed || 0) + gPartiesPlayed;
+    const partiesWonCount = Math.min(partiesCount, (cloudStats.partiesWon || 0) + gPartiesWon);
+
+    const gamesPlayedCount = (cloudStats.gamesPlayed || 0) + gGamesPlayed;
+    const gamesWonCount = Math.min(gamesPlayedCount, (cloudStats.gamesWon || 0) + gGamesWon);
     const gamesLostCount = Math.max(0, gamesPlayedCount - gamesWonCount);
     const winRate = gamesPlayedCount > 0 ? Math.round((gamesWonCount / gamesPlayedCount) * 100) : 0;
-    const totalTricks = (cloudStats.totalTricksWon || 0) + (guestStats.totalTricksWon || 0);
+
+    const manchesWonCount = (cloudStats.manchesWon || 0) + gManchesWon;
+    const manchesPlayedCount = Math.max(
+      manchesWonCount,
+      (cloudStats.manchesPlayed || cloudStats.gamesPlayed || 0) + gManchesPlayed
+    );
+
+    const mergedKoraCount = (cloudStats.koraCount || 0) + gKoraCount;
+    const mergedDoubleKoraCount = Math.min(mergedKoraCount, (cloudStats.doubleKoraCount || 0) + gDoubleKoraCount);
+
+    const totalTricks = (cloudStats.totalTricksWon || 0) + (isGuestMerge ? (guestStats.totalTricksWon || 0) : 0);
 
     const mergedStats: PlayerStats = {
       gamesPlayed: gamesPlayedCount,
@@ -1452,44 +1550,45 @@ export const playerProfileService = {
       winRate,
       partiesPlayed: partiesCount,
       partiesWon: partiesWonCount,
-      manchesWon: (cloudStats.manchesWon || 0) + (guestStats.manchesWon || 0),
-      soloManchesWon: (cloudStats.soloManchesWon || 0) + (guestStats.soloManchesWon || 0),
-      multiplayerManchesWon: (cloudStats.multiplayerManchesWon || 0) + (guestStats.multiplayerManchesWon || 0),
-      soloManchesWonHard: (cloudStats.soloManchesWonHard || 0) + (guestStats.soloManchesWonHard || 0),
-      soloManchesWonNormal: (cloudStats.soloManchesWonNormal || 0) + (guestStats.soloManchesWonNormal || 0),
-      soloManchesWonEasy: (cloudStats.soloManchesWonEasy || 0) + (guestStats.soloManchesWonEasy || 0),
-      soloGamesWonEasy: (cloudStats.soloGamesWonEasy || 0) + (guestStats.soloGamesWonEasy || 0),
-      soloGamesWonNormal: (cloudStats.soloGamesWonNormal || 0) + (guestStats.soloGamesWonNormal || 0),
-      soloGamesWonHard: (cloudStats.soloGamesWonHard || 0) + (guestStats.soloGamesWonHard || 0),
-      koraCount: (cloudStats.koraCount || 0) + (guestStats.koraCount || 0),
-      doubleKoraCount: (cloudStats.doubleKoraCount || 0) + (guestStats.doubleKoraCount || 0),
-      soloKorasEasy: (cloudStats.soloKorasEasy || 0) + (guestStats.soloKorasEasy || 0),
-      soloKorasNormal: (cloudStats.soloKorasNormal || 0) + (guestStats.soloKorasNormal || 0),
-      soloKorasHard: (cloudStats.soloKorasHard || 0) + (guestStats.soloKorasHard || 0),
-      soloDoubleKorasEasy: (cloudStats.soloDoubleKorasEasy || 0) + (guestStats.soloDoubleKorasEasy || 0),
-      soloDoubleKorasNormal: (cloudStats.soloDoubleKorasNormal || 0) + (guestStats.soloDoubleKorasNormal || 0),
-      soloDoubleKorasHard: (cloudStats.soloDoubleKorasHard || 0) + (guestStats.soloDoubleKorasHard || 0),
-      under21Count: (cloudStats.under21Count || 0) + (guestStats.under21Count || 0),
-      threeSevensCount: (cloudStats.threeSevensCount || 0) + (guestStats.threeSevensCount || 0),
-      biggestPotWon: Math.max(cloudStats.biggestPotWon || 0, guestStats.biggestPotWon || 0),
+      manchesPlayed: manchesPlayedCount,
+      manchesWon: manchesWonCount,
+      soloManchesWon: (cloudStats.soloManchesWon || 0) + gSoloManchesWon,
+      multiplayerManchesWon: (cloudStats.multiplayerManchesWon || 0) + gMultiManchesWon,
+      soloManchesWonHard: (cloudStats.soloManchesWonHard || 0) + gSoloManchesWonHard,
+      soloManchesWonNormal: (cloudStats.soloManchesWonNormal || 0) + gSoloManchesWonNormal,
+      soloManchesWonEasy: (cloudStats.soloManchesWonEasy || 0) + gSoloManchesWonEasy,
+      soloGamesWonEasy: (cloudStats.soloGamesWonEasy || 0) + gSoloGamesWonEasy,
+      soloGamesWonNormal: (cloudStats.soloGamesWonNormal || 0) + gSoloGamesWonNormal,
+      soloGamesWonHard: (cloudStats.soloGamesWonHard || 0) + gSoloGamesWonHard,
+      koraCount: mergedKoraCount,
+      doubleKoraCount: mergedDoubleKoraCount,
+      soloKorasEasy: (cloudStats.soloKorasEasy || 0) + gSoloKorasEasy,
+      soloKorasNormal: (cloudStats.soloKorasNormal || 0) + gSoloKorasNormal,
+      soloKorasHard: (cloudStats.soloKorasHard || 0) + gSoloKorasHard,
+      soloDoubleKorasEasy: (cloudStats.soloDoubleKorasEasy || 0) + gSoloDoubleKorasEasy,
+      soloDoubleKorasNormal: (cloudStats.soloDoubleKorasNormal || 0) + gSoloDoubleKorasNormal,
+      soloDoubleKorasHard: (cloudStats.soloDoubleKorasHard || 0) + gSoloDoubleKorasHard,
+      under21Count: (cloudStats.under21Count || 0) + (isGuestMerge ? (guestStats.under21Count || 0) : 0),
+      threeSevensCount: (cloudStats.threeSevensCount || 0) + (isGuestMerge ? (guestStats.threeSevensCount || 0) : 0),
+      biggestPotWon: Math.max(cloudStats.biggestPotWon || 0, isGuestMerge ? Math.min(50000, guestStats.biggestPotWon || 0) : 0),
       totalTricksWon: totalTricks,
       averageTricksPerGame: partiesCount > 0 ? parseFloat((totalTricks / partiesCount).toFixed(1)) : 0,
-      soloGamesPlayed: (cloudStats.soloGamesPlayed || 0) + (guestStats.soloGamesPlayed || 0),
-      multiplayerGamesPlayed: (cloudStats.multiplayerGamesPlayed || 0) + (guestStats.multiplayerGamesPlayed || 0),
-      soloGamesWon: (cloudStats.soloGamesWon || 0) + (guestStats.soloGamesWon || 0),
-      multiplayerGamesWon: (cloudStats.multiplayerGamesWon || 0) + (guestStats.multiplayerGamesWon || 0),
-      forfeitCount: (cloudStats.forfeitCount || 0) + (guestStats.forfeitCount || 0),
-      foldCount: (cloudStats.foldCount || 0) + (guestStats.foldCount || 0),
-      fortune: (cloudStats.fortune || 0) + (guestStats.fortune || 0),
-      multiplayerGains: (cloudStats.multiplayerGains || 0) + (guestStats.multiplayerGains || 0),
-      multiplayerPertes: (cloudStats.multiplayerPertes || 0) + (guestStats.multiplayerPertes || 0),
-      soloKoraCount: (cloudStats.soloKoraCount || 0) + (guestStats.soloKoraCount || 0),
-      multiplayerKoraCount: (cloudStats.multiplayerKoraCount || 0) + (guestStats.multiplayerKoraCount || 0),
-      soloDoubleKoraCount: (cloudStats.soloDoubleKoraCount || 0) + (guestStats.soloDoubleKoraCount || 0),
-      multiplayerDoubleKoraCount: (cloudStats.multiplayerDoubleKoraCount || 0) + (guestStats.multiplayerDoubleKoraCount || 0),
-      soloGains: (cloudStats.soloGains || 0) + (guestStats.soloGains || 0),
-      soloPertes: (cloudStats.soloPertes || 0) + (guestStats.soloPertes || 0),
-      soloFortune: (cloudStats.soloFortune || 0) + (guestStats.soloFortune || 0),
+      soloGamesPlayed: (cloudStats.soloGamesPlayed || 0) + gSoloGamesPlayed,
+      multiplayerGamesPlayed: (cloudStats.multiplayerGamesPlayed || 0) + gMultiGamesPlayed,
+      soloGamesWon: (cloudStats.soloGamesWon || 0) + gSoloGamesWon,
+      multiplayerGamesWon: (cloudStats.multiplayerGamesWon || 0) + gMultiGamesWon,
+      forfeitCount: (cloudStats.forfeitCount || 0) + (isGuestMerge ? (guestStats.forfeitCount || 0) : 0),
+      foldCount: (cloudStats.foldCount || 0) + (isGuestMerge ? (guestStats.foldCount || 0) : 0),
+      fortune: (cloudStats.fortune || 0) + (isGuestMerge ? Math.min(50000, Math.max(-25000, guestStats.fortune || 0)) : 0),
+      multiplayerGains: (cloudStats.multiplayerGains || 0) + (isGuestMerge ? Math.min(50000, guestStats.multiplayerGains || 0) : 0),
+      multiplayerPertes: (cloudStats.multiplayerPertes || 0) + (isGuestMerge ? Math.min(25000, guestStats.multiplayerPertes || 0) : 0),
+      soloKoraCount: (cloudStats.soloKoraCount || 0) + gSoloKoraCount,
+      multiplayerKoraCount: (cloudStats.multiplayerKoraCount || 0) + gMultiKoraCount,
+      soloDoubleKoraCount: (cloudStats.soloDoubleKoraCount || 0) + gSoloDoubleKoraCount,
+      multiplayerDoubleKoraCount: (cloudStats.multiplayerDoubleKoraCount || 0) + gMultiDoubleKoraCount,
+      soloGains: (cloudStats.soloGains || 0) + (isGuestMerge ? Math.min(50000, guestStats.soloGains || 0) : 0),
+      soloPertes: (cloudStats.soloPertes || 0) + (isGuestMerge ? Math.min(25000, guestStats.soloPertes || 0) : 0),
+      soloFortune: (cloudStats.soloFortune || 0) + (isGuestMerge ? Math.min(50000, Math.max(-25000, guestStats.soloFortune || 0)) : 0),
       soloWinRate: 0,
       multiplayerWinRate: 0,
     };
@@ -1498,27 +1597,34 @@ export const playerProfileService = {
     const targetScoreVersion = cloudProfile ? (cloudProfile.scoreVersion || cloudProfile.stats?.scoreVersion || 1) : 2;
     const isTargetV2 = targetScoreVersion >= 2;
 
-    // Pour scoreVersion >= 2 : somme du score cloud v2 et des points de l'invité, pas de recalcul par compteurs
+    // Pour scoreVersion >= 2 : somme du score cloud v2 et des points recalculés de l'invité (plafonnés à 300)
     if (isTargetV2) {
-      const guestPoints = guestStats.masteryScore ?? computeMasteryScore(guestStats);
-      mergedStats.masteryScore = (cloudStats.masteryScore || 0) + guestPoints;
+      mergedStats.masteryScore = (cloudStats.masteryScore || 0) + guestMasteryPoints;
     }
 
-    // Non-destructive chips fusion: preserve earned chips (highest balance or additive delta)
+    // Jetons : plafonnement strict à 20 000 jetons de gain maximum
     const cloudChips = typeof cloudProfile?.chips === 'number' && !isNaN(cloudProfile.chips) ? cloudProfile.chips : 1000;
     const guestChips = typeof guestProfile?.chips === 'number' && !isNaN(guestProfile.chips) ? guestProfile.chips : 1000;
-    const mergedChips = Math.max(cloudChips, guestChips);
+    let mergedChips: number;
+    if (cloudProfile) {
+      // Compte existant : gain plafonné à 20 000 jetons supplémentaires apportés par l'invité
+      const guestGain = isGuestMerge ? Math.min(20000, Math.max(0, guestChips - 1000)) : 0;
+      mergedChips = Math.min(cloudChips + 20000, Math.max(cloudChips, cloudChips + guestGain));
+    } else {
+      // Compte neuf : solde plafonné à 20 000 jetons max (1 000 min)
+      mergedChips = isGuestMerge ? Math.min(20000, Math.max(1000, guestChips)) : 1000;
+    }
 
     // Fair play fusion
     const mergedFairPlay: PlayerFairPlay = {
       consecutiveForfeits: 0,
-      totalForfeits: (cloudProfile?.fairPlay?.totalForfeits || 0) + (guestProfile?.fairPlay?.totalForfeits || 0),
-      totalFoldRounds: (cloudProfile?.fairPlay?.totalFoldRounds || 0) + (guestProfile?.fairPlay?.totalFoldRounds || 0),
-      prolongedDisconnects: (cloudProfile?.fairPlay?.prolongedDisconnects || 0) + (guestProfile?.fairPlay?.prolongedDisconnects || 0),
-      totalGamesStarted: (cloudProfile?.fairPlay?.totalGamesStarted || 0) + (guestProfile?.fairPlay?.totalGamesStarted || 0),
+      totalForfeits: (cloudProfile?.fairPlay?.totalForfeits || 0) + (isGuestMerge ? (guestProfile?.fairPlay?.totalForfeits || 0) : 0),
+      totalFoldRounds: (cloudProfile?.fairPlay?.totalFoldRounds || 0) + (isGuestMerge ? (guestProfile?.fairPlay?.totalFoldRounds || 0) : 0),
+      prolongedDisconnects: (cloudProfile?.fairPlay?.prolongedDisconnects || 0) + (isGuestMerge ? (guestProfile?.fairPlay?.prolongedDisconnects || 0) : 0),
+      totalGamesStarted: (cloudProfile?.fairPlay?.totalGamesStarted || 0) + (isGuestMerge ? (guestProfile?.fairPlay?.totalGamesStarted || 0) : 0),
       disconnectRate: 0,
       activeSanction: cloudProfile?.fairPlay?.activeSanction || null,
-      sanctionsHistory: [...(cloudProfile?.fairPlay?.sanctionsHistory || []), ...(guestProfile?.fairPlay?.sanctionsHistory || [])].slice(0, 20),
+      sanctionsHistory: [...(cloudProfile?.fairPlay?.sanctionsHistory || []), ...(isGuestMerge ? (guestProfile?.fairPlay?.sanctionsHistory || []) : [])].slice(0, 20),
     };
     mergedFairPlay.disconnectRate = parseFloat(
       ((mergedFairPlay.totalForfeits + mergedFairPlay.prolongedDisconnects) / Math.max(1, gamesPlayedCount + 1)).toFixed(2)

@@ -2029,28 +2029,9 @@ export class ServerGameEngine {
       const soleWinner = remainingActiveInPartie[0] || (gs.players || []).find((p) => !p.isEliminated && !p.isForfeit) || gs.players[0];
       const winnerIndex = (gs.players || []).findIndex((p) => p.id === soleWinner.id);
 
-      // Evaluate anti-Kora evasion multipliers
-      let partieWinType: PartieWinType = 'STANDARD';
-      let multiplier = 1;
-
-      const previousTricksCount = gs.currentTrickNumber - 1;
-      const soleWinnerWonAllPrevious = previousTricksCount > 0 && (soleWinner.tricksWonInRound || 0) === previousTricksCount;
-
-      if (soleWinnerWonAllPrevious) {
-        const trick4 = gs.tricksHistory[3];
-        const isTrick4WonWithThree = Boolean(
-          trick4 &&
-          trick4.winnerIndex === winnerIndex &&
-          trick4.winningCard?.value === 3
-        );
-        if (isTrick4WonWithThree && room.enableDoubleKora) {
-          partieWinType = 'DOUBLE_KORA';
-          multiplier = 4;
-        } else {
-          partieWinType = 'KORA';
-          multiplier = 2;
-        }
-      }
+      // Après forfaits, le joueur restant gagne le pot en victoire STANDARD (multiplicateur 1)
+      const partieWinType: PartieWinType = 'STANDARD';
+      const multiplier = 1;
 
       // Collect penalties from folded losers to prevent tactical fold evasion
       const extraCostPerLoser = (multiplier - 1) * gs.baseBet;

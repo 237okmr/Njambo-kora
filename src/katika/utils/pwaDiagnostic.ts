@@ -48,23 +48,49 @@ export async function runPwaDiagnostic(silent = false): Promise<PwaDiagnosticRep
     : '/manifest.webmanifest';
 
   const manifestElement = document.querySelector('link[rel="manifest"]') as HTMLLinkElement | null;
-  const activeManifestHref = manifestElement ? manifestElement.getAttribute('href') : null;
-  const isManifestMatching = activeManifestHref === expectedManifest;
+  const activeManifestHref = manifestElement ? (manifestElement.getAttribute('href') || manifestElement.href) : null;
+  const isManifestMatching =
+    activeManifestHref === expectedManifest ||
+    (activeManifestHref ? activeManifestHref.endsWith(expectedManifest) : false);
 
   let manifestData: any = null;
   let fetchError: string | null = null;
 
-  if (activeManifestHref) {
-    try {
-      const res = await fetch(activeManifestHref, { cache: 'no-cache' });
-      if (res.ok) {
-        manifestData = await res.json();
+  // Resolve target manifest URL to an absolute root path
+  const targetUrl = activeManifestHref || expectedManifest;
+  const fetchUrl = targetUrl.startsWith('http') || targetUrl.startsWith('/')
+    ? targetUrl
+    : '/' + targetUrl;
+
+  try {
+    const res = await fetch(fetchUrl, { cache: 'no-cache' });
+    if (res.ok) {
+      const text = await res.text();
+      if (text.trim().startsWith('<')) {
+        // Fallback: the server returned an HTML fallback (SPA route) instead of the manifest file.
+        if (fetchUrl !== expectedManifest) {
+          const fallbackRes = await fetch(expectedManifest, { cache: 'no-cache' });
+          if (fallbackRes.ok) {
+            const fallbackText = await fallbackRes.text();
+            if (!fallbackText.trim().startsWith('<')) {
+              manifestData = JSON.parse(fallbackText);
+            } else {
+              fetchError = `Le serveur a renvoyé du contenu HTML au lieu du JSON pour ${expectedManifest}`;
+            }
+          } else {
+            fetchError = `HTTP ${fallbackRes.status}: ${fallbackRes.statusText}`;
+          }
+        } else {
+          fetchError = `Le serveur a renvoyé du contenu HTML au lieu du JSON pour ${fetchUrl}`;
+        }
       } else {
-        fetchError = `HTTP ${res.status}: ${res.statusText}`;
+        manifestData = JSON.parse(text);
       }
-    } catch (err: any) {
-      fetchError = err?.message || 'Failed to fetch manifest';
+    } else {
+      fetchError = `HTTP ${res.status}: ${res.statusText}`;
     }
+  } catch (err: any) {
+    fetchError = err?.message || 'Failed to fetch manifest';
   }
 
   // Service worker check

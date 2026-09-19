@@ -715,7 +715,7 @@ export const KatikaSettingsTab: React.FC<KatikaSettingsTabProps> = ({ onConfigUp
                       <span>Bypass Exceptionnel (Kora-Break & Pli 5)</span>
                     </div>
                     <p className="text-[11px] text-slate-400 leading-relaxed">
-                      Autorise les réactions décisives (briser un chelem Kora ou victoire sur le pot au pli 5) à s'exprimer même si le plafond de manche est atteint, dès lors que le délai de silence de table est purgé.
+                      Autorise les réactions décisives (briser une série de plis ou victoire sur le pot au pli 5) à s'exprimer même si le plafond de manche est atteint, dès lors que le délai de silence de table est purgé.
                     </p>
                   </div>
                   <div className="flex items-center justify-between pt-2 border-t border-slate-800/80">
