@@ -30,7 +30,7 @@ export const KoraHunterAlertBanner: React.FC<KoraHunterAlertBannerProps> = ({
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={{ opacity: 0, y: -15, scale: 0.95 }}
           transition={{ type: 'spring', stiffness: 400, damping: 30 }}
-          className="fixed top-14 sm:top-16 left-1/2 -translate-x-1/2 z-50 w-[90%] max-w-md pointer-events-auto"
+          className="pointer-events-auto w-full max-w-sm"
         >
           {/* Sleek, thin, single-row high-contrast tactical banner */}
           <div className="relative rounded-xl bg-amber-950/95 border border-yellow-500/40 shadow-xl px-3.5 py-2.5 text-slate-100 flex items-center justify-between gap-3 backdrop-blur-md">
@@ -53,8 +53,8 @@ export const KoraHunterAlertBanner: React.FC<KoraHunterAlertBannerProps> = ({
             <button
               type="button"
               onClick={onDismiss}
-              className="p-1 rounded-lg text-amber-300/60 hover:text-yellow-100 hover:bg-yellow-950/50 transition-colors shrink-0"
-              title="Fermer l'alerte"
+              className="-mr-1 flex h-11 w-11 items-center justify-center rounded-lg text-amber-300/60 hover:text-yellow-100 hover:bg-yellow-950/50 transition-colors shrink-0"
+              aria-label="Fermer l'alerte"
             >
               <X className="w-3.5 h-3.5" />
             </button>

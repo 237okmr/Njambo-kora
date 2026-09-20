@@ -6,7 +6,8 @@ import { WebSocketServer } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import { RoomManager } from './server/rooms/roomManager';
 import { handleAdminChatMessage, streamAdminChatMessage } from './server/aiAdminChat';
-import { pushService } from './server/pushService';
+import { pushService, buildGameUrl } from './server/pushService';
+import { verifyFirebaseIdToken } from './server/firebaseAdmin';
 import { collection, getDocs, query, limit, orderBy, startAfter } from 'firebase/firestore';
 import { db } from './src/lib/firebase';
 import {
@@ -180,39 +181,86 @@ async function startServer() {
     });
   });
 
-  app.post('/api/push/subscribe', express.json(), (req, res) => {
-    const { userId, userName, subscription, userAgent } = req.body || {};
+  // Un identifiant Google (UID) ne peut être revendiqué qu'avec un jeton Firebase valide ;
+  // seuls les identifiants invités ("usr_...") sont acceptés sans jeton (même règle que le WebSocket).
+  const resolvePushUserId = async (req: express.Request, claimedUserId: string): Promise<string | null> => {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (token) {
+      const verified = await verifyFirebaseIdToken(token);
+      if (verified) return verified.uid;
+      return null;
+    }
+    return typeof claimedUserId === 'string' && claimedUserId.startsWith('usr_') ? claimedUserId : null;
+  };
+
+  app.post('/api/push/subscribe', express.json(), async (req, res) => {
+    const { userId, userName, subscription, userAgent, preferences } = req.body || {};
     if (!userId || !subscription) {
       return res.status(400).json({ success: false, error: 'Champs userId ou subscription manquants' });
     }
-    const registered = pushService.registerSubscription(userId, userName, subscription, userAgent);
+    const resolvedId = await resolvePushUserId(req, userId);
+    if (!resolvedId) {
+      return res.status(401).json({ success: false, error: 'Identité non vérifiée' });
+    }
+    const registered = pushService.registerSubscription(resolvedId, userName, subscription, userAgent, preferences);
     res.json({ success: registered, subscribersCount: pushService.getSubscribersCount() });
   });
 
-  app.post('/api/push/unsubscribe', express.json(), (req, res) => {
+  app.post('/api/push/preferences', express.json(), async (req, res) => {
+    const { userId, endpoint, preferences } = req.body || {};
+    if (!userId || !endpoint || !preferences) {
+      return res.status(400).json({ success: false, error: 'Champs manquants' });
+    }
+    const resolvedId = await resolvePushUserId(req, userId);
+    if (!resolvedId) {
+      return res.status(401).json({ success: false, error: 'Identité non vérifiée' });
+    }
+    res.json({ success: pushService.updatePreferences(resolvedId, endpoint, preferences) });
+  });
+
+  app.post('/api/push/unsubscribe', express.json(), async (req, res) => {
     const { userId, endpoint } = req.body || {};
     if (!userId || !endpoint) {
       return res.status(400).json({ success: false, error: 'Champs userId ou endpoint manquants' });
     }
-    const removed = pushService.removeSubscription(userId, endpoint);
+    const resolvedId = await resolvePushUserId(req, userId);
+    if (!resolvedId) {
+      return res.status(401).json({ success: false, error: 'Identité non vérifiée' });
+    }
+    const removed = pushService.removeSubscription(resolvedId, endpoint);
     res.json({ success: removed });
   });
 
+  // Test de notification : envoyé UNIQUEMENT à l'appareil qui le demande (endpoint), 1 fois / 15 s.
+  const lastPushTestAt = new Map<string, number>();
   app.post('/api/push/send-test', express.json(), async (req, res) => {
-    const { userId } = req.body || {};
-    if (!userId) {
-      return res.status(400).json({ success: false, error: 'userId requis pour le test' });
+    const { userId, endpoint } = req.body || {};
+    if (!userId || !endpoint) {
+      return res.status(400).json({ success: false, error: 'userId et endpoint requis pour le test' });
     }
-    const result = await pushService.sendNotificationToUser(userId, {
-      title: '🃏 Njambo Kora Push Test',
-      body: 'Félicitations ! Les notifications push mobiles et hors-ligne sont parfaitement actives sur votre appareil !',
-      icon: '/icon-192.svg',
-      badge: '/icon-192.svg',
-      data: {
-        type: 'SYSTEM',
-        url: '/',
+    const resolvedId = await resolvePushUserId(req, userId);
+    if (!resolvedId) {
+      return res.status(401).json({ success: false, error: 'Identité non vérifiée' });
+    }
+    const now = Date.now();
+    if (now - (lastPushTestAt.get(resolvedId) || 0) < 15_000) {
+      return res.status(429).json({ success: false, error: 'Patientez quelques secondes avant un nouveau test.' });
+    }
+    lastPushTestAt.set(resolvedId, now);
+
+    const result = await pushService.sendNotificationToUser(
+      resolvedId,
+      {
+        title: '🃏 Njambo Kora — test réussi',
+        body: 'Les notifications fonctionnent sur cet appareil. Touchez pour ouvrir le jeu.',
+        icon: '/icon-192.png',
+        badge: '/badge-96.png',
+        tag: 'njambo-test',
+        data: { type: 'SYSTEM', url: buildGameUrl() },
       },
-    });
+      { onlyEndpoint: endpoint }
+    );
     res.json({ success: result.success > 0, ...result });
   });
 

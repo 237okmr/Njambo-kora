@@ -1,9 +1,9 @@
 import { WebSocket } from 'ws';
 import { MultiplayerRoom, RoomPlayer, EmoteMessage, PublicRoomSummary, GameInvitation, UserPresence, IntegrationProposal, CapacityExtensionProposal, PartieResult } from '../../src/types';
 import { ClientMessage, ServerMessage } from '../types';
-import { ActiveRoomState, ServerGameEngine, maskOpponentCards, selectBotToReplace, syncRoomPlayersWithGameState } from '../engine/serverGameEngine';
+import { ActiveRoomState, ServerGameEngine, maskOpponentCards, selectBotToReplace, syncRoomPlayersWithGameState, PlayerAlert } from '../engine/serverGameEngine';
 import { getEngineConfig, updateEngineConfig as applyEngineConfigUpdate, KatikaEngineConfig, DEFAULT_ENGINE_CONFIG } from '../engine/engineConfig';
-import { pushService } from '../pushService';
+import { pushService, buildGameUrl } from '../pushService';
 import { APP_VERSION } from '../../src/version';
 import { verifyFirebaseIdToken } from '../firebaseAdmin';
 
@@ -390,6 +390,9 @@ export class RoomManager {
         instantWinTimer: null,
         disconnectTimers: new Map<string, NodeJS.Timeout>(),
         consecutiveTimeouts: new Map<string, number>(),
+        onPlayerAlert: (playerId: string, r: MultiplayerRoom, alert: PlayerAlert) => {
+          this.pushPlayerAlert(playerId, r, alert);
+        },
         onPlayerForfeit: (playerId: string, r: MultiplayerRoom, isExplicit?: boolean) => {
           if (isExplicit) {
             const result = this.recordPlayerForfeit(playerId, `Forfait explicite partie #${r.gameState?.partieCount || 1} table ${r.id}`);
@@ -609,10 +612,11 @@ export class RoomManager {
       }
       this.evaluateLobbyHostInactivity(roomCode);
     } else if (room.status === 'PARTIE_OVER') {
+      // Règle du relais : pas de délai de reconnexion. Le joueur a jusqu'à la fin du compte à rebours entre deux
+      // parties pour revenir ; sinon il est forfait pour la partie suivante et revient quand il veut.
       const rp = (room.players || []).find((p) => p.id === playerId);
       if (rp && !rp.isSpectator) {
-        const graceSecs = state.engineConfig?.reconnectGracePeriodSeconds || 180;
-        rp.disconnectGraceExpiresAt = Date.now() + graceSecs * 1000;
+        rp.disconnectGraceExpiresAt = null;
         this.broadcastRoomState(roomCode);
       }
     }
@@ -1237,16 +1241,17 @@ export class RoomManager {
       const playerIndex = (room.players || []).findIndex(p => p.id === playerId);
       if (playerIndex !== -1) {
         if (room.status === 'PLAYING') {
+          // Règle du relais : rejoindre une autre table = quitter celle-ci, même règle que l'absence.
           const state = this.getOrCreateActiveState(roomCode, room);
-          ServerGameEngine.forfeitPlayer(
-            room,
-            playerId,
-            (updatedRoom) => {
-              this.broadcastRoomState(updatedRoom.id);
-          this.evaluateAutoStart(updatedRoom.id);
-            },
-            state
-          );
+          this.relayLeavingPlayer(room, roomCode, playerId, state);
+        } else if (room.status === 'PARTIE_OVER') {
+          // Entre deux parties : le siège est conservé, le joueur sera forfait pour la partie suivante s'il n'est pas revenu.
+          const rp = (room.players || [])[playerIndex];
+          if (rp) {
+            rp.leftRoom = true;
+            rp.connected = false;
+          }
+          this.broadcastRoomState(roomCode);
         } else {
           room.players = (room.players || []).filter(p => p.id !== playerId);
           
@@ -1576,10 +1581,12 @@ export class RoomManager {
         return;
       }
     } else {
-      // Prune permanently disconnected players whose grace expired before joining
+      // Prune permanently disconnected players whose grace expired before joining.
+      // Règle du relais : en cours de manche, un joueur absent GARDE son siège (retour possible sans limite).
       const graceTimeoutMs = (room.disconnectGraceSeconds || this.engineConfig.reconnectGracePeriodSeconds || 30) * 1000;
+      const seatsAreReserved = room.status === 'PLAYING' || room.status === 'PARTIE_OVER';
       room.players = (room.players || []).filter((p) => {
-        if (!p.connected) {
+        if (!p.connected && !seatsAreReserved) {
           const isExpired = p.disconnectGraceExpiresAt
             ? Date.now() > p.disconnectGraceExpiresAt
             : (Date.now() - (p.lastSeen || room.createdAt || Date.now()) > graceTimeoutMs);
@@ -2429,14 +2436,18 @@ export class RoomManager {
     if (!player || player.isSpectator) return;
 
     player.readyForNextPartie = true;
+    // Confirmer sa présence = reprendre la main : le relais s'efface et le compteur d'inactivité repart de zéro.
+    ServerGameEngine.endRelay(room, player.id);
+    this.getOrCreateActiveState(client.roomCode, room).consecutiveTimeouts?.set(player.id, 0);
     room.updatedAt = Date.now();
 
-    // Check if all seated human players are ready AND no human player is in active reconnect grace
+    // Règle du relais : tant qu'un humain est absent, la partie suivante n'est PAS lancée en avance.
+    // On laisse courir le compte à rebours de fin de partie : c'est la dernière chance de retour de l'absent.
     const seatedHumans = room.players.filter((p) => p.isHuman && !p.isEliminated && !p.isSpectator);
-    const hasPlayerInGrace = seatedHumans.some(
-      (p) => !p.connected && p.disconnectGraceExpiresAt && Date.now() < p.disconnectGraceExpiresAt
-    );
-    const allReady = !hasPlayerInGrace && seatedHumans.length > 0 && seatedHumans.every((p) => p.readyForNextPartie || !p.connected);
+    const allReady =
+      seatedHumans.length > 0 &&
+      !ServerGameEngine.hasAbsentHuman(room) &&
+      seatedHumans.every((p) => p.readyForNextPartie);
 
     if (allReady) {
       const state = this.getOrCreateActiveState(client.roomCode, room);
@@ -2634,28 +2645,12 @@ export class RoomManager {
       const rp = (room.players || []).find((p) => p.id === playerId);
       const gs = room.gameState;
       const gp = gs ? (gs.players || []).find((p) => p.id === playerId) : null;
-      const isActif = rp && rp.isHuman && !rp.isSpectator && !rp.isEliminated && !rp.isForfeit && !rp.forfeitedForManche;
+      const isSeated = rp && rp.isHuman && !rp.isSpectator && !rp.isEliminated && !rp.forfeitedForManche;
 
-      if (isActif) {
-        ServerGameEngine.forfeitPlayer(
-          room,
-          playerId,
-          (updatedRoom) => {
-            this.broadcastRoomState(updatedRoom.id);
-            this.evaluateAutoStart(updatedRoom.id);
-          },
-          state,
-          false,
-          { notify: false }
-        );
-        if (rp) {
-          rp.leftRoom = true;
-          rp.connected = false;
-        }
-        if (gp) {
-          gp.leftRoom = true;
-          gp.connected = false;
-        }
+      if (isSeated) {
+        // Règle du relais : quitter la table = même règle que l'absence. Le siège est conservé, un relais joue
+        // des cartes neutres jusqu'à la fin de la partie, le joueur peut revenir à tout moment.
+        this.relayLeavingPlayer(room, roomCode, playerId, state);
       } else {
         // When a player leaves, hot-swap their seat with an AI bot so the table stays at 4 players,
         // no ghost player with an empty hand is left, and the game never hangs at 0s.
@@ -2695,24 +2690,19 @@ export class RoomManager {
     }
 
     if (room.status === 'PARTIE_OVER') {
+      // Règle du relais : quitter entre deux parties = même règle que l'absence. Le siège est conservé (aucune
+      // élimination, aucun gel) ; sans retour avant la partie suivante, le joueur est forfait pour cette partie
+      // et peut revenir au début de n'importe quelle partie suivante.
       const rp = (room.players || []).find((p) => p.id === playerId);
       if (rp) {
-        rp.isForfeit = true;
-        rp.isEliminated = true;
-        rp.forfeitedForManche = true;
         rp.leftRoom = true;
         rp.connected = false;
-        rp.hand = [];
       }
       const gs = room.gameState;
       const gp = gs ? (gs.players || []).find((p) => p.id === playerId) : null;
       if (gp) {
-        gp.isForfeit = true;
-        gp.isEliminated = true;
-        gp.forfeitedForManche = true;
         gp.leftRoom = true;
         gp.connected = false;
-        gp.hand = [];
       }
 
       if (room.hostId === playerId) {
@@ -2781,6 +2771,39 @@ export class RoomManager {
       this.broadcastRoomState(roomCode);
     this.evaluateAutoStart(roomCode);
       this.evaluateLobbyHostInactivity(roomCode);
+    }
+  }
+
+  /**
+   * Règle du relais : un joueur quitte la table (bouton Quitter, ou il rejoint une autre table) pendant une partie.
+   * Il garde son siège (retour possible), un relais joue à sa place jusqu'à la fin de la partie.
+   */
+  private static relayLeavingPlayer(room: MultiplayerRoom, roomCode: string, playerId: string, state: ActiveRoomState): void {
+    const rp = (room.players || []).find((p) => p.id === playerId);
+    const gp = room.gameState ? (room.gameState.players || []).find((p) => p.id === playerId) : undefined;
+    if (rp) {
+      rp.leftRoom = true;
+      rp.connected = false;
+      rp.lastSeen = Date.now();
+    }
+    if (gp) {
+      gp.leftRoom = true;
+      gp.connected = false;
+    }
+    // Un joueur déjà forfait pour cette partie n'a plus de cartes en jeu : rien à relayer.
+    if (rp && !rp.isForfeit) {
+      ServerGameEngine.startRelay(
+        room,
+        playerId,
+        (updatedRoom) => {
+          this.broadcastRoomState(updatedRoom.id);
+          this.evaluateAutoStart(updatedRoom.id);
+        },
+        state,
+        'LEFT'
+      );
+    } else {
+      this.broadcastRoomState(roomCode);
     }
   }
 
@@ -3673,6 +3696,101 @@ export class RoomManager {
     });
   }
 
+  /**
+   * Notifications « table en danger » (niveau critique) : relais en jeu, tours manqués, coût de l'absence, forfait pour
+   * la partie, manche perdue par forfait. Textes sobres et exacts, sans aucune information de jeu (pas de cartes).
+   * Règle du relais : le joueur n'a AUCUN délai chronométré ; il peut reprendre la main jusqu'à la fin de la partie,
+   * puis revenir au début de n'importe quelle partie suivante.
+   */
+  private static pushPlayerAlert(playerId: string, room: MultiplayerRoom, alert: PlayerAlert): void {
+    const send = (
+      type: 'DISCONNECTED' | 'FORFEIT_WARNING' | 'FORFEIT_DECLARED',
+      title: string,
+      body: string,
+      opts?: { openTable?: boolean }
+    ) => {
+      pushService
+        .sendNotificationToUser(playerId, {
+          title,
+          body,
+          icon: '/icon-192.png',
+          badge: '/badge-96.png',
+          tag: `table-${room.id}`, // une seule notification critique par table : la plus récente remplace l'autre
+          data: {
+            type,
+            roomCode: room.id,
+            url: opts?.openTable === false ? buildGameUrl() : buildGameUrl(room.id),
+          },
+        })
+        .catch((err) => console.warn(`[RoomManager] Critical push (${type}) failed for ${playerId}:`, err));
+    };
+
+    const player = (room.players || []).find((p) => p.id === playerId);
+    const client = this.clients.get(playerId);
+    const atTableInForeground = Boolean(
+      client && client.socket.readyState === WebSocket.OPEN && client.roomCode === room.id && !player?.isAway
+    );
+    const gs = room.gameState;
+
+    switch (alert.kind) {
+      case 'RELAY_STARTED': {
+        // Un joueur qui a la table sous les yeux (inactif mais connecté, app visible) voit déjà le relais à l'écran.
+        if (alert.reason === 'AFK' && atTableInForeground) return;
+        // Combien d'autres joueurs peuvent jouer la partie suivante ? S'il n'en reste qu'un, l'absence coûte la manche.
+        const othersAbleToPlay = (gs?.players || []).filter(
+          (p) => p.id !== playerId && !p.isEliminated && !p.isForfeit && !(p.isHuman && p.relayAbsent) && p.capital >= (gs?.baseBet || 0)
+        ).length;
+        const mancheAtStake = othersAbleToPlay <= 1;
+        send(
+          'DISCONNECTED',
+          `⚠️ Table #${room.id} : un relais joue pour vous`,
+          mancheAtStake
+            ? 'Revenez avant la fin de la partie (et de son compte à rebours) : sinon la manche est perdue par forfait.'
+            : 'Revenez avant la fin de la partie pour reprendre la main. Sinon la mise de la partie est perdue.'
+        );
+        return;
+      }
+      case 'TIMEOUT_WARNING': {
+        if (atTableInForeground) return; // le joueur voit déjà la table et le chrono
+        const last = alert.maxMissed - alert.missed <= 1;
+        send(
+          'FORFEIT_WARNING',
+          last ? `🚨 Table #${room.id} : dernier avertissement` : `⏱ Table #${room.id} : tour manqué`,
+          last
+            ? `Au prochain tour manqué, un relais jouera à votre place jusqu'à la fin de la partie et la mise sera perdue.`
+            : `${alert.missed} tour manqué sur ${alert.maxMissed}. Au ${alert.maxMissed}e, un relais jouera à votre place jusqu'à la fin de la partie.`
+        );
+        return;
+      }
+      case 'RELAY_COST': {
+        const kora = alert.koraPenalty > 0 ? ` La pénalité de Kora (${alert.koraPenalty} 🪙) a aussi été prélevée.` : '';
+        send(
+          'FORFEIT_DECLARED',
+          `📉 Table #${room.id} : partie perdue par absence`,
+          `Votre mise de la partie est perdue.${kora} Revenez au début de la prochaine partie pour rejouer avec votre capital.`,
+          { openTable: false }
+        );
+        return;
+      }
+      case 'PARTIE_FORFEIT':
+        send(
+          'FORFEIT_DECLARED',
+          `🚪 Table #${room.id} : forfait pour la partie`,
+          "Vous n'êtes pas de retour : vous passez la partie suivante. Vous pouvez revenir au début de n'importe quelle partie, avec votre capital.",
+          { openTable: false }
+        );
+        return;
+      case 'MANCHE_LOST_BY_FORFEIT':
+        send(
+          'FORFEIT_DECLARED',
+          `🏁 Table #${room.id} : manche perdue par forfait`,
+          "Il ne restait qu'un seul joueur présent : la manche est terminée en sa faveur.",
+          { openTable: false }
+        );
+        return;
+    }
+  }
+
   private static triggerPushNotificationsForRoom(room: MultiplayerRoom): void {
     if (!room) return;
 
@@ -3685,19 +3803,19 @@ export class RoomManager {
         // Send a game start push to all human players who are offline or not currently looking at the game room
         if (p.isHuman) {
           const client = this.clients.get(p.id);
-          const isOnlineAndAtTable = client && client.socket.readyState === WebSocket.OPEN && client.roomCode === room.id;
+          const isOnlineAndAtTable = client && client.socket.readyState === WebSocket.OPEN && client.roomCode === room.id && !p.isAway;
           
           if (!isOnlineAndAtTable) {
             pushService.sendNotificationToUser(p.id, {
-              title: '⚔️ La partie commence !',
-              body: `La table #${room.id} a démarré ! Vos cartes de Kora ont été distribuées. Rejoignez la table !`,
-              icon: '/icon-192.svg',
-              badge: '/icon-192.svg',
+              title: '⚔️ La partie commence',
+              body: `Table #${room.id} : les cartes sont distribuées. Reprenez la partie.`,
+              icon: '/icon-192.png',
+              badge: '/badge-96.png',
               tag: `gamestart-${room.id}`,
               data: {
                 type: 'GAME_START',
                 roomCode: room.id,
-                url: `/?join=${room.id}`,
+                url: buildGameUrl(room.id),
               },
             }).catch((err) => {
               console.error(`[RoomManager] Error sending GAME_START push to ${p.id}:`, err);
@@ -3725,20 +3843,24 @@ export class RoomManager {
 
           // Check if player is offline or has active WebSocket but roomCode is different (meaning they are in home screen/lobby, not looking at the table!)
           const client = this.clients.get(currentPlayer.id);
-          const isAtTable = client && client.socket.readyState === WebSocket.OPEN && client.roomCode === room.id;
+          const isAtTable = client && client.socket.readyState === WebSocket.OPEN && client.roomCode === room.id && !(room.players || []).find((rp) => rp.id === currentPlayer.id)?.isAway;
 
-          if (!isAtTable) {
+          // Joueur déconnecté : le relais joue à sa place et l'alerte « un relais joue pour vous » le prévient déjà.
+          const roomPlayer = (room.players || []).find((rp) => rp.id === currentPlayer.id);
+          const coveredByDisconnectAlert = roomPlayer?.connected === false || Boolean(roomPlayer?.isAiRelay);
+
+          if (!isAtTable && !coveredByDisconnectAlert) {
             console.log(`[RoomManager] Active player ${currentPlayer.name} (${currentPlayer.id}) is not at table. Dispatching "YOUR_TURN" push alert.`);
             pushService.sendNotificationToUser(currentPlayer.id, {
-              title: '⏳ À vous de jouer !',
-              body: `C'est à votre tour de poser une carte sur la table #${room.id}. Ne faites pas attendre vos adversaires !`,
-              icon: '/icon-192.svg',
-              badge: '/icon-192.svg',
+              title: '⏳ À vous de jouer',
+              body: `Table #${room.id} : posez votre carte, le tour est chronométré.`,
+              icon: '/icon-192.png',
+              badge: '/badge-96.png',
               tag: `turn-${room.id}`,
               data: {
                 type: 'YOUR_TURN',
                 roomCode: room.id,
-                url: `/?join=${room.id}`,
+                url: buildGameUrl(room.id),
               },
             }).catch((err) => {
               console.error(`[RoomManager] Error sending YOUR_TURN push to ${currentPlayer.id}:`, err);
@@ -4172,7 +4294,9 @@ export class RoomManager {
           const client = this.clients.get(p.id);
           const isConnected = Boolean(p.connected && client && client.socket.readyState === WebSocket.OPEN);
           const hasGrace = Boolean(p.disconnectGraceExpiresAt && Date.now() < p.disconnectGraceExpiresAt);
-          return isConnected || hasGrace;
+          // Règle du relais : en cours de manche, le siège d'un absent reste réservé.
+          const keepsSeat = room.status === 'PLAYING' || room.status === 'PARTIE_OVER';
+          return isConnected || hasGrace || keepsSeat;
         });
         const botPlayers = (room.players || []).filter((p) => !p.isHuman);
         const spectators = (room.players || []).filter((p) => p.isHuman && p.isSpectator);
@@ -4385,10 +4509,10 @@ export class RoomManager {
 
     // 2. Dispatch Web Push Notification (PWA / Mobile / Background)
     pushService.sendNotificationToUser(msg.targetPlayerId, {
-      title: `🃏 Invitation de ${fromName} !`,
-      body: `Rejoignez la table #${msg.roomCode} (Mise: ${room.baseBet} FCFA). Cliquez pour jouer !`,
-      icon: '/icon-192.svg',
-      badge: '/icon-192.svg',
+      title: `🃏 ${fromName} te lance un défi !`,
+      body: `Table #${msg.roomCode} · ${room.baseBet} jetons · ça part dans 2 min.`,
+      icon: '/icon-192.png',
+      badge: '/badge-96.png',
       tag: `invite-${inviteId}`,
       data: {
         type: 'INVITATION',
@@ -4396,7 +4520,8 @@ export class RoomManager {
         inviteId,
         fromUserId: client.playerId,
         fromUserName: fromName,
-        url: `/?join=${msg.roomCode}`,
+        expiresAt: invitation.expiresAt,
+        url: buildGameUrl(msg.roomCode),
       },
     }).catch((err) => {
       console.warn('[RoomManager] Web Push dispatch notice:', err);

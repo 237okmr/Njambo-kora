@@ -1,4 +1,22 @@
 // Web Push Notifications & Badging Client Service (PWA / Mobile & Desktop)
+import { auth } from '../lib/firebase';
+import { getPlayerId } from './identity';
+
+/** URL d'ouverture d'une table : DOIT rester dans le scope de la PWA (/game/). */
+export const buildGameUrl = (roomCode?: string): string =>
+  roomCode ? `/game/?join=${encodeURIComponent(roomCode)}` : '/game/';
+
+/** En-têtes d'identité : jeton Firebase pour les comptes Google, rien pour les invités. */
+async function getPushAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  try {
+    const token = await auth.currentUser?.getIdToken();
+    if (token) headers.Authorization = `Bearer ${token}`;
+  } catch {
+    // invité ou hors-ligne : on continue sans jeton
+  }
+  return headers;
+}
 export interface PushUserProfile {
   id: string;
   name: string;
@@ -11,6 +29,7 @@ export interface PushPreferences {
   directInvites: boolean;
   rematches: boolean;
   gameStartAlerts: boolean;
+  tableAlerts: boolean;
   quietHoursEnabled: boolean;
   quietHoursStart: number; // 0-23 (e.g. 23)
   quietHoursEnd: number; // 0-23 (e.g. 8)
@@ -21,6 +40,7 @@ export const DEFAULT_PUSH_PREFERENCES: PushPreferences = {
   directInvites: true,
   rematches: true,
   gameStartAlerts: true,
+  tableAlerts: true,
   quietHoursEnabled: false,
   quietHoursStart: 23,
   quietHoursEnd: 8,
@@ -46,6 +66,14 @@ function urlBase64ToUint8Array(base64String: string): Uint8Array {
     outputArray[i] = rawData.charCodeAt(i);
   }
   return outputArray;
+}
+
+function sameKey(existing: ArrayBuffer | null | undefined, expected: Uint8Array): boolean {
+  if (!existing) return false;
+  const a = new Uint8Array(existing);
+  if (a.length !== expected.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== expected[i]) return false;
+  return true;
 }
 
 class PushNotificationService {
@@ -83,6 +111,104 @@ class PushNotificationService {
       localStorage.setItem('njambo_push_preferences', JSON.stringify(this.status.preferences));
     } catch (e) {}
     this.notifyListeners();
+    this.schedulePreferencesSync();
+  }
+
+  private prefsSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastProfile: PushUserProfile | null = null;
+
+  /** Préférences envoyées au serveur : seul lui peut réellement empêcher un envoi (appli fermée). */
+  private serverPreferences() {
+    return { ...this.status.preferences, tzOffsetMinutes: -new Date().getTimezoneOffset() };
+  }
+
+  private schedulePreferencesSync(): void {
+    if (!this.status.isSubscribed || !this.lastProfile) return;
+    if (this.prefsSyncTimer) clearTimeout(this.prefsSyncTimer);
+    this.prefsSyncTimer = setTimeout(async () => {
+      try {
+        const reg = await navigator.serviceWorker.ready;
+        const sub = await reg.pushManager.getSubscription();
+        if (!sub || !this.lastProfile) return;
+        await fetch('/api/push/preferences', {
+          method: 'POST',
+          headers: await getPushAuthHeaders(),
+          body: JSON.stringify({
+            userId: this.lastProfile.id,
+            endpoint: sub.endpoint,
+            preferences: this.serverPreferences(),
+          }),
+        });
+      } catch (e) {
+        console.warn('[PushService] Preferences sync failed:', e);
+      }
+    }, 600);
+  }
+
+  /**
+   * Resynchronise l'abonnement avec le serveur SANS redemander la permission :
+   * au démarrage, après un changement d'identité (connexion Google), quand le navigateur
+   * renouvelle l'abonnement, ou quand le serveur a changé de clé VAPID.
+   */
+  public async syncSubscription(profile: PushUserProfile): Promise<void> {
+    if (typeof window === 'undefined') return;
+    // Le statut (support, permission, abonnement existant) est déterminé de façon asynchrone :
+    // on l'attend, sinon la resynchronisation du démarrage serait ignorée à tort.
+    await this.checkInitialStatus();
+    // Identifiant canonique du joueur (UID Google ou identifiant invité "usr_…") : c'est celui que le serveur
+    // utilise pour envoyer les notifications, quel que soit l'écran qui appelle.
+    profile = { id: getPlayerId(), name: profile.name };
+    this.lastProfile = profile;
+    if (!this.status.isSupported) return;
+    if (Notification.permission !== 'granted') return;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      let sub = await reg.pushManager.getSubscription();
+      const keyRes = await fetch('/api/push/public-key');
+      if (!keyRes.ok) return;
+      const { publicKey } = await keyRes.json();
+      if (!publicKey) return;
+      const expected = urlBase64ToUint8Array(publicKey);
+
+      // Abonnement créé avec une ancienne clé VAPID => inutilisable, on le remplace en silence.
+      if (sub && !sameKey(sub.options?.applicationServerKey, expected)) {
+        await sub.unsubscribe();
+        sub = null;
+      }
+      if (!sub) {
+        if (!this.status.isSubscribed) return; // l'utilisateur n'avait pas activé les notifications
+        sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: expected });
+      }
+
+      await fetch('/api/push/subscribe', {
+        method: 'POST',
+        headers: await getPushAuthHeaders(),
+        body: JSON.stringify({
+          userId: profile.id,
+          userName: profile.name,
+          subscription: sub.toJSON(),
+          userAgent: navigator.userAgent,
+          preferences: this.serverPreferences(),
+        }),
+      });
+      this.status.isSubscribed = true;
+      this.notifyListeners();
+    } catch (err) {
+      console.warn('[PushService] syncSubscription failed:', err);
+    }
+  }
+
+  /** Ferme les notifications système restées dans le tiroir quand le joueur revient dans l'app. */
+  public async clearDeliveredNotifications(): Promise<void> {
+    try {
+      if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return;
+      const reg = await navigator.serviceWorker.ready;
+      const list = await reg.getNotifications();
+      list.forEach((n) => n.close());
+      await this.clearBadge();
+    } catch {
+      // ignore
+    }
   }
 
   public getPreferences(): PushPreferences {
@@ -213,12 +339,13 @@ class PushNotificationService {
       if (reg && reg.showNotification) {
         await reg.showNotification(options.title, {
           body: options.body,
-          icon: '/icon-192.svg',
-          badge: '/icon-192.svg',
+          icon: '/icon-192.png',
+          badge: '/badge-96.png',
           tag: options.tag || 'njambo-local-alert',
           data: {
             roomCode: options.roomCode,
-            url: options.roomCode ? `/?join=${options.roomCode}` : '/',
+            url: buildGameUrl(options.roomCode),
+            type: options.type,
           },
           renotify: true,
           ...({ vibrate: [150, 80, 150] } as any),
@@ -233,6 +360,10 @@ class PushNotificationService {
     if (!this.status.isSupported) {
       return { success: false, error: 'Les notifications Push ne sont pas supportées par votre navigateur.' };
     }
+
+    // L'identifiant reçu de l'écran appelant peut être un repli (« guest ») ou un identifiant de session de salle :
+    // on utilise toujours l'identifiant canonique du joueur.
+    profile = { id: getPlayerId(), name: profile.name };
 
     this.status.isLoading = true;
     this.notifyListeners();
@@ -260,12 +391,16 @@ class PushNotificationService {
       const vapidPublicKey = keyData.publicKey;
       if (!vapidPublicKey) throw new Error('Clé VAPID publique introuvable.');
 
-      // 3. Register or get Service Worker
+      // 3. Service worker prêt
       const reg = await navigator.serviceWorker.ready;
 
-      // 4. Create Push Subscription
+      // 4. Abonnement push (on remplace un abonnement créé avec une autre clé VAPID)
       const convertedKey = urlBase64ToUint8Array(vapidPublicKey);
       let subscription = await reg.pushManager.getSubscription();
+      if (subscription && !sameKey(subscription.options?.applicationServerKey, convertedKey)) {
+        await subscription.unsubscribe();
+        subscription = null;
+      }
       if (!subscription) {
         subscription = await reg.pushManager.subscribe({
           userVisibleOnly: true,
@@ -273,16 +408,17 @@ class PushNotificationService {
         });
       }
 
-      // 5. Save subscription on server
-      const subJson = subscription.toJSON();
+      // 5. Enregistrement côté serveur (identité vérifiée + préférences)
+      this.lastProfile = { id: profile.id, name: profile.name };
       const saveRes = await fetch('/api/push/subscribe', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: await getPushAuthHeaders(),
         body: JSON.stringify({
           userId: profile.id,
           userName: profile.name,
-          subscription: subJson,
+          subscription: subscription.toJSON(),
           userAgent: navigator.userAgent,
+          preferences: this.serverPreferences(),
         }),
       });
 
@@ -300,7 +436,8 @@ class PushNotificationService {
     }
   }
 
-  public async disableNotifications(userId: string): Promise<{ success: boolean; error?: string }> {
+  public async disableNotifications(_userId?: string): Promise<{ success: boolean; error?: string }> {
+    const userId = getPlayerId();
     this.status.isLoading = true;
     this.notifyListeners();
 
@@ -314,7 +451,7 @@ class PushNotificationService {
         // Notify server
         await fetch('/api/push/unsubscribe', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: await getPushAuthHeaders(),
           body: JSON.stringify({ userId, endpoint }),
         }).catch(() => {});
       }
@@ -331,12 +468,16 @@ class PushNotificationService {
     }
   }
 
-  public async sendTestNotification(userId: string): Promise<{ success: boolean; error?: string }> {
+  public async sendTestNotification(_userId?: string): Promise<{ success: boolean; error?: string }> {
+    const userId = getPlayerId();
     try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (!sub) return { success: false, error: 'Aucun abonnement actif sur cet appareil.' };
       const res = await fetch('/api/push/send-test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId }),
+        headers: await getPushAuthHeaders(),
+        body: JSON.stringify({ userId, endpoint: sub.endpoint }),
       });
       const data = await res.json();
       if (!data.success) {

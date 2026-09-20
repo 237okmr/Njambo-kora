@@ -31,7 +31,7 @@ export function setPwaIdentity(mode: 'GAME' | 'COPILOT') {
   const isCopilot = mode === 'COPILOT';
   const manifestHref = isCopilot ? '/manifest-copilot.webmanifest' : '/manifest.webmanifest';
   const appTitle = isCopilot ? 'Njambo Copilote' : 'Njambo Kora';
-  const iconHref = isCopilot ? '/icon-copilot-192.svg' : '/icon-192.svg';
+  const iconHref = isCopilot ? '/icon-copilot-192.png' : '/apple-touch-icon.png';
 
   // If in Copilot mode and on query param like /?view=copilot, normalize to /copilot/ for WebAPK scope matching
   if (isCopilot && typeof window !== 'undefined') {

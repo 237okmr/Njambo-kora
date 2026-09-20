@@ -339,32 +339,13 @@ export const MultiplayerHubModal: React.FC<MultiplayerHubModalProps> = ({
             </div>
 
 
-              <div className="flex flex-col gap-2 bg-slate-950/60 p-3 rounded-2xl border border-slate-800">
-                <span className="text-xs font-bold text-slate-300">Action si inactif (AFK/Déco)</span>
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setAfkAction('replace_bot')}
-                    className={`py-1.5 rounded-xl text-center border text-xs font-bold transition cursor-pointer ${
-                      afkAction === 'replace_bot'
-                        ? 'bg-amber-500 text-slate-950 border-amber-400 font-black'
-                        : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    Remplacer par Bot
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setAfkAction('auto_play')}
-                    className={`py-1.5 rounded-xl text-center border text-xs font-bold transition cursor-pointer ${
-                      afkAction === 'auto_play'
-                        ? 'bg-amber-500 text-slate-950 border-amber-400 font-black'
-                        : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    Forfait (Jeu auto)
-                  </button>
-                </div>
+              <div className="flex flex-col gap-1 bg-slate-950/60 p-3 rounded-2xl border border-slate-800">
+                <span className="text-xs font-bold text-slate-300">Absence d'un joueur (déconnexion, inactivité, départ)</span>
+                <p className="text-[11px] leading-snug text-slate-400">
+                  Un relais joue des cartes neutres jusqu'à la fin de la partie et ne peut pas gagner le pot. Le joueur
+                  reprend la main en revenant ; sinon il perd sa mise et passe la partie suivante, puis peut revenir au
+                  début de n'importe quelle partie.
+                </p>
               </div>
             {/* Mises, Capitaux & Variantes */}
             <div className="grid grid-cols-2 gap-2">

@@ -43,10 +43,13 @@ import { PlayerProfileScreen } from './components/profile/PlayerProfileScreen';
 import { GlobalLeaderboardModal } from './components/leaderboard/GlobalLeaderboardModal';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { TopNotificationStack } from './components/common/TopNotificationStack';
+import { NotificationViewport, useNotify } from './components/common/NotificationCenter';
+import { PushOptInBanner, usePushOptIn } from './components/PushOptInBanner';
 import { telemetryService } from './services/telemetryService';
 import { wsService } from './services/websocketService';
 import { FriendService } from './services/friendService';
 import { pushNotificationService } from './services/pushNotificationService';
+import { onIdentityChange } from './services/identity';
 import { syncPwaIdentityFromLocation } from './katika/utils/pwaManifestSwitcher';
 import { auth } from './lib/firebase';
 
@@ -175,35 +178,40 @@ function GameApp() {
   const [showSavedSessionsModal, setShowSavedSessionsModal] = useState<boolean>(false);
   const [showTestModeModal, setShowTestModeModal] = useState<boolean>(false);
   const [showQuitModal, setShowQuitModal] = useState<boolean>(false);
-  const [toastNotification, setToastNotification] = useState<string | null>(null);
+  const { notify } = useNotify();
   const [useDiamondLayout, setUseDiamondLayout] = useState<boolean>(() => {
     return localStorage.getItem('njambo_diamond_layout') === 'true';
   });
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
 
-  // Katika Admin Toasts State & Subscription
-  const [adminToasts, setAdminToasts] = useState<Array<{ id: string; senderName: string; text: string; isPrivate: boolean }>>([]);
-
+  // Messages admin (Katika) : mêmes toasts que le reste de l'app, dans la file unique.
   useEffect(() => {
     const unsub = wsService.onAdminMessage((data) => {
-      const id = 'toast_' + Math.random().toString(36).substring(2, 9);
-      setAdminToasts((prev) => [...prev, { id, ...data }]);
-      
-      // Play cool alert sound
       sounds.playCutSlash();
-      
-      // Auto dismiss after 7 seconds
-      setTimeout(() => {
-        setAdminToasts((prev) => prev.filter((t) => t.id !== id));
-      }, 7000);
+      notify({
+        tone: data.isPrivate ? 'private' : 'admin',
+        title: `${data.senderName} • ${data.isPrivate ? 'Message privé' : 'Message global'}`,
+        message: data.text,
+        durationMs: 7000,
+      });
     });
     return () => unsub();
-  }, []);
+  }, [notify]);
 
-  const triggerToast = useCallback((msg: string) => {
-    setToastNotification(msg);
-    setTimeout(() => setToastNotification(null), 3500);
-  }, []);
+  // Messages d'information du serveur (avertissement de connexion, invitation transmise…).
+  useEffect(() => {
+    const unsub = wsService.onServerNotification((text) => {
+      notify({ message: text, tone: text.includes('⚠️') ? 'warning' : 'info', durationMs: 6000 });
+    });
+    return () => unsub();
+  }, [notify]);
+
+  const triggerToast = useCallback(
+    (msg: string) => {
+      notify(msg);
+    },
+    [notify]
+  );
 
   // Lot 4 - Multiplayer accounting through onPartieResults
   useEffect(() => {
@@ -711,75 +719,141 @@ function GameApp() {
     pushNotificationService.setBadgeCount(incomingInvitations.length);
   }, [incomingInvitations.length]);
 
-  // Background Turn Alert & Game Start Notification
+  // ------------------------------------------------------------------
+  // Liens profonds (?join=CODE) et clics sur notifications push
+  // ------------------------------------------------------------------
+  const currentRoomIdRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!isMultiplayerMode || !multiplayerRoom) return;
+    currentRoomIdRef.current = multiplayerRoom?.id ? multiplayerRoom.id.toUpperCase() : null;
+  }, [multiplayerRoom?.id]);
 
-    // Check if player's turn and remaining time is running out while tab/app is hidden
-    if (document.hidden && multiplayerRoom.status === 'PLAYING' && multiplayerRoom.gameState) {
-      const gs = multiplayerRoom.gameState;
-      const currentPlayer = gs.players[gs.currentTurnIndex];
-      const isMyTurn = currentPlayer && currentPlayer.id === localPlayerId;
-
-      if (isMyTurn && turnRemainingSeconds <= 8 && turnRemainingSeconds > 0) {
-        pushNotificationService.triggerLocalGameNotification({
-          title: '⏳ À vous de jouer !',
-          body: `Il ne vous reste que ${turnRemainingSeconds}s pour poser votre carte.`,
-          roomCode: multiplayerRoom.id,
-          type: 'YOUR_TURN',
-          tag: `turn-alert-${multiplayerRoom.id}`,
-        });
-      }
-    }
-  }, [isMultiplayerMode, multiplayerRoom?.status, multiplayerRoom?.id, multiplayerRoom?.gameState, turnRemainingSeconds, localPlayerId]);
-
-  // Web Push Deep Linking & URL (?join=ROOM_CODE or ?room=ROOM_CODE) handling
+  // 1) Lien /game/?join=CODE (app fermée puis ouverte depuis une notification, ou lien partagé).
+  //    Traité UNE seule fois ; en cas d'échec le hub s'ouvre avec le code prérempli.
+  const deepLinkHandledRef = useRef<boolean>(false);
   useEffect(() => {
-    // 1. Check URL parameters on mount
+    if (deepLinkHandledRef.current) return;
     try {
       const urlParams = new URLSearchParams(window.location.search);
       const rawCode = urlParams.get('join') || urlParams.get('room');
-      if (rawCode) {
-        const cleanCode = rawCode.replace(/[^A-Za-z0-9]/g, '').trim().toUpperCase();
-        if (cleanCode) {
-          // Clean URL immediately to avoid re-joining on refresh (Idempotence)
-          window.history.replaceState({}, document.title, window.location.pathname);
-          handleJoinRoom(cleanCode, localPlayerName).then((res) => {
-            if (res.success) {
-              triggerToast(`Connexion automatique au salon #${cleanCode}...`);
-            } else {
-              triggerToast(res.error || "Erreur de connexion");
-            }
-          });
-        }
+      if (!rawCode) return;
+      const cleanCode = rawCode.replace(/[^A-Za-z0-9]/g, '').trim().toUpperCase();
+      if (!cleanCode) return;
+      deepLinkHandledRef.current = true;
+
+      // Ouverture depuis une notification d'invitation alors que l'app était fermée :
+      // on solde l'invitation (l'invitant reçoit « accepté ») comme le fait le bouton Rejoindre.
+      const inviteId = urlParams.get('inv');
+      const inviterId = urlParams.get('inviter') || undefined;
+      if (inviteId) {
+        wsService.respondToDirectInvite(inviteId, inviterId, true, cleanCode);
       }
-    } catch (e) {
+
+      handleJoinRoom(cleanCode, localPlayerName).then((res) => {
+        if (res.success) {
+          triggerToast(`Table #${cleanCode} rejointe.`);
+        } else {
+          triggerToast(res.error || 'Connexion à la table impossible.');
+          setShowMultiplayerHub(true); // le code reste prérempli tant que l'URL n'est pas nettoyée
+        }
+        // Nettoyage de l'URL une fois le résultat connu (évite tout rejeu au rechargement).
+        setTimeout(() => {
+          try {
+            window.history.replaceState({}, document.title, window.location.pathname);
+          } catch {
+            // ignore
+          }
+        }, 400);
+      });
+    } catch {
       // ignore
     }
+  }, [handleJoinRoom, localPlayerName, triggerToast, setShowMultiplayerHub]);
 
-    // 2. Listen to postMessage from Service Worker when a push notification is clicked
-    if ('serviceWorker' in navigator) {
-      const handleSwMessage = (event: MessageEvent) => {
-        if (event.data && event.data.type === 'PUSH_NOTIFICATION_CLICKED') {
-          const roomCode = event.data.data?.roomCode;
-          if (roomCode) {
-            handleJoinRoom(roomCode, localPlayerName).then((res) => {
-              if (res.success) {
-                triggerToast(`Salon #${roomCode} rejoint depuis la notification !`);
-              } else {
-                triggerToast(res.error || "Erreur de connexion");
-              }
-            });
-          }
+  // 2) Messages du service worker : clic sur une notification, renouvellement d'abonnement.
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+
+    const handleSwMessage = (event: MessageEvent) => {
+      const msg = event.data;
+      if (!msg || typeof msg !== 'object') return;
+
+      if (msg.type === 'PUSH_SUBSCRIPTION_CHANGED') {
+        pushNotificationService.syncSubscription({ id: wsService.getLocalPlayerId(), name: localPlayerName });
+        return;
+      }
+      if (msg.type !== 'PUSH_NOTIFICATION_CLICKED') return;
+
+      const d = msg.data || {};
+      const roomCode: string | undefined = d.roomCode ? String(d.roomCode).toUpperCase() : undefined;
+
+      // Forfait déjà prononcé : rien à rejoindre, on explique simplement.
+      if (d.type === 'FORFEIT_DECLARED') {
+        notify({ message: 'Vous avez été déclaré forfait sur cette table.', tone: 'warning', durationMs: 6000 });
+        return;
+      }
+      if (!roomCode) return;
+
+      // Déjà assis à cette table : la fenêtre a juste été ramenée au premier plan, on ne rejoint pas deux fois.
+      if (currentRoomIdRef.current === roomCode) return;
+
+      // Invitation périmée : message clair plutôt qu'un échec de connexion.
+      if (d.type === 'INVITATION' && typeof d.expiresAt === 'number' && wsService.getServerTime() > d.expiresAt) {
+        notify({ message: 'Cette invitation a expiré.', tone: 'warning' });
+        return;
+      }
+
+      // Invitation : on répond « accepté » pour que l'invitant reçoive son retour et que l'invitation soit soldée.
+      if (d.type === 'INVITATION' && d.inviteId) {
+        setIncomingInvitations((prev) => prev.filter((i) => i.id !== d.inviteId));
+        wsService.respondToDirectInvite(d.inviteId, d.fromUserId, true, roomCode);
+      }
+
+      handleJoinRoom(roomCode, localPlayerName).then((res) => {
+        if (res.success) {
+          triggerToast(`Table #${roomCode} rejointe.`);
+        } else {
+          triggerToast(res.error || 'Connexion à la table impossible.');
         }
-      };
+      });
+    };
 
-      navigator.serviceWorker.addEventListener('message', handleSwMessage);
-      return () => {
-        navigator.serviceWorker.removeEventListener('message', handleSwMessage);
-      };
-    }
-  }, [handleJoinRoom, localPlayerName, triggerToast]);
+    navigator.serviceWorker.addEventListener('message', handleSwMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', handleSwMessage);
+  }, [handleJoinRoom, localPlayerName, triggerToast, notify]);
+
+  // Demande de permission contextuelle : uniquement dans un salon en attente d'adversaires.
+  const pushOptIn = usePushOptIn({
+    active: Boolean(isMultiplayerMode && multiplayerRoom?.status === 'LOBBY'),
+    userId: wsService.getLocalPlayerId(),
+    userName: localPlayerName,
+    onResult: triggerToast,
+  });
+
+  // 3) Retour dans l'app : on vide le tiroir de notifications (elles sont périmées) et le badge.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        pushNotificationService.clearDeliveredNotifications();
+      }
+    };
+    onVisible();
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, []);
+
+  // 4) Abonnement push resynchronisé au démarrage et à chaque changement d'identité (connexion Google),
+  //    sans redemander la permission.
+  useEffect(() => {
+    const sync = () => pushNotificationService.syncSubscription({ id: wsService.getLocalPlayerId(), name: localPlayerName });
+    sync();
+    const unsub = onIdentityChange(sync);
+    return () => unsub();
+  }, [localPlayerName]);
+
+  // Synchronisation des messages hors-ligne : toast de succès dans la file unique.
+  useEffect(() => {
+    if (offlineNotice) notify({ message: offlineNotice, tone: 'success', dedupeKey: 'offline-sync' });
+  }, [offlineNotice, notify]);
 
   // Auto-Update Engine (Checks for newly deployed builds seamlessly)
   const isGamePlaying = currentScreen === 'GAME';
@@ -2458,52 +2532,6 @@ function GameApp() {
         </React.Suspense>
       )}
 
-      {/* Toast Notification Banner */}
-      {toastNotification && (
-        <div className="fixed top-14 left-1/2 -translate-x-1/2 z-50 bg-emerald-950/95 text-emerald-200 border border-emerald-500/50 px-4 py-2 rounded-xl text-xs font-bold shadow-2xl backdrop-blur-md flex items-center gap-2 pointer-events-none animate-bounce">
-          <Sparkles className="w-4 h-4 text-emerald-400 shrink-0" />
-          <span>{toastNotification}</span>
-        </div>
-      )}
-
-      {/* Katika Admin Toasts Overlay (Option A - Floating layers) */}
-      <div className="fixed top-20 left-1/2 -translate-x-1/2 z-[100] flex flex-col gap-2.5 w-full max-w-sm px-4 pointer-events-none">
-        {adminToasts.map((toast) => (
-          <div
-            key={toast.id}
-            className={`w-full rounded-2xl border p-4 shadow-2xl backdrop-blur-md flex gap-3 pointer-events-auto transition-all ${
-              toast.isPrivate
-                ? 'bg-purple-950/95 border-purple-500/50 text-purple-200'
-                : 'bg-slate-900/95 border-amber-500/50 text-amber-200'
-            }`}
-          >
-            <div className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 shadow-inner ${
-              toast.isPrivate ? 'bg-purple-500/20 text-purple-400' : 'bg-amber-500/20 text-amber-400'
-            }`}>
-              {toast.isPrivate ? <Shield className="w-4 h-4 text-purple-400" /> : <Sparkles className="w-4 h-4 text-amber-400" />}
-            </div>
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-1.5 justify-between">
-                <span className={`text-[10px] font-black uppercase tracking-wider ${
-                  toast.isPrivate ? 'text-purple-300' : 'text-amber-300'
-                }`}>
-                  {toast.senderName} {toast.isPrivate ? '• Message Privé' : '• Message Global'}
-                </span>
-                <button
-                  onClick={() => setAdminToasts((prev) => prev.filter((t) => t.id !== toast.id))}
-                  className="text-slate-400 hover:text-white pointer-events-auto transition text-xs"
-                >
-                  ✕
-                </button>
-              </div>
-              <p className="text-sm mt-1 text-slate-100 font-medium break-words leading-relaxed">
-                {toast.text}
-              </p>
-            </div>
-          </div>
-        ))}
-      </div>
-
       {/* Quit Confirmation Modal */}
       <QuitConfirmationModal
         isOpen={showQuitModal}
@@ -2649,14 +2677,6 @@ function GameApp() {
         />
       )}
 
-      {/* Kora Hunter Anonymous Alert Banner */}
-      {currentScreen === 'GAME' && (
-        <KoraHunterAlertBanner
-          show={Boolean(activeGameState.showKoraHunterAlert)}
-          onDismiss={handleDismissKoraHunterAlertUnified}
-        />
-      )}
-
       {/* Kora Victory Celebration Overlay */}
       {currentScreen === 'GAME' && (
         <KoraVictoryOverlay
@@ -2762,61 +2782,63 @@ function GameApp() {
         )}
       </AnimatePresence>
 
-      {/* Global Notifications Stack */}
+      {/* Pile de notifications unique : invitation, alerte Kora, toasts, mise à jour, version */}
       <TopNotificationStack>
-        {/* Floating In-App Game Invitation Toast */}
         <DirectInviteToast
           invitations={incomingInvitations}
           onAccept={handleAcceptInvitationUnified}
           onDecline={handleDeclineInvitationUnified}
           onDismiss={handleDismissInvitationUnified}
+          compact={currentScreen === 'GAME'}
+          willSaveSolo={currentScreen === 'GAME' && !isMultiplayerMode}
         />
 
-        {/* Automatic Application Update Notification Banner */}
+        {currentScreen === 'GAME' && (
+          <KoraHunterAlertBanner
+            show={Boolean(activeGameState.showKoraHunterAlert)}
+            onDismiss={handleDismissKoraHunterAlertUnified}
+          />
+        )}
+
+        {pushOptIn.visible && (
+          <PushOptInBanner busy={pushOptIn.busy} onEnable={pushOptIn.enable} onLater={pushOptIn.later} />
+        )}
+
+        <NotificationViewport />
+
         <UpdateNotificationBanner
           updateAvailable={updateAvailable}
           isReloading={isAppReloading}
-          onUpdateNow={forceReload}
+          onUpdateNow={() => forceReload(true)}
           isGameActive={isGamePlaying}
         />
+
+        {versionStatus?.updateRecommended && versionStatus?.isProtocolCompatible !== false && !dismissedVersionBanner && (
+          <div className="pointer-events-auto w-[calc(100%-1.5rem)] max-w-sm rounded-2xl border border-amber-500/50 bg-slate-900/95 p-3 text-amber-300 shadow-xl backdrop-blur-md flex items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-2 text-xs font-medium">
+              <span className="text-base">🚀</span>
+              <span>Nouvelle version du serveur disponible ({versionStatus.serverVersion || '2.5.22'}).</span>
+            </div>
+            <div className="flex shrink-0 items-center gap-1">
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="min-h-[44px] rounded-xl bg-amber-500 px-3 text-xs font-black text-slate-950 transition hover:bg-amber-400 active:scale-95"
+              >
+                Recharger
+              </button>
+              <button
+                type="button"
+                aria-label="Masquer l'avertissement"
+                onClick={() => setDismissedVersionBanner(true)}
+                className="flex h-11 w-11 items-center justify-center rounded-lg text-slate-400 transition hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        )}
       </TopNotificationStack>
-
-      {/* Offline Message Queue Sync Toast */}
-      {offlineNotice && (
-        <div className="fixed top-4 right-4 z-[9999] bg-emerald-900/90 text-emerald-100 border border-emerald-500/80 px-4 py-3 rounded-2xl shadow-2xl backdrop-blur-md flex items-center gap-3 animate-slide-in">
-          <div className="w-8 h-8 rounded-full bg-emerald-500/20 flex items-center justify-center text-emerald-400 font-bold">
-            ⚡
-          </div>
-          <p className="text-xs font-bold">{offlineNotice}</p>
-        </div>
-      )}
-
-      {/* Soft Version Negotiation Banner (Tier 2 - Non Blocking) */}
-      {versionStatus?.updateRecommended && versionStatus?.isProtocolCompatible !== false && !dismissedVersionBanner && (
-        <div className="fixed top-2 left-1/2 -translate-x-1/2 z-[9998] w-11/12 max-w-xl bg-slate-900/95 text-amber-300 border border-amber-500/50 p-3 rounded-2xl shadow-2xl backdrop-blur-md flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2 text-xs font-medium">
-            <span className="text-base">🚀</span>
-            <span>Une version mise à jour du serveur est disponible ({versionStatus.serverVersion || '2.5.22'}).</span>
-          </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={() => window.location.reload()}
-              className="px-3 py-1 rounded-xl bg-amber-500 text-slate-950 text-xs font-black hover:bg-amber-400 transition cursor-pointer"
-            >
-              Recharger
-            </button>
-            <button
-              type="button"
-              onClick={() => setDismissedVersionBanner(true)}
-              className="p-1 rounded-lg text-slate-400 hover:text-white transition cursor-pointer"
-              title="Masquer l'avertissement"
-            >
-              ✕
-            </button>
-          </div>
-        </div>
-      )}
 
       {/* Critical Version Negotiation Overlay (Tier 1 - Strict Protocol Mismatch) */}
       {versionStatus?.isProtocolCompatible === false && (

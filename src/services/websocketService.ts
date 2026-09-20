@@ -51,6 +51,7 @@ class WebSocketService {
   private emoteListeners: Set<EmoteListener> = new Set();
   private lobbyAlertListeners: Set<LobbyAlertListener> = new Set();
   private adminMessageListeners: Set<AdminMessageListener> = new Set();
+  private serverNotificationListeners: Set<(text: string) => void> = new Set();
   private publicRoomsListeners: Set<PublicRoomsListener> = new Set();
   private directInviteListeners: Set<DirectInviteListener> = new Set();
   private inviteFeedbackListeners: Set<InviteFeedbackListener> = new Set();
@@ -166,6 +167,7 @@ class WebSocketService {
       };
 
       window.addEventListener('visibilitychange', handleAppResume);
+      document.addEventListener('visibilitychange', () => this.sendPresence());
       window.addEventListener('pageshow', handleAppResume);
       window.addEventListener('focus', handleAppResume);
       window.addEventListener('online', () => {
@@ -520,38 +522,48 @@ class WebSocketService {
     }
   }
 
+  /**
+   * Envoie l'état de présence (au premier plan / en arrière-plan). Appelé toutes les 25 s ET
+   * immédiatement à chaque changement de visibilité : le serveur sait ainsi tout de suite s'il
+   * doit envoyer une notification push ou si le joueur regarde déjà la table.
+   */
+  public sendPresence(withPing: boolean = false): void {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+    const playerId = this.getLocalPlayerId();
+    const playerName = localStorage.getItem('njambo_player_name') || '';
+    const avatarSeed = localStorage.getItem('njambo_avatar_seed') || '';
+    const statusPresence = this.activeRoomCode
+      ? (this.currentRoom?.status === 'PLAYING' ? 'IN_GAME' : 'IN_LOBBY')
+      : this.currentPresenceStatus;
+
+    const isAway = typeof document !== 'undefined' ? document.hidden : false;
+
+    this.send({
+      type: 'HEARTBEAT_PRESENCE',
+      playerId,
+      playerName,
+      avatarSeed,
+      roomCode: this.activeRoomCode || undefined,
+      statusPresence,
+      isAway,
+    } as any);
+
+    if (withPing) {
+      // Ping périodique pour la synchronisation d'horloge et la latence
+      this.lastPingSentAt = Date.now();
+      this.send({
+        type: 'PING',
+        playerId,
+        timestamp: this.lastPingSentAt,
+      } as any);
+    }
+  }
+
   private startHeartbeat(): void {
     this.stopHeartbeat();
     // 25s client heartbeat (harmonized with server RFC-6455 20s transport ping/pong to save battery)
     this.pingInterval = setInterval(() => {
-      if (this.socket && this.socket.readyState === WebSocket.OPEN) {
-        const playerId = this.getLocalPlayerId();
-        const playerName = localStorage.getItem('njambo_player_name') || '';
-        const avatarSeed = localStorage.getItem('njambo_avatar_seed') || '';
-        const statusPresence = this.activeRoomCode
-          ? (this.currentRoom?.status === 'PLAYING' ? 'IN_GAME' : 'IN_LOBBY')
-          : this.currentPresenceStatus;
-
-        const isAway = typeof document !== 'undefined' ? document.hidden : false;
-
-        this.send({
-          type: 'HEARTBEAT_PRESENCE',
-          playerId,
-          playerName,
-          avatarSeed,
-          roomCode: this.activeRoomCode || undefined,
-          statusPresence,
-          isAway,
-        } as any);
-
-        // Periodic ping for clock synchronization and latency tracking
-        this.lastPingSentAt = Date.now();
-        this.send({
-          type: 'PING',
-          playerId,
-          timestamp: this.lastPingSentAt,
-        } as any);
-      }
+      this.sendPresence(true);
     }, 25000);
   }
 
@@ -695,6 +707,14 @@ class WebSocketService {
       case 'LOBBY_ALERT':
         if (msg.alertMessage) {
           this.notifyLobbyAlert(msg.alertMessage);
+        }
+        break;
+
+      case 'NOTIFICATION':
+        // Messages d'information du serveur (avertissement de forfait, invitation transmise…)
+        // jusqu'ici ignorés par le client.
+        if (msg.notification) {
+          this.serverNotificationListeners.forEach((l) => l(msg.notification!));
         }
         break;
 
@@ -1320,6 +1340,13 @@ class WebSocketService {
     listener(this.isConnected());
     return () => {
       this.connectionStateListeners.delete(listener);
+    };
+  }
+
+  public onServerNotification(listener: (text: string) => void): () => void {
+    this.serverNotificationListeners.add(listener);
+    return () => {
+      this.serverNotificationListeners.delete(listener);
     };
   }
 

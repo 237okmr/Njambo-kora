@@ -32,6 +32,17 @@ import { getEngineConfig, KatikaEngineConfig } from './engineConfig';
 import { computePartieOutcome, applyPartiePayout, detectInstantWin } from '../../src/utils/gameRules';
 import { buildPartieResult, computeForfeitPenalty, FORFAIT_PENALITE_DES_PLI, FORFAIT_INACTIVITE_GELE_LE_SIEGE } from '../../src/utils/settlement';
 
+/**
+ * Événements « table en danger » remontés au gestionnaire de salles pour notifier le joueur.
+ * Règle du relais : un joueur absent est remplacé par un relais jusqu'à la fin de la partie en cours.
+ */
+export type PlayerAlert =
+  | { kind: 'RELAY_STARTED'; reason: 'DISCONNECT' | 'AFK' | 'LEFT' }
+  | { kind: 'TIMEOUT_WARNING'; missed: number; maxMissed: number }
+  | { kind: 'RELAY_COST'; potShared: boolean; koraPenalty: number }
+  | { kind: 'PARTIE_FORFEIT' }
+  | { kind: 'MANCHE_LOST_BY_FORFEIT' };
+
 export interface ActiveRoomState {
   room: MultiplayerRoom;
   engineConfig?: KatikaEngineConfig;
@@ -48,6 +59,7 @@ export interface ActiveRoomState {
   consecutiveTimeouts: Map<string, number>;
   emergencyTrickPlayed?: Map<string, number>;
   onPlayerForfeit?: (playerId: string, room: MultiplayerRoom, isExplicit?: boolean) => void;
+  onPlayerAlert?: (playerId: string, room: MultiplayerRoom, alert: PlayerAlert) => void;
   onPartieCompleted?: (room: MultiplayerRoom) => void;
   partieResults?: PartieResult[];
   onPartieResult?: (result: PartieResult, room: MultiplayerRoom) => void;
@@ -610,7 +622,9 @@ export class ServerGameEngine {
 
     // Play is legal! Clear timers
     this.clearTurnTimers(activeRoomState);
-    if (activeRoomState.consecutiveTimeouts) {
+    // Le compteur de tours manqués ne repart de zéro que si le JOUEUR joue lui-même : la carte jouée d'office
+    // à sa place (relais / délai écoulé) ne doit pas l'effacer, sinon le 3e tour manqué n'arriverait jamais.
+    if (!isAutoPlayedByEmergencyBot && activeRoomState.consecutiveTimeouts) {
       activeRoomState.consecutiveTimeouts.set(playerId, 0);
     }
     if (!isAutoPlayedByEmergencyBot) {
@@ -619,6 +633,8 @@ export class ServerGameEngine {
       if (roomPlayer) {
         roomPlayer.consecutiveMissedTurns = 0;
       }
+      // Un joueur qui joue lui-même reprend la main : le relais s'efface, le siège redevient normal.
+      this.endRelay(room, playerId);
     }
 
     // Update trick
@@ -773,6 +789,58 @@ export class ServerGameEngine {
     }
   }
 
+  /**
+   * Partage du pot quand le vainqueur désigné par les plis est un siège tenu par le relais.
+   * Bénéficiaires : joueurs présents (ni relais, ni éliminés, ni forfait, ni couchés) ayant reçu des cartes.
+   * Parts égales ; le reste de la division (moins d'un jeton par bénéficiaire) va aux premiers dans l'ordre des sièges,
+   * de sorte qu'aucun jeton ne soit créé ni détruit. Retourne null si la règle ne s'applique pas.
+   */
+  private static computeRelaySplit(
+    gs: NonNullable<MultiplayerRoom['gameState']>,
+    winnerIndex: number
+  ): {
+    shares: number[];
+    grossById: Record<string, number>;
+    firstReceiverIndex: number;
+    receiverIndexes: number[];
+    label: string;
+    absentName: string;
+  } | null {
+    const players = gs.players || [];
+    const winner = players[winnerIndex];
+    if (!winner || !winner.isHuman || !winner.relayAbsent) return null;
+
+    const dealt = gs.dealParticipantIds && gs.dealParticipantIds.length > 0 ? new Set(gs.dealParticipantIds) : null;
+    const receiverIndexes: number[] = [];
+    players.forEach((p, i) => {
+      if (i === winnerIndex) return;
+      if (p.isEliminated || p.isForfeit || p.isFoldedInRound) return;
+      if (p.isHuman && p.relayAbsent) return;
+      if (dealt && !dealt.has(p.id)) return;
+      receiverIndexes.push(i);
+    });
+    if (receiverIndexes.length === 0) return null;
+
+    const pot = gs.pot;
+    const each = Math.floor(pot / receiverIndexes.length);
+    const remainder = pot - each * receiverIndexes.length;
+    const shares: number[] = players.map(() => 0);
+    const grossById: Record<string, number> = {};
+    receiverIndexes.forEach((i, position) => {
+      shares[i] = each + (position < remainder ? 1 : 0);
+      grossById[players[i].id] = shares[i];
+    });
+
+    return {
+      shares,
+      grossById,
+      firstReceiverIndex: receiverIndexes[0],
+      receiverIndexes,
+      label: `${receiverIndexes.map((i) => players[i].name).join(' & ')} (partage)`,
+      absentName: winner.name,
+    };
+  }
+
   private static emitPartieResult(
     room: MultiplayerRoom,
     activeRoomState: ActiveRoomState,
@@ -907,9 +975,18 @@ export class ServerGameEngine {
       enableDoubleKora: gs.enableDoubleKora,
     });
 
-    const winType = outcome.winType;
-    const multiplier = outcome.multiplier;
-    const partieWinnerIndex = outcome.winnerIndex;
+    let winType: 'STANDARD' | 'KORA' | 'DOUBLE_KORA' = outcome.winType;
+    let multiplier = outcome.multiplier;
+    let partieWinnerIndex = outcome.winnerIndex;
+
+    // RÈGLE DU RELAIS : un siège tenu par le relais (joueur absent) ne peut pas remporter le pot.
+    // Le pot est alors partagé à parts égales entre les joueurs présents, sans bonus Kora.
+    const relaySplit = this.computeRelaySplit(gs, partieWinnerIndex);
+    if (relaySplit) {
+      winType = 'STANDARD';
+      multiplier = 1;
+      partieWinnerIndex = relaySplit.firstReceiverIndex;
+    }
 
     if (winType === 'DOUBLE_KORA') {
       gs.doubleKoraAchievedByPlayer = {
@@ -920,10 +997,10 @@ export class ServerGameEngine {
 
     const winner = gs.players[partieWinnerIndex];
     gs.partieWinnerIndex = partieWinnerIndex;
-    gs.partieWinnerName = winner.name;
+    gs.partieWinnerName = relaySplit ? relaySplit.label : winner.name;
     gs.partieWinType = winType;
     gs.roundWinnerIndex = partieWinnerIndex;
-    gs.roundWinnerName = winner.name;
+    gs.roundWinnerName = relaySplit ? relaySplit.label : winner.name;
 
     // Record capital before payout for accurate delta calculation
     const capitalsBefore: Record<string, number> = {};
@@ -939,17 +1016,41 @@ export class ServerGameEngine {
     });
 
     const cfg = this.getConfig(activeRoomState);
-    const payout = applyPartiePayout({
-      capitals: (gs.players || []).map((p) => p.capital),
-      isEliminated: (gs.players || []).map((p) => p.isEliminated || p.isForfeit),
-      exemptFromPenalty: nonParticipatingMask,
-      winnerIndex: partieWinnerIndex,
-      pot: gs.pot,
-      baseBet: gs.baseBet,
-      multiplier,
-      rakePct: 0,
-    });
+    const payout = relaySplit
+      ? (() => {
+          const capitals = (gs.players || []).map((p, i) => p.capital + (relaySplit.shares[i] || 0));
+          return {
+            capitals,
+            eliminated: capitals.map((cap, i) => Boolean(gs.players[i].isEliminated || gs.players[i].isForfeit) || cap < gs.baseBet),
+            extraCollected: 0,
+            winnerReceived: relaySplit.shares[partieWinnerIndex] || 0,
+          };
+        })()
+      : applyPartiePayout({
+          capitals: (gs.players || []).map((p) => p.capital),
+          isEliminated: (gs.players || []).map((p) => p.isEliminated || p.isForfeit),
+          exemptFromPenalty: nonParticipatingMask,
+          winnerIndex: partieWinnerIndex,
+          pot: gs.pot,
+          baseBet: gs.baseBet,
+          multiplier,
+          rakePct: 0,
+        });
     const netWon = payout.winnerReceived;
+
+    if (relaySplit) {
+      const shareText = relaySplit.receiverIndexes.map((i) => `${gs.players[i].name} ${relaySplit.shares[i]} 🪙`).join(', ');
+      const emote: EmoteMessage = {
+        id: 'em_' + Math.random().toString(36).substring(2, 9),
+        playerId: 'system',
+        playerName: 'Table',
+        text: `🤝 ${relaySplit.absentName} étant absent, son relais ne peut pas gagner : le pot est partagé entre les joueurs présents (${shareText}).`,
+        emoji: '🤝',
+        timestamp: Date.now(),
+        isBot: true,
+      };
+      room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
+    }
 
     if (multiplier > 1) {
       (gs.players || []).forEach((p, idx) => {
@@ -1009,9 +1110,19 @@ export class ServerGameEngine {
     this.emitPartieResult(room, activeRoomState, {
       winnerId: winner.id,
       winType: winType as PartieResultWinType,
-      endReason: winType === 'DOUBLE_KORA' ? 'DOUBLE_KORA' : winType === 'KORA' ? 'KORA' : 'TRICKS_COMPLETED',
+      endReason: relaySplit
+        ? 'RELAY_SPLIT'
+        : winType === 'DOUBLE_KORA' ? 'DOUBLE_KORA' : winType === 'KORA' ? 'KORA' : 'TRICKS_COMPLETED',
       capitalsBefore,
-      grossByPlayerId: { [winner.id]: netWon },
+      grossByPlayerId: relaySplit ? relaySplit.grossById : { [winner.id]: netWon },
+    });
+
+    // Le joueur encore absent à la fin de la partie apprend ce que l'absence lui a coûté (règle du relais).
+    (gs.players || []).forEach((p) => {
+      if (p.isHuman && p.relayAbsent && !p.isForfeit) {
+        const koraPenalty = Math.max(0, (capitalsBefore[p.id] ?? p.capital) - p.capital);
+        activeRoomState.onPlayerAlert?.(p.id, room, { kind: 'RELAY_COST', potShared: Boolean(relaySplit), koraPenalty });
+      }
     });
 
     // Auto-advance timestamp only for next partie if manche is still ongoing
@@ -1154,11 +1265,15 @@ export class ServerGameEngine {
       }
     });
 
-    // Check disconnected human players at start of new partie:
-    // Any player not connected is declared forfeit for this partie
+    // RÈGLE DU RELAIS — début de la partie suivante :
+    // tout humain encore absent (déconnecté, ou inactif et n'ayant pas confirmé sa présence) est déclaré forfait
+    // POUR CETTE PARTIE : pas de mise, pas de pénalité. Il pourra revenir au début de n'importe quelle partie suivante.
+    const newlyForfeitedIds: string[] = [];
     (room.players || []).forEach((p) => {
-      if (p.isHuman && !p.connected && !p.isEliminated) {
+      const isAbsent = !p.connected || (Boolean(p.relayAbsent) && !p.readyForNextPartie);
+      if (p.isHuman && isAbsent && !p.isEliminated && !p.isSpectator) {
         const wasAlreadyForfeit = p.isForfeit;
+        if (!wasAlreadyForfeit) newlyForfeitedIds.push(p.id);
         p.isForfeit = true;
         p.isAiRelay = false;
         p.hand = [];
@@ -1175,7 +1290,7 @@ export class ServerGameEngine {
             id: 'em_' + Math.random().toString(36).substring(2, 9),
             playerId: 'system',
             playerName: 'Table',
-            text: `🚪 ${p.name} n'est pas connecté : forfait pour cette donne.`,
+            text: `🚪 ${p.name} n'est pas de retour : forfait pour cette partie. Il peut revenir au début de n'importe quelle partie suivante.`,
             emoji: '🚪',
             timestamp: Date.now(),
             isBot: true,
@@ -1183,6 +1298,17 @@ export class ServerGameEngine {
           room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
         }
       }
+    });
+
+    // Nouvelle partie : plus aucun relais en cours, compteurs d'inactivité remis à zéro.
+    (room.players || []).forEach((p) => {
+      p.relayAbsent = false;
+      if (activeRoomState.consecutiveTimeouts) {
+        activeRoomState.consecutiveTimeouts.set(p.id, 0);
+      }
+    });
+    (gs.players || []).forEach((gp) => {
+      gp.relayAbsent = false;
     });
 
     // Reset missed turns counter for connected players
@@ -1217,6 +1343,11 @@ export class ServerGameEngine {
       (p) => p.isHuman && !p.isEliminated && !p.connected && p.disconnectGraceExpiresAt && Date.now() < p.disconnectGraceExpiresAt
     );
 
+    // Alertes push aux joueurs qui viennent d'être déclarés forfait pour cette partie (voir la règle du relais).
+    const notifyNewlyForfeited = (kind: 'PARTIE_FORFEIT' | 'MANCHE_LOST_BY_FORFEIT') => {
+      newlyForfeitedIds.forEach((id) => activeRoomState.onPlayerAlert?.(id, room, { kind }));
+    };
+
     if (activeHumans.length === 0) {
       if (inGraceHumans.length > 0) {
         // Wait for player reconnection grace period before concluding
@@ -1231,6 +1362,7 @@ export class ServerGameEngine {
       this.clearAllTimers(activeRoomState);
       gs.phase = 'MANCHE_OVER';
       room.status = 'MANCHE_OVER';
+      notifyNewlyForfeited('MANCHE_LOST_BY_FORFEIT');
       onStateChange(room);
       return;
     }
@@ -1274,9 +1406,13 @@ export class ServerGameEngine {
       };
       room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
       room.updatedAt = Date.now();
+      // Un seul joueur présent : victoire de la manche par forfait dès le début de la partie suivante.
+      notifyNewlyForfeited('MANCHE_LOST_BY_FORFEIT');
       onStateChange(room);
       return;
     }
+
+    notifyNewlyForfeited('PARTIE_FORFEIT');
 
     const nextPartieCount = (gs.partieCount || 1) + 1;
 
@@ -1536,25 +1672,22 @@ export class ServerGameEngine {
       const count = (activeRoomState.consecutiveTimeouts.get(currentPlayer.id) || 0) + 1;
       activeRoomState.consecutiveTimeouts.set(currentPlayer.id, count);
 
+      // 3 tours manqués : le siège passe au relais jusqu'à la fin de la partie (jamais de forfait en cours de partie).
+      // Le joueur reprend la main dès qu'il rejoue. Dans tous les cas la carte neutre est jouée à sa place.
       if (count >= 3) {
-        if (room.afkAction === 'replace_bot') {
-          console.log(`[Timer Expired] Player ${currentPlayer.name} reached 3 consecutive timeouts. Replacing with Bot.`);
-          this.replacePlayerWithBot(room, currentPlayer.id, onStateChange, activeRoomState, 'AFK');
-        } else {
-          console.log(`[Timer Expired] Player ${currentPlayer.name} reached 3 consecutive timeouts. Declaring player FORFEIT.`);
-          this.forfeitPlayer(room, currentPlayer.id, onStateChange, activeRoomState, false, { freezeSeat: FORFAIT_INACTIVITE_GELE_LE_SIEGE });
-        }
+        this.startRelay(room, currentPlayer.id, onStateChange, activeRoomState, 'AFK');
       } else {
-        console.log(`[Timer Expired] Player ${currentPlayer.name} timed out (${count}/3). Auto-playing valid card on their behalf.`);
-        const playableCards = getPlayableCards(currentPlayer.hand, gs.currentTrick.leadSuit);
-        if (playableCards.length > 0) {
-          // Play neutral card so timed-out player does not gain unfair advantage
-          const cardToPlay = chooseRelayAICard(currentPlayer.hand, gs.currentTrick.leadSuit);
-          this.handlePlayCard(room, currentPlayer.id, cardToPlay.id, onStateChange, activeRoomState, true);
-        } else {
-          gs.currentTurnIndex = (gs.currentTurnIndex + 1) % (gs.players || []).length;
-          this.scheduleTurnAction(room, onStateChange, activeRoomState);
-        }
+        activeRoomState.onPlayerAlert?.(currentPlayer.id, room, { kind: 'TIMEOUT_WARNING', missed: count, maxMissed: 3 });
+      }
+      console.log(`[Timer Expired] Player ${currentPlayer.name} timed out (${count}). Auto-playing neutral card on their behalf.`);
+      const playableCards = getPlayableCards(currentPlayer.hand, gs.currentTrick.leadSuit);
+      if (playableCards.length > 0) {
+        // Play neutral card so timed-out player does not gain unfair advantage
+        const cardToPlay = chooseRelayAICard(currentPlayer.hand, gs.currentTrick.leadSuit);
+        this.handlePlayCard(room, currentPlayer.id, cardToPlay.id, onStateChange, activeRoomState, true);
+      } else {
+        gs.currentTurnIndex = (gs.currentTurnIndex + 1) % (gs.players || []).length;
+        this.scheduleTurnAction(room, onStateChange, activeRoomState);
       }
     }, effectiveTimerMs);
   }
@@ -1591,14 +1724,13 @@ export class ServerGameEngine {
 
     const cfg = this.getConfig(activeRoomState);
 
-    // Reconnect grace / forfeit timer (reconnectGracePeriodSeconds, e.g. 180s) starts on disconnect
-    const reconnectGraceSecs = cfg.reconnectGracePeriodSeconds || 180;
-    const graceExpiresAt = Date.now() + reconnectGraceSecs * 1000;
-    rp.disconnectGraceExpiresAt = graceExpiresAt;
+    // Règle du relais : plus de délai de reconnexion avec forfait en pleine partie. Le joueur déconnecté
+    // n'a AUCUN délai à respecter : après quelques secondes de tolérance (micro-coupures), un relais joue
+    // des cartes neutres jusqu'à la fin de la partie ; il reprend la main en revenant.
+    rp.disconnectGraceExpiresAt = null;
     if (gp) {
-      gp.disconnectGraceExpiresAt = graceExpiresAt;
+      gp.disconnectGraceExpiresAt = null;
     }
-
     if (!activeRoomState.disconnectTimers) {
       activeRoomState.disconnectTimers = new Map();
     }
@@ -1606,17 +1738,8 @@ export class ServerGameEngine {
       clearTimeout(activeRoomState.disconnectTimers.get(playerId)!);
       activeRoomState.disconnectTimers.delete(playerId);
     }
-    const forfeitTimeout = setTimeout(() => {
-      activeRoomState.disconnectTimers.delete(playerId);
-      const target = (room.players || []).find((p) => p.id === playerId);
-      if (target && !target.connected && !target.isForfeit && !target.isEliminated) {
-        console.log(`[Forfeit] Reconnect grace expired (${reconnectGraceSecs}s) for player ${target.name} (${playerId}) in room ${room.id}`);
-        this.forfeitPlayer(room, playerId, onStateChange, activeRoomState);
-      }
-    }, reconnectGraceSecs * 1000);
-    activeRoomState.disconnectTimers.set(playerId, forfeitTimeout);
 
-    // AI Relay tolerance timer (aiRelayGraceSeconds, e.g. 8s)
+    // Tolérance aux micro-coupures avant que le relais ne prenne le siège (aiRelayGraceSeconds, 8 s par défaut)
     if (!activeRoomState.aiRelayTimers) {
       activeRoomState.aiRelayTimers = new Map();
     }
@@ -1632,45 +1755,93 @@ export class ServerGameEngine {
       if (!targetRp || targetRp.connected || targetRp.isForfeit || targetRp.isEliminated) {
         return;
       }
-
-      // Mark isAiRelay = true
-      targetRp.isAiRelay = true;
-      const targetGp = room.gameState?.players?.find((p) => p.id === playerId);
-      if (targetGp) {
-        targetGp.isAiRelay = true;
-      }
-
-      // Announce AI Relay warning to table
-      const emote: EmoteMessage = {
-        id: 'em_' + Math.random().toString(36).substring(2, 9),
-        playerId: 'system',
-        playerName: 'Table',
-        text: `🤖 ${targetRp.name} s'est déconnecté. Un relais IA termine la donne en cours avec des cartes neutres. Forfait aux donnes suivantes si absent.`,
-        emoji: '🤖',
-        timestamp: Date.now(),
-        isBot: true,
-      };
-      room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
-      room.updatedAt = Date.now();
-      onStateChange(room);
-
-      // If it is currently this player's turn, launch the AI relay move
-      const currentGs = room.gameState;
-      if (
-        currentGs &&
-        currentGs.phase === 'PLAYING' &&
-        room.status === 'PLAYING' &&
-        currentGs.players[currentGs.currentTurnIndex]?.id === playerId
-      ) {
-        this.clearTurnTimers(activeRoomState);
-        this.scheduleTurnAction(room, onStateChange, activeRoomState);
-      }
+      this.startRelay(room, playerId, onStateChange, activeRoomState, 'DISCONNECT');
     }, aiGraceSecs * 1000);
 
     activeRoomState.aiRelayTimers.set(playerId, relayTimer);
 
     room.updatedAt = Date.now();
     onStateChange(room);
+  }
+
+  /**
+   * RÈGLE DU RELAIS.
+   * Un joueur absent (déconnexion, 3 tours manqués, départ volontaire) n'est jamais retiré en cours de partie :
+   * un relais joue des cartes neutres à sa place jusqu'à la fin de la partie, pour ne bloquer personne.
+   *  - le relais ne peut pas remporter le pot (voir resolvePartieOver : partage entre les joueurs présents) ;
+   *  - si le joueur revient avant la fin de la partie, il reprend la main sans aucun coût ;
+   *  - s'il est encore absent à la fin, il a perdu sa mise (et paie la pénalité de Kora des perdants si un Kora a lieu) ;
+   *  - au début de la partie suivante, s'il n'est pas de retour, il est déclaré forfait pour cette partie (voir advanceToNextPartie).
+   */
+  public static startRelay(
+    room: MultiplayerRoom,
+    playerId: string,
+    onStateChange: (room: MultiplayerRoom) => void,
+    activeRoomState: ActiveRoomState,
+    reason: 'DISCONNECT' | 'AFK' | 'LEFT'
+  ): void {
+    const gs = room.gameState;
+    const rp = (room.players || []).find((p) => p.id === playerId);
+    const gp = gs ? (gs.players || []).find((p) => p.id === playerId) : undefined;
+    if (!gs || !rp || !gp || !rp.isHuman) return;
+    if (rp.isEliminated || rp.isForfeit || rp.isSpectator || gp.isEliminated || gp.isForfeit) return;
+    if (gs.phase !== 'PLAYING' && gs.phase !== 'TRICK_RESOLVED') return;
+    if (rp.relayAbsent) return; // idempotent
+
+    rp.relayAbsent = true;
+    gp.relayAbsent = true;
+    if (!rp.connected) {
+      rp.isAiRelay = true;
+      gp.isAiRelay = true;
+    }
+
+    const text =
+      reason === 'DISCONNECT'
+        ? `🤖 ${rp.name} s'est déconnecté. Un relais joue des cartes neutres jusqu'à la fin de cette partie et ne peut pas remporter le pot. ${rp.name} peut reprendre la main en revenant.`
+        : reason === 'LEFT'
+          ? `🚪 ${rp.name} a quitté la table. Un relais joue des cartes neutres jusqu'à la fin de cette partie et ne peut pas remporter le pot.`
+          : `⏳ ${rp.name} est inactif. Un relais joue à sa place jusqu'à la fin de cette partie ; il reprend la main en rejouant.`;
+    const emote: EmoteMessage = {
+      id: 'em_' + Math.random().toString(36).substring(2, 9),
+      playerId: 'system',
+      playerName: 'Table',
+      text,
+      emoji: '🤖',
+      timestamp: Date.now(),
+      isBot: true,
+    };
+    room.activeEmotes = [...(room.activeEmotes || []), emote].slice(-5);
+    room.updatedAt = Date.now();
+    activeRoomState.onPlayerAlert?.(playerId, room, { kind: 'RELAY_STARTED', reason });
+    onStateChange(room);
+
+    // Si c'est justement son tour, le relais joue tout de suite (joueur déconnecté ou parti).
+    if (
+      !rp.connected &&
+      gs.phase === 'PLAYING' &&
+      room.status === 'PLAYING' &&
+      gs.players[gs.currentTurnIndex]?.id === playerId
+    ) {
+      this.clearTurnTimers(activeRoomState);
+      this.scheduleTurnAction(room, onStateChange, activeRoomState);
+    }
+  }
+
+  /** Le joueur reprend la main (il rejoue, se reconnecte ou confirme sa présence) : le relais s'efface. */
+  public static endRelay(room: MultiplayerRoom, playerId: string): boolean {
+    const rp = (room.players || []).find((p) => p.id === playerId);
+    const gp = room.gameState ? (room.gameState.players || []).find((p) => p.id === playerId) : undefined;
+    const was = Boolean(rp?.relayAbsent || gp?.relayAbsent);
+    if (rp) rp.relayAbsent = false;
+    if (gp) gp.relayAbsent = false;
+    return was;
+  }
+
+  /** Vrai si un humain assis est absent (déconnecté ou sous relais) : la partie suivante n'est pas lancée en avance. */
+  public static hasAbsentHuman(room: MultiplayerRoom): boolean {
+    return (room.players || []).some(
+      (p) => p.isHuman && !p.isEliminated && !p.isSpectator && (p.connected === false || Boolean(p.relayAbsent))
+    );
   }
 
   public static handlePlayerReconnect(
@@ -1722,6 +1893,7 @@ export class ServerGameEngine {
       rp.lastSeen = Date.now();
       rp.disconnectGraceExpiresAt = null;
       rp.isAiRelay = false;
+      rp.relayAbsent = false;
       rp.consecutiveMissedTurns = 0;
       rp.aiRelayPlaysCount = 0;
       if (rp.hand && rp.hand.length > 0) {
@@ -1736,6 +1908,7 @@ export class ServerGameEngine {
         gp.connected = true;
         gp.disconnectGraceExpiresAt = null;
         gp.isAiRelay = false;
+        gp.relayAbsent = false;
         gp.consecutiveMissedTurns = 0;
         gp.aiRelayPlaysCount = 0;
         if (gp.hand && gp.hand.length > 0) {

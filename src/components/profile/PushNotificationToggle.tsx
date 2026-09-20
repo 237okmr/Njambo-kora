@@ -144,7 +144,12 @@ export const PushNotificationToggle: React.FC<PushNotificationToggleProps> = ({
         <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 flex items-start gap-2.5 text-xs text-rose-300">
           <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
           <div className="flex-1 leading-snug">
-            Les notifications sont actuellement <strong>bloquées</strong> dans les paramètres de votre navigateur. Veuillez cliquer sur le cadenas dans la barre d'adresse pour les autoriser.
+            Les notifications sont <strong>bloquées</strong>.{' '}
+            {isIOS
+              ? "Ouvrez Réglages › Notifications › Njambo Kora pour les autoriser."
+              : isStandalone
+                ? "Ouvrez les paramètres du téléphone › Applications › Njambo Kora › Notifications pour les autoriser."
+                : "Touchez le cadenas dans la barre d'adresse pour les autoriser."}
           </div>
         </div>
       )}
@@ -221,7 +226,7 @@ export const PushNotificationToggle: React.FC<PushNotificationToggleProps> = ({
             <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <UserCheck className="w-4 h-4 text-amber-400 shrink-0" />
-                <span className="text-slate-200 font-medium">Invitations d'amis</span>
+                <span className="text-slate-200 font-medium">Invitations et revanches</span>
               </div>
               <input
                 type="checkbox"
@@ -245,22 +250,26 @@ export const PushNotificationToggle: React.FC<PushNotificationToggleProps> = ({
               />
             </div>
 
-            {/* Rematches */}
-            <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Swords className="w-4 h-4 text-rose-400 shrink-0" />
-                <span className="text-slate-200 font-medium">Défis de Revanche</span>
+            {/* Table alerts (critical) */}
+            <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between sm:col-span-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                <div className="min-w-0">
+                  <span className="block text-slate-200 font-medium">Alertes de table (déconnexion, forfait)</span>
+                  <span className="block text-[10px] text-slate-500">Jamais coupées par le mode nuit pendant une partie.</span>
+                </div>
               </div>
               <input
                 type="checkbox"
-                checked={prefs.rematches}
-                onChange={(e) => handleUpdatePref('rematches', e.target.checked)}
-                className="w-4 h-4 rounded text-rose-500 accent-rose-500 cursor-pointer"
+                aria-label="Alertes de table"
+                checked={prefs.tableAlerts}
+                onChange={(e) => handleUpdatePref('tableAlerts', e.target.checked)}
+                className="w-5 h-5 rounded text-rose-500 accent-rose-500 cursor-pointer shrink-0"
               />
             </div>
 
             {/* Game Start Alerts */}
-            <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between">
+            <div className="p-2.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between sm:col-span-2">
               <div className="flex items-center gap-2">
                 <BellRing className="w-4 h-4 text-blue-400 shrink-0" />
                 <span className="text-slate-200 font-medium">Début de Manche</span>
@@ -289,12 +298,20 @@ export const PushNotificationToggle: React.FC<PushNotificationToggleProps> = ({
               />
             </div>
             {prefs.quietHoursEnabled && (
-              <div className="flex items-center gap-2 text-[11px] text-slate-400 pt-1 border-t border-slate-900">
+              <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400 pt-1 border-t border-slate-900">
                 <Clock className="w-3.5 h-3.5 text-slate-500" />
                 <span>Silencieux de</span>
-                <span className="font-bold text-slate-200">{prefs.quietHoursStart}h00</span>
+                <select aria-label="Début du mode nuit" value={prefs.quietHoursStart}
+                  onChange={(e) => handleUpdatePref('quietHoursStart', Number(e.target.value))}
+                  className="min-h-[36px] rounded-lg border border-slate-700 bg-slate-900 px-2 font-bold text-slate-200">
+                  {Array.from({ length: 24 }, (_, h) => (<option key={h} value={h}>{h}h00</option>))}
+                </select>
                 <span>à</span>
-                <span className="font-bold text-slate-200">{prefs.quietHoursEnd}h00</span>
+                <select aria-label="Fin du mode nuit" value={prefs.quietHoursEnd}
+                  onChange={(e) => handleUpdatePref('quietHoursEnd', Number(e.target.value))}
+                  className="min-h-[36px] rounded-lg border border-slate-700 bg-slate-900 px-2 font-bold text-slate-200">
+                  {Array.from({ length: 24 }, (_, h) => (<option key={h} value={h}>{h}h00</option>))}
+                </select>
               </div>
             )}
           </div>

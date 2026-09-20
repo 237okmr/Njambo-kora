@@ -1,6 +1,6 @@
 // Njambo Kora & Njambo Copilote Dual PWA Service Worker - v25200 (Network-First Navigation & Isolated Caches)
-const CACHE_GAME = 'njambo-kora-assets-v25206';
-const CACHE_COPILOT = 'katika-copilot-assets-v25206';
+const CACHE_GAME = 'njambo-kora-assets-v25221';
+const CACHE_COPILOT = 'katika-copilot-assets-v25221';
 
 const GAME_ASSETS = [
   '/',
@@ -8,17 +8,18 @@ const GAME_ASSETS = [
   '/index.html',
   '/manifest.webmanifest',
   '/favicon.svg',
-  '/icon-192.svg',
-  '/icon-512.svg',
-  '/icon-maskable.svg'
+  '/icon-192.png',
+  '/icon-512.png',
+  '/icon-maskable-512.png',
+  '/badge-96.png'
 ];
 
 const COPILOT_ASSETS = [
   '/copilot/',
   '/manifest-copilot.webmanifest',
-  '/icon-copilot-192.svg',
-  '/icon-copilot-512.svg',
-  '/icon-copilot-maskable.svg'
+  '/icon-copilot-192.png',
+  '/icon-copilot-512.png',
+  '/icon-copilot-maskable-512.png'
 ];
 
 function getCacheNameForRequest(request) {
@@ -178,111 +179,190 @@ self.addEventListener('fetch', (event) => {
 // ==========================================
 // Web Push Notifications & Background Alerts
 // ==========================================
+// IMPORTANT : le service worker est enregistré à la racine (scope "/") mais les deux PWA
+// (Njambo Kora et Njambo Copilote) ont un scope manifeste plus étroit ("/game/" et "/copilot/").
+// Toute URL ouverte depuis une notification DOIT rester dans l'un de ces deux scopes, sinon
+// Chrome Android ouvre un onglet navigateur au lieu de l'application installée (WebAPK).
+const PWA_SCOPES = ['/game/', '/copilot/'];
+const DEFAULT_SCOPE = '/game/';
+
+function scopeForData(data) {
+  return data && data.app === 'copilot' ? '/copilot/' : DEFAULT_SCOPE;
+}
+
+function resolveTargetUrl(data) {
+  const origin = self.location.origin;
+  const fallbackScope = scopeForData(data);
+  let url;
+  try {
+    url = new URL((data && data.url) || fallbackScope, origin);
+  } catch (e) {
+    url = new URL(fallbackScope, origin);
+  }
+  if (url.origin !== origin) url = new URL(fallbackScope, origin);
+
+  // Anciennes charges utiles ("/?join=ABCD", "/") : on les ramène dans le scope de la PWA.
+  if (!PWA_SCOPES.some((scope) => url.pathname.startsWith(scope))) {
+    url = new URL(fallbackScope + url.search + url.hash, origin);
+  }
+  if (data && data.roomCode && data.type !== 'FORFEIT_DECLARED' && !url.searchParams.has('join') && url.pathname.startsWith('/game/')) {
+    url.searchParams.set('join', data.roomCode);
+  }
+  // Invitation : l'identifiant et l'expéditeur voyagent dans l'URL pour que l'app, si elle était fermée,
+  // puisse répondre « accepté » et que l'invitant reçoive son retour.
+  if (data && data.type === 'INVITATION' && data.inviteId && url.pathname.startsWith('/game/')) {
+    if (!url.searchParams.has('inv')) url.searchParams.set('inv', data.inviteId);
+    if (data.fromUserId && !url.searchParams.has('inviter')) url.searchParams.set('inviter', data.fromUserId);
+  }
+  return url;
+}
+
+function isClientInScope(client, scopePath) {
+  try {
+    const u = new URL(client.url);
+    return u.origin === self.location.origin && u.pathname.startsWith(scopePath);
+  } catch (e) {
+    return false;
+  }
+}
+
+async function getWindowClients(scopePath) {
+  const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  return all.filter((c) => isClientInScope(c, scopePath));
+}
+
+// Safari / WebKit (iPhone, iPad, Mac) révoque l'abonnement push si une notification reçue n'est pas
+// affichée. Sur ces navigateurs on affiche donc TOUJOURS la notification (en silence puis fermeture
+// rapide si l'app est déjà visible). Chrome/Edge/Firefox autorisent, eux, de ne rien afficher.
+function isWebKitBrowser() {
+  const ua = (self.navigator && self.navigator.userAgent) || '';
+  return /AppleWebKit/.test(ua) && !/Chrome\/|Chromium|Edg\/|OPR\/|Android/.test(ua);
+}
+
+// Niveaux de priorité : critique (table en danger), actionnable, système.
+const CRITICAL_TYPES = ['DISCONNECTED', 'FORFEIT_WARNING', 'FORFEIT_DECLARED'];
+
+function actionsFor(type, data) {
+  if (!data.roomCode || type === 'FORFEIT_DECLARED') return [];
+  return [
+    { action: 'join', title: type === 'INVITATION' ? 'Rejoindre' : 'Reprendre la partie' },
+    { action: 'dismiss', title: 'Plus tard' },
+  ];
+}
+
 self.addEventListener('push', (event) => {
   let payload = {
     title: '🃏 Njambo Kora',
     body: 'Nouvelle notification de jeu !',
-    icon: '/icon-192.svg',
-    badge: '/icon-192.svg',
+    icon: '/icon-192.png',
+    badge: '/badge-96.png',
     tag: 'njambo-notification',
-    data: { url: '/' },
+    data: {},
   };
 
   if (event.data) {
     try {
-      const json = event.data.json();
-      payload = { ...payload, ...json };
+      payload = { ...payload, ...event.data.json() };
     } catch (e) {
       payload.body = event.data.text() || payload.body;
     }
   }
 
-  const notificationOptions = {
-    body: payload.body,
-    icon: payload.icon || '/icon-192.svg',
-    badge: payload.badge || '/icon-192.svg',
-    tag: payload.tag || 'njambo-game-alert',
-    data: payload.data || { url: '/' },
-    vibrate: [200, 100, 200, 100, 200],
-    renotify: true,
-    requireInteraction: true,
-    actions: payload.data?.roomCode
-      ? [
-          { action: 'join', title: '🃏 Rejoindre la table' },
-          { action: 'dismiss', title: 'Ignorer' },
-        ]
-      : [],
-  };
+  const data = payload.data || {};
+  const type = data.type || 'SYSTEM';
+  const critical = CRITICAL_TYPES.includes(type);
 
-  const tasks = [
-    self.registration.showNotification(payload.title, notificationOptions),
-  ];
+  event.waitUntil((async () => {
+    // App déjà visible : l'interface en jeu s'en charge, pas de doublon système.
+    // Le message de test (SYSTEM) est toujours affiché.
+    let appVisible = false;
+    if (type !== 'SYSTEM') {
+      const clients = await getWindowClients(scopeForData(data));
+      const visibleClient = clients.find((c) => c.visibilityState === 'visible');
+      if (visibleClient) {
+        appVisible = true;
+        visibleClient.postMessage({ type: 'PUSH_RECEIVED_FOREGROUND', data });
+        if (!isWebKitBrowser()) return; // Chrome & co : rien à afficher
+      }
+    }
 
-  // Set App Badge on mobile home screen if supported
-  if ('setAppBadge' in self.navigator) {
-    tasks.push(self.navigator.setAppBadge().catch(() => {}));
-  }
+    const options = {
+      body: payload.body,
+      icon: payload.icon || '/icon-192.png',
+      badge: payload.badge || '/badge-96.png',
+      tag: payload.tag || 'njambo-game-alert',
+      data,
+      timestamp: data.sentAt || Date.now(),
+      // Discret par défaut ; motif plus marqué uniquement pour les alertes critiques.
+      vibrate: critical ? [200, 100, 200, 100, 200] : [120, 60, 120],
+      renotify: true,
+      requireInteraction: critical,
+      silent: appVisible,
+      actions: actionsFor(type, data),
+    };
 
-  event.waitUntil(Promise.all(tasks));
+    const tasks = [self.registration.showNotification(payload.title, options)];
+    if ('setAppBadge' in self.navigator) {
+      const count = Number(data.badgeCount);
+      tasks.push(
+        (count > 0 ? self.navigator.setAppBadge(count) : self.navigator.setAppBadge()).catch(() => {})
+      );
+    }
+    await Promise.all(tasks);
+
+    // WebKit + app visible : la notification n'a servi qu'à satisfaire la règle d'affichage.
+    if (appVisible) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      const shown = await self.registration.getNotifications({ tag: options.tag });
+      shown.forEach((n) => n.close());
+    }
+  })());
 });
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
 
-  // Clear App Badge when clicking notification
   if ('clearAppBadge' in self.navigator) {
     self.navigator.clearAppBadge().catch(() => {});
   }
+  if (event.action === 'dismiss') return;
 
-  if (event.action === 'dismiss') {
-    return;
-  }
+  const data = event.notification.data || {};
+  const target = resolveTargetUrl(data);
+  const scopePath = target.pathname.startsWith('/copilot/') ? '/copilot/' : '/game/';
 
-  const notifData = event.notification.data || {};
-  let targetUrlStr = notifData.url || '/';
-  if (notifData.roomCode) {
-    targetUrlStr = `/?join=${notifData.roomCode}`;
-  }
+  event.waitUntil((async () => {
+    const clients = await getWindowClients(scopePath);
+    const client =
+      clients.find((c) => c.focused) ||
+      clients.find((c) => c.visibilityState === 'visible') ||
+      clients[0];
 
-  // Resolve absolute URL using registration scope to guarantee precise WebAPK matching
-  const absoluteTargetUrl = new URL(targetUrlStr, self.registration.scope).href;
-
-  event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
-      // Find a client window that belongs to our application scope (browser tab or PWA standalone window)
-      let matchingClient = null;
-      for (const client of clientList) {
-        if (client.url && client.url.startsWith(self.registration.scope)) {
-          matchingClient = client;
-          break;
-        }
+    if (client) {
+      // Fenêtre déjà ouverte : on la ramène au premier plan et on lui transmet l'action.
+      // AUCUNE navigation forcée (client.navigate) : pas de rechargement, pas de sortie de scope,
+      // et pas de double connexion à la table (l'app traite le message une seule fois).
+      client.postMessage({ type: 'PUSH_NOTIFICATION_CLICKED', data, url: target.href });
+      try {
+        await client.focus();
+        return;
+      } catch (e) {
+        // focus() refusé : on retombe sur openWindow ci-dessous.
       }
+    }
 
-      if (matchingClient) {
-        // If a window is already open (browser tab or standalone PWA), focus it and navigate
-        if ('focus' in matchingClient) {
-          matchingClient.postMessage({
-            type: 'PUSH_NOTIFICATION_CLICKED',
-            data: notifData,
-          });
-          if (notifData.roomCode && 'navigate' in matchingClient) {
-            matchingClient.navigate(absoluteTargetUrl);
-          }
-          return matchingClient.focus();
-        }
-      }
-
-      // Otherwise, open a new window.
-      // Since absoluteTargetUrl is fully qualified within self.registration.scope,
-      // mobile Chrome/Android will open it inside the WebAPK (standalone app) if installed,
-      // or as a standard browser tab if the app is not installed.
-      if (self.clients.openWindow) {
-        return self.clients.openWindow(absoluteTargetUrl);
-      }
-    })
-  );
+    // App fermée : URL dans le scope => Chrome l'ouvre dans la PWA installée (WebAPK).
+    if (self.clients.openWindow) {
+      await self.clients.openWindow(target.href);
+    }
+  })());
 });
 
-self.addEventListener('notificationclose', (event) => {
-  console.log('Notification was closed by user', event.notification.tag);
+// Le navigateur a renouvelé ou invalidé l'abonnement : on prévient les fenêtres ouvertes
+// pour qu'elles se réabonnent et resynchronisent le serveur (sans nouvelle demande de permission).
+self.addEventListener('pushsubscriptionchange', (event) => {
+  event.waitUntil((async () => {
+    const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    all.forEach((c) => c.postMessage({ type: 'PUSH_SUBSCRIPTION_CHANGED' }));
+  })());
 });

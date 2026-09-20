@@ -45,18 +45,7 @@ export function useMultiplayerGame() {
   const localPlayerId = getLocalPlayerId();
   const localPlayerName = getLocalPlayerName();
 
-  // Check URL params for room code on mount
-  useEffect(() => {
-    try {
-      const params = new URLSearchParams(window.location.search);
-      const roomParam = params.get('room') || params.get('join');
-      if (roomParam) {
-        setShowMultiplayerHub(true);
-      }
-    } catch (e) {
-      console.error('Failed to parse URL params:', e);
-    }
-  }, []);
+  // Le lien ?join=CODE est traité par App.tsx (connexion directe ; le hub ne s'ouvre qu'en cas d'échec).
 
   // Listen to WebSocket server room updates
   const lastRoomStatusRef = useRef<string | null>(null);

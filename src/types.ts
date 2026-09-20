@@ -210,6 +210,8 @@ export interface Player {
   isFoldedInRound?: boolean;
   disconnectGraceExpiresAt?: number | null;
   isAiRelay?: boolean;
+  /** Siège tenu par le relais pour la partie en cours (joueur absent) : il ne peut pas remporter le pot. */
+  relayAbsent?: boolean;
   connected?: boolean;
   isSpectator?: boolean;
   isPendingIntegration?: boolean;
@@ -370,6 +372,8 @@ export interface RoomPlayer {
   connected?: boolean;
   disconnectGraceExpiresAt?: number | null;
   isAiRelay?: boolean;
+  /** Siège tenu par le relais pour la partie en cours (joueur absent) : il ne peut pas remporter le pot. */
+  relayAbsent?: boolean;
   isAway?: boolean; // True when page/tab is backgrounded
   lastSeen?: number;
   isSpectator?: boolean;
@@ -420,6 +424,7 @@ export type PartieEndReason =
   | 'KORA'
   | 'DOUBLE_KORA'
   | 'TRICKS_COMPLETED'
+  | 'RELAY_SPLIT'
   | 'FORFEIT_VICTORY'
   | 'FOLD_VICTORY';
 

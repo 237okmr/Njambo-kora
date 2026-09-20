@@ -404,39 +404,15 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
             <div className="p-2 bg-slate-950/40 rounded-xl border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
               <div className="flex flex-wrap items-center gap-2">
 
-                {/* AFK Setting */}
+                {/* Règle du relais (plus de réglage : identique pour toutes les tables) */}
                 <div className="flex items-center gap-1 w-full sm:w-auto">
-                  <span className="text-slate-400 font-medium">Inactif:</span>
-                  {onUpdateSettings ? (
-                    <div className="flex items-center gap-1">
-                      <button
-                        type="button"
-                        onClick={() => onUpdateSettings({ afkAction: 'replace_bot' })}
-                        className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition ${
-                          currentAfkAction === 'replace_bot'
-                            ? 'bg-amber-500 text-slate-950 border-amber-400 font-black'
-                            : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
-                        }`}
-                      >
-                        Bot
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => onUpdateSettings({ afkAction: 'auto_play' })}
-                        className={`px-1.5 py-0.5 rounded text-[10px] font-bold border transition ${
-                          currentAfkAction === 'auto_play'
-                            ? 'bg-amber-500 text-slate-950 border-amber-400 font-black'
-                            : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
-                        }`}
-                      >
-                        Forfait
-                      </button>
-                    </div>
-                  ) : (
-                    <span className="text-amber-400 font-bold text-[10px] bg-amber-500/10 px-1.5 py-0.5 rounded">
-                      {currentAfkAction === 'replace_bot' ? 'Bot' : 'Forfait'}
-                    </span>
-                  )}
+                  <span className="text-slate-400 font-medium">Absence :</span>
+                  <span
+                    className="text-amber-400 font-bold text-[10px] bg-amber-500/10 px-1.5 py-0.5 rounded"
+                    title="Un relais joue des cartes neutres jusqu'à la fin de la partie et ne peut pas gagner le pot. Le joueur peut revenir à tout moment."
+                  >
+                    Relais IA
+                  </span>
                 </div>
 
                 <div className="flex items-center gap-1">

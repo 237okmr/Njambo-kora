@@ -1,7 +1,7 @@
 {
   "name": "react-example",
   "private": true,
-  "version": "2.5.217",
+  "version": "2.5.221",
   "type": "module",
   "scripts": {
     "version:sync": "node scripts/sync-version.js",
@@ -11,7 +11,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "node --import tsx --test src/utils/gameRules.test.ts src/utils/settlement.test.ts server/engine/serverGameEngine.settlement.test.ts"
+    "test": "node --import tsx --test src/utils/gameRules.test.ts src/utils/settlement.test.ts server/engine/serverGameEngine.settlement.test.ts server/engine/relayRule.test.ts server/pushService.policy.test.ts && node --test scripts/sw-push.test.cjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -43,6 +43,7 @@
     "@types/ws": "^8.18.1",
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",
+    "sharp": "^0.35.4",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",

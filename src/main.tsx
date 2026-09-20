@@ -2,6 +2,7 @@ import {StrictMode} from 'react';
 import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
 import { ErrorBoundary } from './components/common/ErrorBoundary.tsx';
+import { NotificationProvider } from './components/common/NotificationCenter.tsx';
 import './index.css';
 
 // Handle unhandled transient database closing or hidden events from iframe lifecycle
@@ -69,7 +70,9 @@ createRoot(document.getElementById('root')!).render(
       fallbackMessage="L'application a rencontré un problème technique temporaire. Appuyez sur Réessayer pour réinitialiser votre session et recharger."
       onReset={handleRootReset}
     >
-      <App />
+      <NotificationProvider>
+        <App />
+      </NotificationProvider>
     </ErrorBoundary>
   </StrictMode>,
 );
